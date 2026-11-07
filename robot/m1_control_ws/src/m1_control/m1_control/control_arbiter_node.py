@@ -67,10 +67,17 @@ class ControlArbiterNode(Node):
         self.declare_parameter('max_linear_y', 0.20)
         self.declare_parameter('max_angular_z', 0.80)
 
-        # Servo travel limits. s1 = pan (driver -> PWM channel 2),
-        # s2 = tilt (driver -> PWM channel 3, driver hard-clamps to 0..110).
-        # Defaults are the mechanical centre verified on this robot:
+        # Servo travel limits, passed through unchanged (the arbiter does not
+        # interpret the axes - it only clamps).
+        #
+        # Axis mapping, verified by hand on this robot (direction only):
+        #   s1 = TILT  (driver -> PWM channel 2)   larger = look UP
+        #   s2 = PAN   (driver -> PWM channel 3)   larger = look LEFT
+        #              the driver hard-clamps s2 to 0..110.
+        # Rest pose confirmed working:
         #   ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
+        # Ranges below are the vendor joystick limits; they have NOT been
+        # checked against the mechanical stops.
         self.declare_parameter('default_servo_s1', 40)
         self.declare_parameter('default_servo_s2', 90)
         self.declare_parameter('servo_s1_min', 0)
@@ -80,7 +87,7 @@ class ControlArbiterNode(Node):
 
         self.declare_parameter('initial_mode', MODE_KEYBOARD)
         self.declare_parameter('publish_rate_hz', 20.0)
-        self.declare_parameter('beep_on_mode_change', True)
+        self.declare_parameter('beep_on_mode_change', False)
 
         self.timeout = float(self.get_parameter('watchdog_timeout_sec').value)
         self.max_vx = float(self.get_parameter('max_linear_x').value)
@@ -102,6 +109,7 @@ class ControlArbiterNode(Node):
         self.s1 = int(self.get_parameter('default_servo_s1').value)
         self.s2 = int(self.get_parameter('default_servo_s2').value)
         self.servo_dirty = True
+        self._beep_timer = None
 
         # ---------------- interfaces ----------------
         # Actuator topics: RELIABLE. Setpoints must not be dropped.
@@ -154,9 +162,32 @@ class ControlArbiterNode(Node):
     def _publish_mode(self):
         self.mode_pub.publish(UInt8(data=self.active_mode))
 
-    def _beep(self, count=1):
-        if self.beep:
-            self.buzzer_pub.publish(Bool(data=True))
+    def _beep(self):
+        """Pulse the buzzer ON, then OFF shortly after.
+
+        The chassis driver maps Bool(true) -> set_beep(1) and Bool(false) ->
+        set_beep(0), so the buzzer LATCHES. Publishing only `true` leaves it
+        sounding forever - which is exactly what happened the first time this
+        ran: one mode change started a beep that never stopped.
+
+        The OFF message is therefore not optional, it is the other half of the
+        beep. A one-shot timer sends it so the ON is audible first.
+        """
+        if not self.beep:
+            return
+        self.buzzer_pub.publish(Bool(data=True))
+        if self._beep_timer is not None:
+            self._beep_timer.cancel()
+            self.destroy_timer(self._beep_timer)
+        self._beep_timer = self.create_timer(0.15, self._beep_off)
+
+    def _beep_off(self):
+        """Turn the buzzer off, then remove this one-shot timer."""
+        self.buzzer_pub.publish(Bool(data=False))
+        if self._beep_timer is not None:
+            self._beep_timer.cancel()
+            self.destroy_timer(self._beep_timer)
+            self._beep_timer = None
 
     def mode_callback(self, msg: UInt8):
         new_mode = int(msg.data)
@@ -266,6 +297,12 @@ class ControlArbiterNode(Node):
         try:
             self.cmd_vel_pub.publish(Twist())
         except Exception:  # noqa: BLE001 - best effort on shutdown
+            pass
+        # Always silence the buzzer on the way out: it latches, so an
+        # interrupted beep would otherwise sound until the next power cycle.
+        try:
+            self.buzzer_pub.publish(Bool(data=False))
+        except Exception:  # noqa: BLE001
             pass
 
 

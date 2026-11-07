@@ -50,7 +50,7 @@ robot/
 
 ```bash
 # On the robot
-~/bin/m1.sh start
+./m1.sh start
 
 # Individual launches, inside the container
 ros2 launch m1_control m1_robot_bringup.launch.py lidar:=auto camera:=true
@@ -113,9 +113,9 @@ These differ from common documentation — verified on this unit:
 ## Quick checks
 
 ```bash
-~/bin/m1.sh diag                    # 0 failed?
-~/bin/m1.sh status                  # nodes + topics
-~/bin/m1.sh devices                 # device + container state
+./m1.sh diag                    # 0 failed?
+./m1.sh status                  # nodes + topics
+./m1.sh devices                 # device + container state
 
 # Safety suite (wheels off the ground)
 docker exec -it ros-humble-dev bash -lc \

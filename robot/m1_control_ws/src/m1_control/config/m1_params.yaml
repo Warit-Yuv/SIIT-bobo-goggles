@@ -8,8 +8,12 @@ control_arbiter_node:
     max_linear_y: 0.20
     max_angular_z: 0.80
 
-    # Servo centres verified on this robot:
+    # Servo rest pose. Axis mapping verified by hand (direction only):
+    #   s1 = TILT  larger = look UP     (0 down-angled, 30 level, 70 up)
+    #   s2 = PAN   larger = look LEFT   (60 right, 90 centre, 120 left)
+    # Confirmed working:
     #   ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
+    # Ranges are the vendor joystick limits, NOT checked against mechanical stops.
     default_servo_s1: 40
     default_servo_s2: 90
     servo_s1_min: 0
@@ -19,7 +23,11 @@ control_arbiter_node:
 
     initial_mode: 1            # 1 = KEYBOARD
     publish_rate_hz: 20.0
-    beep_on_mode_change: true
+    # Beep on mode change. OFF by default: the buzzer latches on the chassis
+    # driver (true -> set_beep(1), false -> set_beep(0)), so a beep that is not
+    # explicitly turned off sounds forever. The arbiter now pulses on/off, but
+    # the feature is not worth the risk during normal operation.
+    beep_on_mode_change: false
 
 wasd_teleop_node:
   ros__parameters:
@@ -27,6 +35,7 @@ wasd_teleop_node:
     speed_strafe: 0.20
     speed_rot: 0.60
     servo_step: 5.0
+    # s1 = TILT (larger = up), s2 = PAN (larger = left)
     servo_s1_center: 40.0
     servo_s2_center: 90.0
     servo_s1_min: 0.0

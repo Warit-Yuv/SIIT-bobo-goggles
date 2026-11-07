@@ -5,20 +5,39 @@ Publishes to the mode-specific topics consumed by the arbiter, never to
 /cmd_vel directly:
 
     /cmd_vel/keyboard   geometry_msgs/Twist    (vx, vy, wz)
-    /servo/keyboard     geometry_msgs/Vector3  (x = pan s1, y = tilt s2)
+    /servo/keyboard     geometry_msgs/Vector3  (x = s1 = TILT, y = s2 = PAN)
     /control_mode       std_msgs/UInt8         (0 = E-STOP, 1/2/3 = modes)
+
+SERVO AXIS MAPPING - verified by hand on this robot
+---------------------------------------------------
+The two servos are NOT what the labels suggest. Measured by sending single
+commands and watching the head:
+
+    s1  ->  TILT  (up / down)      0 = angled down, 30 = level, 70 = angled up
+    s2  ->  PAN   (left / right)   60 = right,       90 = centre, 120 = left
+
+So a LARGER s1 looks UP and a LARGER s2 looks LEFT. Centre pose: s1=40, s2=90.
+
+Only the *directions* above were confirmed by observation. The travel limits
+come from the vendor joystick controller (s1 0..180, s2 0..117) and from the
+chassis driver, which hard-clamps s2 to 0..110. They are NOT yet confirmed
+against the mechanical stops - move the servos slowly the first time and stop
+before they buzz or stall.
 
 Controls
 --------
     W / S      forward / backward          (vx)
     Q / E      strafe left / right         (vy)
     A / D      rotate CCW / CW             (wz)
-    I / K      camera tilt up / down
-    J / L      camera pan left / right
+    I / K      camera tilt up / down       (s1)
+    J / L      camera pan left / right     (s2)
     U          re-centre the gimbal
     SPACE      E-STOP (latched mode 0)
     1 / 2 / 3  select KEYBOARD / GAZE / EEG mode
     Ctrl+C     quit (sends a final zero velocity)
+
+`q` is STRAFE LEFT, not quit. It used to be both, so the node exited the moment
+you tried to strafe sideways. Quitting is Ctrl+C only.
 
 A command stays alive for `hold_time_sec` after the last keypress and then
 decays to zero, so holding a key gives smooth motion while a single tap
@@ -39,15 +58,18 @@ INSTRUCTIONS = """
 ---------------------------------------------------------------
  ROSMASTER M1 - KEYBOARD TELEOP (mode 1)
 ---------------------------------------------------------------
- Chassis (holonomic mecanum)      PTZ gimbal (2-axis)
-        W                              I  tilt up
-   Q    S    E          J  pan left  K  tilt down  L  pan right
-   A         D                        U  re-centre
-   W/S forward/back   Q/E strafe
-   A/D rotate CCW/CW
+ CHASSIS (mecanum)                 GIMBAL
+        W                              I   tilt up    (s1 +)
+   Q    S    E                         K   tilt down  (s1 -)
+   A         D                J  pan left (s2 +)  L  pan right (s2 -)
+                                      U   re-centre
+   W/S  forward / back
+   Q/E  strafe left / right
+   A/D  rotate CCW / CW
 
- SPACE  E-STOP (latched)     1/2/3  KEYBOARD / GAZE / EEG
- Ctrl+C quit
+ SPACE   E-STOP (latched - press 1 to resume)
+ 1 2 3   KEYBOARD / GAZE / EEG mode
+ Ctrl+C  quit          (q is STRAFE, not quit)
 ---------------------------------------------------------------
 """
 
@@ -60,13 +82,16 @@ class WASDTeleopNode(Node):
         self.declare_parameter('speed_trans', 0.20)
         self.declare_parameter('speed_strafe', 0.20)
         self.declare_parameter('speed_rot', 0.60)
+
+        # s1 = TILT, s2 = PAN (see the module docstring). Limits are the
+        # vendor's, not yet checked against the mechanical stops.
         self.declare_parameter('servo_step', 5.0)
-        self.declare_parameter('servo_s1_center', 40.0)
-        self.declare_parameter('servo_s2_center', 90.0)
+        self.declare_parameter('servo_s1_center', 40.0)   # tilt, near level
+        self.declare_parameter('servo_s2_center', 90.0)   # pan, straight ahead
         self.declare_parameter('servo_s1_min', 0.0)
         self.declare_parameter('servo_s1_max', 180.0)
         self.declare_parameter('servo_s2_min', 0.0)
-        self.declare_parameter('servo_s2_max', 110.0)
+        self.declare_parameter('servo_s2_max', 110.0)     # driver hard limit
         self.declare_parameter('hold_time_sec', 0.25)
         self.declare_parameter('publish_rate_hz', 20.0)
 
@@ -110,49 +135,61 @@ class WASDTeleopNode(Node):
 
     # ---------------------------------------------------------------- keys
     def _handle_key(self, key):
-        """Return False when the loop should exit."""
-        if key in ('\x03', 'q'):
+        """Return False when the loop should exit.
+
+        `q` is deliberately NOT a quit key - it strafes left. Having it do both
+        meant the node exited the instant you tried to strafe, which looked like
+        the terminal "detaching" and left no obvious way back. Quit is Ctrl+C.
+        """
+        if key == '\x03':                      # Ctrl+C only
             return False
 
         self.vel = Twist()  # each key event re-derives the setpoint
 
+        # ---- chassis ----
         if key == 'w':
             self.vel.linear.x = self.speed_trans
         elif key == 's':
             self.vel.linear.x = -self.speed_trans
         elif key == 'q':
-            self.vel.linear.y = self.speed_strafe
+            self.vel.linear.y = self.speed_strafe        # strafe LEFT
         elif key == 'e':
-            self.vel.linear.y = -self.speed_strafe
+            self.vel.linear.y = -self.speed_strafe       # strafe RIGHT
         elif key == 'a':
             self.vel.angular.z = self.speed_rot
         elif key == 'd':
             self.vel.angular.z = -self.speed_rot
+
+        # ---- gimbal: s1 = TILT (larger = up) ----
         elif key == 'i':
-            self.s2 = min(self.s2_max, self.s2 + self.servo_step)
-            self.servo_dirty = True
-        elif key == 'k':
-            self.s2 = max(self.s2_min, self.s2 - self.servo_step)
-            self.servo_dirty = True
-        elif key == 'j':
             self.s1 = min(self.s1_max, self.s1 + self.servo_step)
             self.servo_dirty = True
-        elif key == 'l':
+        elif key == 'k':
             self.s1 = max(self.s1_min, self.s1 - self.servo_step)
             self.servo_dirty = True
+
+        # ---- gimbal: s2 = PAN (larger = left) ----
+        elif key == 'j':
+            self.s2 = min(self.s2_max, self.s2 + self.servo_step)
+            self.servo_dirty = True
+        elif key == 'l':
+            self.s2 = max(self.s2_min, self.s2 - self.servo_step)
+            self.servo_dirty = True
+
         elif key == 'u':
             self.s1 = float(self.get_parameter('servo_s1_center').value)
             self.s2 = float(self.get_parameter('servo_s2_center').value)
             self.servo_dirty = True
+
         elif key == ' ':
             self.mode_pub.publish(UInt8(data=0))
             self.vel = Twist()
-            print('\n[E-STOP] latched. Press 1/2/3 to resume.\n')
+            print('\n[E-STOP] latched. Press 1 to resume.\n', flush=True)
             return True
         elif key in ('1', '2', '3'):
             self.mode_pub.publish(UInt8(data=int(key)))
             self.vel = Twist()
-            print(f'\n[INFO] mode -> {key}\n')
+            print(f'\n[INFO] mode -> {key}\n', flush=True)
             return True
         else:
             return True
@@ -178,12 +215,16 @@ class WASDTeleopNode(Node):
                 self.vel_pub.publish(self.vel)
 
                 if self.servo_dirty:
+                    # x = s1 = tilt, y = s2 = pan
                     self.servo_pub.publish(
                         Vector3(x=float(self.s1), y=float(self.s2), z=0.0)
                     )
                     self.servo_dirty = False
         finally:
+            # Always leave the terminal usable and say how to get back in.
             self.vel_pub.publish(Twist())
+            print('\n[teleop] stopped - robot halted.', flush=True)
+            print('[teleop] restart with:  ./m1.sh teleop\n', flush=True)
 
 
 def main(args=None):

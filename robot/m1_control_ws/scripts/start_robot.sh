@@ -72,8 +72,9 @@ if [ "$DRY" != "1" ] && [ "$FORCE" != "1" ]; then
         echo " several drivers reading one serial port interleave bytes and" >&2
         echo " produce checksum errors, and only one process can own the camera." >&2
         echo >&2
-        echo "   stop it :  ~/bin/m1.sh stop --hard" >&2
-        echo "   or force:  $0 --force" >&2
+        echo "   stop it (in here):  ${SCRIPT_DIR}/stop_all.sh --hard" >&2
+        echo "   stop it (on host):  /home/pi/m1.sh stop --hard" >&2
+        echo "   or force:           $0 --force" >&2
         exit 1
     fi
     # Lock fd 9 is held for the lifetime of this script and released on exit.

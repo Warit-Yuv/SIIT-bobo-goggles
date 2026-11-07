@@ -29,9 +29,19 @@ Input
 Output (never /cmd_vel - the arbiter owns that)
 -----------------------------------------------
     /cmd_vel/gaze   geometry_msgs/Twist    vx, vy, wz
-    /servo/gaze     geometry_msgs/Vector3  x = pan s1, y = tilt s2
+    /servo/gaze     geometry_msgs/Vector3  x = s1 = TILT, y = s2 = PAN
     /control_mode   std_msgs/UInt8         asserted to 2 while gaze is live
     /gaze/zone      std_msgs/String        current zone, for the HUD/diagnostics
+
+SERVO AXIS MAPPING (verified by hand, direction only)
+-----------------------------------------------------
+    s1 -> TILT   larger = look UP      centre 40
+    s2 -> PAN    larger = look LEFT    centre 90
+
+So looking up must INCREASE s1, and looking left must INCREASE s2. The travel
+limits below come from the vendor joystick controller and the chassis driver
+(which hard-clamps s2 to 0..110); they are not yet confirmed against the
+mechanical stops.
 
     ros2 run m1_control gaze_control_node
     ros2 run m1_control gaze_control_node --ros-args -p deadzone_radius_ratio:=0.3
@@ -130,8 +140,10 @@ class GazeControlNode(Node):
         self.invert_tilt = bool(gp('invert_tilt').value)
         self.assert_mode = bool(gp('assert_mode').value)
 
-        self.pan = float(gp('servo_s1_center').value)
-        self.tilt = float(gp('servo_s2_center').value)
+        # Raw servo positions, named as the message/hardware name them.
+        #   s1 = TILT (larger = up)      s2 = PAN (larger = left)
+        self.s1 = float(gp('servo_s1_center').value)      # tilt
+        self.s2 = float(gp('servo_s2_center').value)      # pan
         self.s1_min, self.s1_max = (float(gp('servo_s1_min').value),
                                     float(gp('servo_s1_max').value))
         self.s2_min, self.s2_max = (float(gp('servo_s2_min').value),
@@ -235,8 +247,9 @@ class GazeControlNode(Node):
         if now - self._last_servo < self._servo_period:
             return
         self._last_servo = now
+        # x = s1 = tilt, y = s2 = pan
         self.servo_pub.publish(
-            Vector3(x=float(self.pan), y=float(self.tilt), z=0.0))
+            Vector3(x=float(self.s1), y=float(self.s2), z=0.0))
 
     # ----------------------------------------------------------------- loop
     def tick(self):
@@ -274,14 +287,21 @@ class GazeControlNode(Node):
         if zone == ZONE_CENTER:
             # Fine PTZ aiming. Scale by the deadzone radius so full deflection
             # at the deadzone edge gives the maximum step.
+            #
+            # Axis mapping: gaze is in image coordinates (+dx = right,
+            # +dy = down). Servo s1 = tilt (larger = up), s2 = pan (larger =
+            # left). So both steps are negated:
+            #   looking left  (dx < 0) -> s2 increases -> pan left
+            #   looking up    (dy < 0) -> s1 increases -> tilt up
             pan_step = -(dx / max(1e-6, deadzone_r)) * self.gain_pan
             tilt_step = -(dy / max(1e-6, deadzone_r)) * self.gain_tilt
             if self.invert_pan:
                 pan_step = -pan_step
             if self.invert_tilt:
                 tilt_step = -tilt_step
-            self.pan = float(np.clip(self.pan + pan_step, self.s1_min, self.s1_max))
-            self.tilt = float(np.clip(self.tilt + tilt_step, self.s2_min, self.s2_max))
+            # pan drives s2, tilt drives s1
+            self.s2 = float(np.clip(self.s2 + pan_step, self.s2_min, self.s2_max))
+            self.s1 = float(np.clip(self.s1 + tilt_step, self.s1_min, self.s1_max))
             self._publish_servo()
         else:
             # Dwell gate: rejects saccades, which would otherwise cause

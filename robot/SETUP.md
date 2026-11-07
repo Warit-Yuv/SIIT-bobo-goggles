@@ -81,18 +81,39 @@ present.
 
 ## Step 3 — Install the two host scripts
 
-Copy these from this repo onto the Pi:
+Both scripts go in the home directory, next to the workspace:
 
 ```bash
 # On the Pi
-mkdir -p ~/bin
-cp robot/host/m1_docker.sh ~/bin/
-cp robot/host/m1.sh        ~/bin/
-chmod +x ~/bin/m1_docker.sh ~/bin/m1.sh
+cd ~
+cp robot/host/m1_docker.sh .
+cp robot/host/m1.sh        .
+chmod +x m1.sh m1_docker.sh
 ```
 
-If `~/bin` is not on your `PATH`, either add it (`export PATH="$HOME/bin:$PATH"`
-in `~/.bashrc`) or just call them by full path.
+**Verify:**
+
+```bash
+ls -l ~/m1.sh ~/m1_docker.sh
+```
+
+Expected:
+
+```
+-rwxr-xr-x 1 pi pi ... /home/pi/m1.sh
+-rwxr-xr-x 1 pi pi ... /home/pi/m1_docker.sh
+```
+
+Every command in this guide is written as `./m1.sh …`, which assumes you are in
+`/home/pi`. If you are elsewhere, use the full path:
+
+```bash
+/home/pi/m1.sh status
+```
+
+> An earlier version of this guide put them in `~/bin`, which is not on the
+> default `PATH` on Raspberry Pi OS. `./m1.sh: No such file or directory`
+> means the scripts are in `~` and you used the wrong prefix.
 
 ---
 
@@ -127,13 +148,13 @@ This is the step that matters most. Two details are deliberate:
   Without it, every `ros2 launch` you stop leaves a zombie behind.
 
 ```bash
-~/bin/m1_docker.sh recreate
+./m1_docker.sh recreate
 ```
 
 **Verify:**
 
 ```bash
-~/bin/m1_docker.sh status
+./m1_docker.sh status
 ```
 
 Expected:
@@ -195,7 +216,7 @@ This is idempotent: running it twice leaves one managed block, not two.
 ## Step 7 — Build the overlay
 
 ```bash
-~/bin/m1.sh build
+./m1.sh build
 ```
 
 **Verify:**
@@ -219,14 +240,14 @@ m1_control wasd_teleop_node
 ```
 
 > If files become unreadable from the host after a build (the container runs as
-> root), run `~/bin/m1.sh fix-perms`.
+> root), run `./m1.sh fix-perms`.
 
 ---
 
 ## Step 8 — Verify the environment
 
 ```bash
-~/bin/m1.sh diag
+./m1.sh diag
 ```
 
 Expected — **0 failed**:
@@ -258,13 +279,13 @@ breaks you know exactly what it was.
 **Elevate the robot so the wheels spin freely. Put a hand on the power switch.**
 
 ```bash
-~/bin/m1.sh shell
+./m1.sh shell
 # inside the container:
 source /root/m1_control_ws/scripts/env.sh
 ros2 run yahboomcar_bringup Mcnamu_driver_M1
 ```
 
-**Verify** in a second terminal (`~/bin/m1.sh shell`):
+**Verify** in a second terminal (`./m1.sh shell`):
 
 ```bash
 ros2 topic echo /voltage --once      # expect >= 10.3 (11.7 measured)
@@ -344,13 +365,13 @@ Now lidar is scanning...
 ### 9.5 Everything together
 
 ```bash
-~/bin/m1.sh start
+./m1.sh start
 ```
 
 **Verify** in another terminal:
 
 ```bash
-~/bin/m1.sh status
+./m1.sh status
 ```
 
 Expected nodes:
@@ -420,7 +441,7 @@ This proves:
 ## Step 11 — Drive it
 
 ```bash
-~/bin/m1.sh teleop
+./m1.sh teleop
 ```
 
 ```
@@ -439,8 +460,8 @@ This proves:
 ## Step 12 — Stop and clean up
 
 ```bash
-~/bin/m1.sh stop          # stop our nodes (sends zero velocity first)
-~/bin/m1.sh stop --hard   # also stop vendor/app nodes
+./m1.sh stop          # stop our nodes (sends zero velocity first)
+./m1.sh stop --hard   # also stop vendor/app nodes
 ```
 
 ---
@@ -450,9 +471,9 @@ This proves:
 ```bash
 ssh pi@10.0.0.54
 cd ~
-~/bin/m1.sh start          # foreground
-~/bin/m1.sh bg             # or background, logs to m1_control_ws/logs/robot.log
-~/bin/m1.sh logs           # follow the log
+./m1.sh start          # foreground
+./m1.sh bg             # or background, logs to m1_control_ws/logs/robot.log
+./m1.sh logs           # follow the log
 ```
 
 | Command | Purpose |
@@ -478,9 +499,9 @@ does not auto-start any node. This is deliberate: a reboot must never silently
 re-arm a controller.
 
 ```bash
-~/bin/m1_docker.sh status     # container up? devices resolved?
-~/bin/m1.sh diag              # 0 failed?
-~/bin/m1.sh start
+./m1_docker.sh status     # container up? devices resolved?
+./m1.sh diag              # 0 failed?
+./m1.sh start
 ```
 
 > The udev symlinks survive `ttyUSB` renumbering. Measured after a real reboot:
@@ -515,9 +536,9 @@ re-arm a controller.
 ### Full reset
 
 ```bash
-~/bin/m1.sh stop --hard
+./m1.sh stop --hard
 docker exec ros-humble-dev bash /root/m1_control_ws/scripts/kill_all.sh
-~/bin/m1.sh start
+./m1.sh start
 ```
 
 ---
