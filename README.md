@@ -30,8 +30,13 @@ with live 2D LiDAR SLAM.
 
 ## Start here
 
+**New to the project? Read [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) first.**
+It explains the whole system from first principles, what is finished, and where
+to begin — no prior ROS 2 knowledge assumed.
+
 | I want to… | Read |
 |---|---|
+| **Understand the big picture** | [`docs/WALKTHROUGH.md`](docs/WALKTHROUGH.md) |
 | Set the robot up from scratch | [`robot/SETUP.md`](robot/SETUP.md) |
 | Set up the operator PC | [`operator-pc/SETUP.md`](operator-pc/SETUP.md) |
 | Understand what was built and why | [`robot/docs/report.md`](robot/docs/report.md) |
