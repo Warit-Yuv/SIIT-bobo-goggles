@@ -21,6 +21,25 @@ export CAMERA_TYPE=usb             # usb | nuwa
 export INIT_SERVO_S1=40
 export INIT_SERVO_S2=90
 
+# ---------------------------------------------------------------------------
+# ROS 2 setup files are NOT nounset-safe.
+#
+# /opt/ros/humble/setup.bash line 8 is:
+#     if [ -n "$AMENT_TRACE_SETUP_FILES" ]; then
+# with no default, so sourcing it under `set -u` aborts with
+#     AMENT_TRACE_SETUP_FILES: unbound variable
+# and every script that sets `set -u` (start_robot.sh, diagnose.sh,
+# stop_all.sh, kill_all.sh) dies before doing anything.
+#
+# Rather than weaken those scripts - `set -u` catches real typos in our own
+# code - nounset is disabled only around the sourcing chain and then restored
+# to whatever the caller had.
+# ---------------------------------------------------------------------------
+_m1_restore_nounset=0
+case "$-" in
+    *u*) _m1_restore_nounset=1; set +u ;;
+esac
+
 # Layer 1 - core ROS 2 Humble
 source /opt/ros/humble/setup.bash
 
@@ -38,6 +57,12 @@ fi
 if [ -f /root/m1_control_ws/install/setup.bash ]; then
     source /root/m1_control_ws/install/setup.bash
 fi
+
+# Restore the caller's nounset setting.
+if [ "$_m1_restore_nounset" = "1" ]; then
+    set -u
+fi
+unset _m1_restore_nounset
 
 export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
 
