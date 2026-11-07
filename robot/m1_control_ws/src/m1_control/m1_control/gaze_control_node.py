@@ -122,7 +122,9 @@ class GazeControlNode(Node):
 
         self.declare_parameter('invert_pan', False)
         self.declare_parameter('invert_tilt', False)
-        self.declare_parameter('assert_mode', True)
+        # Mode is the OPERATOR's decision, not this node's. Default off; see
+        # the note in gaze_hud_node.py for what happens when it is on.
+        self.declare_parameter('assert_mode', False)
         self.declare_parameter('publish_rate_hz', 20.0)
 
         gp = self.get_parameter

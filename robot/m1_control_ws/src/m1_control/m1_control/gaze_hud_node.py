@@ -82,7 +82,11 @@ class GazeHUDNode(Node):
         self.declare_parameter('invert_pan', False)
         self.declare_parameter('invert_tilt', False)
         self.declare_parameter('show_window', True)
-        self.declare_parameter('assert_mode', True)
+        # Mode is the OPERATOR's decision, not this node's. Default off.
+        # With this on, the HUD re-asserted GAZE every second, which made
+        # keyboard control impossible while it was running: the arbiter was
+        # flipped back to GAZE within ~16 ms of every KEYBOARD command.
+        self.declare_parameter('assert_mode', False)
 
         gp = self.get_parameter
         self.camera_topic = gp('camera_topic').value
@@ -266,7 +270,10 @@ class GazeHUDNode(Node):
             Vector3(x=float(self.pan), y=float(self.tilt), z=0.0))
 
     def _assert_mode(self):
-        if self.assert_mode:
+        # Only ever *offer* the mode, and only while this node is genuinely
+        # tracking. Silence otherwise: an idle or crashed HUD must never be
+        # able to take the robot away from the operator.
+        if self.assert_mode and self.gaze_valid:
             self.mode_pub.publish(UInt8(data=MODE_GAZE))
 
     def _hud_tick(self):

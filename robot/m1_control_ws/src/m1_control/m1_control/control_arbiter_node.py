@@ -111,6 +111,9 @@ class ControlArbiterNode(Node):
         self.servo_dirty = True
         self._beep_timer = None
 
+        # Timestamps of recent mode switches, for churn detection.
+        self._mode_switch_times = []
+
         # ---------------- interfaces ----------------
         # Actuator topics: RELIABLE. Setpoints must not be dropped.
         actuator_qos = QoSProfile(
@@ -196,6 +199,27 @@ class ControlArbiterNode(Node):
             return
         if new_mode == self.active_mode and not self.estop_latched:
             return
+
+        # Mode-churn detector.
+        #
+        # The arbiter does not police who may publish /control_mode - that
+        # would break the normal `ros2 topic pub --once` workflow. What it can
+        # do is make a hijack loud. A node that re-asserts its own mode on a
+        # timer produces a stream of switches, and that is worth shouting
+        # about, because the symptom (keyboard silently doing nothing) looks
+        # nothing like the cause.
+        now = self.get_clock().now()
+        self._mode_switch_times.append(now)
+        while (len(self._mode_switch_times) > 8 and
+               (now - self._mode_switch_times[0]).nanoseconds / 1e9 > 5.0):
+            self._mode_switch_times.pop(0)
+
+        if len(self._mode_switch_times) >= 6:
+            self.get_logger().error(
+                f'{len(self._mode_switch_times)} mode changes in '
+                f'{(now - self._mode_switch_times[0]).nanoseconds / 1e9:.1f}s '
+                f'- something is asserting /control_mode on a timer. '
+                f'Check for a gaze/EEG node with assert_mode:=true.')
 
         # Stop first, then switch. Never leave a stale setpoint behind.
         self.cmd_vel_pub.publish(Twist())
