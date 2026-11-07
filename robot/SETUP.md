@@ -505,6 +505,11 @@ re-arm a controller.
 | Servo does not move | `yahboomcar_msgs` not sourced | Use `scripts/env.sh` |
 | Video freezes after seconds | UDP buffers | `tune_network.sh apply`, reboot |
 | Zombie processes pile up | Container lacks `--init` | `m1_docker.sh recreate` |
+| LiDAR `Check Sum 0xC5A3 != 0x2191` spam | **Two or more stacks running** — drivers interleave bytes on `/dev/rplidar` | `m1.sh stop --hard`, then start once |
+| `Fail to get baseplate device information` | Same — serial port contention | Same |
+| `usb_cam` dies: `terminate called after throwing an instance of 'char*'` | **Two or more stacks running** — only one process can own `/dev/video0` | Same |
+| `Failed to meet update rate!` from EKF | Duplicate EKF/IMU nodes competing | Same |
+| `REFUSING TO START: a robot stack is already running` | Singleton guard working as intended | `m1.sh stop --hard`, or add `--force` |
 | Build leaves root-owned files | Container runs as root | `m1.sh fix-perms` |
 
 ### Full reset
