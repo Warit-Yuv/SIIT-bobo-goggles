@@ -66,7 +66,13 @@ case "${1:-help}" in
 
     stop)
         ensure_container
-        in_ctr_nc "${WS_CTR}/scripts/stop_all.sh ${2:-}"
+        # stop_all.sh now stops the launch parents too, and returns non-zero
+        # if anything survived. Fall back to the hard reset so a single
+        # command always gets you back to a startable state.
+        if ! in_ctr_nc "${WS_CTR}/scripts/stop_all.sh ${2:-}"; then
+            c_err "[m1] stop_all could not stop everything - running kill_all"
+            in_ctr_nc "${WS_CTR}/scripts/kill_all.sh"
+        fi
         ;;
 
     diag|diagnose)

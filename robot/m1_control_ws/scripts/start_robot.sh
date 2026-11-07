@@ -96,8 +96,16 @@ fi
 
 # Bringup in the background, control in the foreground so Ctrl+C lands on the
 # arbiter (it publishes a zero Twist on shutdown).
+#
+# `9>&-` on both launches is important: without it every descendant inherits
+# fd 9 and therefore the flock, so the lock is held by the whole process tree
+# and is only released when the last node dies. That made "is the stack
+# running?" impossible to answer and left the lock stuck after a partial stop.
+# Closing fd 9 for the children means the lock represents exactly one thing:
+# this supervisor process is alive.
 ros2 launch m1_control m1_robot_bringup.launch.py \
-    lidar:="${LIDAR}" camera:="${CAMERA}" throttle_rate:="${THROTTLE}" &
+    lidar:="${LIDAR}" camera:="${CAMERA}" throttle_rate:="${THROTTLE}" \
+    9>&- &
 BRINGUP_PID=$!
 
 cleanup() {
@@ -112,7 +120,7 @@ trap cleanup EXIT INT TERM
 sleep 3
 
 if [ "$CONTROL" = "true" ]; then
-    ros2 launch m1_control m1_control.launch.py
+    ros2 launch m1_control m1_control.launch.py 9>&-
 else
     echo "[start_robot] control disabled - bringup only. Ctrl+C to stop."
     wait "${BRINGUP_PID}"

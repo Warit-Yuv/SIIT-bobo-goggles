@@ -24,7 +24,7 @@ PATTERNS=(
     "wasd_teleop_node"
     "gaze_hud_node"
     "eeg_udp_bridge"
-    "ekf_filter_node"
+    "ekf_node"
     "imu_filter_madgwick_node"
     "robot_state_publisher"
     "joint_state_publisher"
