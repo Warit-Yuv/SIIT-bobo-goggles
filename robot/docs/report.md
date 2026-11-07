@@ -31,7 +31,7 @@ implemented, built and validated against real hardware:
 | Cross-machine DDS | **Working** | Zero-config discovery, Pi↔VM, 1.3 ms |
 | start / stop / restart | **Working** | Two consecutive cycles, 0 leftovers |
 
-**Ten defects were found and fixed during validation.** They are documented in
+**Eleven defects were found and fixed during validation.** They are documented in
 §7 because each one would have been a silent failure in operation.
 
 ---
@@ -248,7 +248,7 @@ Everything stateful lives on the host, so the container is disposable:
 
 ## 7. Defects Found and Fixed
 
-Ten real bugs were caught by testing rather than by reading. Each is recorded
+Eleven real bugs were caught by testing rather than by reading. Each is recorded
 because all five were **silent** — no crash, no error, just wrong behaviour.
 
 ### 7.1 The LiDAR "hardware fault" was a race condition
@@ -468,6 +468,35 @@ odom -> base_footprint      Translation: [0.342, 0.000, 0.000]     OK
 > perfect. When a consumer silently does nothing, check the *transforms* and
 > the *latched* topics first — and treat a mixed-vendor DDS setup as a
 > defect, not a configuration choice.
+
+### 7.11 A gaze node stole the control mode
+
+With a gaze node merely *running*, keyboard driving silently did nothing. The
+safety suite dropped from 12/12 to 9/12.
+
+`gaze_hud_node` declared `assert_mode` with a default of `True` and published
+`/control_mode = GAZE` from a 1 Hz timer, unconditionally — no gaze data
+required. The arbiter log showed it plainly:
+
+```
+Mode -> KEYBOARD   (t=...439.192)
+Mode -> GAZE       (t=...439.208)   <- 16 ms later
+```
+
+Every keyboard selection was undone almost immediately, and the keyboard topic
+was correctly ignored because the arbiter really was in GAZE mode.
+
+**Fix:** `assert_mode` defaults to `False` on both gaze nodes, and
+`gaze_hud_node` only offers the mode while it is genuinely tracking. The
+arbiter additionally logs an ERROR when it sees 6+ mode changes in 5 seconds,
+naming the likely cause — but it does **not** block the switch, because that
+would break `ros2 topic pub --once /control_mode`, which is the documented way
+to change mode.
+
+> **Lesson:** a mode topic is an *authority* channel. A node that asserts it on
+> a timer, merely because it is running, will silently disable every other
+> mode. Assert only when you are actually producing commands — and prefer a
+> loud warning over a silent block.
 
 ---
 

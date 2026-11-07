@@ -556,6 +556,31 @@ base_link -> laser        Translation: [0.006, 0.000, 0.149]     OK
 > the **latched** topics first. And treat a mixed-vendor DDS setup as a defect,
 > not a configuration choice — the two ends must match.
 
+### Lesson 10: One node can steal the whole robot
+
+With a gaze node merely *running* — not even being used — keyboard driving
+stopped working. No error, no warning; pressing `W` simply did nothing.
+
+The gaze HUD published "I am the active mode" once a second, on a timer,
+whether or not it was tracking anything. The arbiter obeyed, so it looked like
+this:
+
+```
+Mode -> KEYBOARD   (you pressed 1)
+Mode -> GAZE       (16 milliseconds later)
+```
+
+The keyboard topic was then correctly ignored — the robot genuinely was in gaze
+mode. Everything behaved exactly as written; the *design* was wrong.
+
+**Fix:** a control source must never claim the mode on its own. `assert_mode`
+now defaults to off, and the HUD only offers the mode while it is actually
+tracking a face.
+
+> **Lesson:** the mode topic is an **authority** channel. Anything that writes
+> to it is claiming the robot. A source should only ever *offer* commands on
+> its own topic and let the operator decide who is in charge.
+
 ---
 
 ## Part 8 — What's finished
