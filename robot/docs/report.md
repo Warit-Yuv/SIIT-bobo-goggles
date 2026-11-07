@@ -3,7 +3,7 @@
 **Robot:** `raspberrypi` (Raspberry Pi 5, 8 GB) — **`10.0.0.54`**
 **Operator PC:** `Rescue-Ubuntu` VMware VM — **`10.0.0.102`**
 **ROS 2 Humble** inside Docker container `ros-humble-dev` — **`ROS_DOMAIN_ID=30`**
-**Date:** 2026-11-07
+**Date:** 2026-11-08
 **Status:** Robot side complete and validated. 12/12 safety checks pass.
 
 > **This document is an engineering report**, not a procedure: it records what
@@ -19,17 +19,19 @@ implemented, built and validated against real hardware:
 
 | Capability | State | Evidence |
 |---|---|---|
-| Chassis driver (STM32) | **Working** | `/dev/myserial`, edition `3.6`, 11.7 V |
+| Chassis driver (STM32) | **Working** | `/dev/myserial`, edition `3.6`, 12.3 V |
 | Mecanum + PTZ teleop | **Working** | Arbiter→`/cmd_vel` 1:1, servo round-trip verified |
-| YDLIDAR Tmini Plus | **Working** | 10.03 Hz `/scan`, 360°, 0.03–12 m |
+| Servo axis mapping | **Working** | `s1`=tilt, `s2`=pan — confirmed by hand (§10) |
+| YDLIDAR Tmini Plus | **Working** | 10.03 Hz `/scan`, 360°, 328 real returns |
 | USB camera 640×480 | **Working** | 30.8 Hz capture, throttled to 20.0 Hz |
 | Control arbiter + watchdog | **Working** | 12/12 safety checks, stop in 0.38 s |
-| Gaze control pipeline | **Working** | Zone mapping + PTZ verified |
+| Gaze control pipeline | **Working** | Zone mapping + PTZ axes verified |
 | EEG UDP bridge | **Working** | `GO`→vx 0.15, link-loss stop in 0.88 s |
 | SLAM (`slam_toolbox`) on VM | **Working** | 78 occupied cells, map 73×149 @ 5 cm |
-| Cross-machine DDS | **Working** | Zero-config discovery, Pi↔VM |
+| Cross-machine DDS | **Working** | Zero-config discovery, Pi↔VM, 1.3 ms |
+| start / stop / restart | **Working** | Two consecutive cycles, 0 leftovers |
 
-**Five defects were found and fixed during validation.** They are documented in
+**Nine defects were found and fixed during validation.** They are documented in
 §7 because each one would have been a silent failure in operation.
 
 ---
@@ -43,7 +45,7 @@ what the real machine reports. These differences matter:
 |---|---|
 | YDLIDAR **Tmini** | **Tmini Plus**, FW 1.2, HW 1, S/N `2026000800080141` |
 | LiDAR at `/dev/ydlidar` | **`/dev/rplidar`** (udev rule maps `10c4:ea60`) |
-| Servo centre `s1=90, s2=35` | **`s1=40, s2=90`** (verified working command) |
+| Servo centre `s1=90, s2=35` | **`s1=40, s2=90`** — and **`s1` is tilt, `s2` is pan** (verified by hand, §10) |
 | CycloneDDS recommended | **Not installed.** FastDDS only — exporting `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` breaks every node |
 | Arbiter runs on operator PC | **Moved to the Pi** (see §3.1) |
 | `topic_tools throttle` | **Not installed** — replaced with our own node |
@@ -214,8 +216,9 @@ Everything stateful lives on the host, so the container is disposable:
 | Topic | Type | Notes |
 |---|---|---|
 | `/cmd_vel` | `Twist` | **Arbiter only** — 1 publisher |
-| `/Servo` | `ServoControl` | `s1`=pan, `s2`=tilt |
+| `/Servo` | `ServoControl` | `s1`=**tilt** (larger = up), `s2`=**pan** (larger = left) |
 | `/control_mode` | `UInt8` | 0=E-STOP, 1=KEYBOARD, 2=GAZE, 3=EEG |
+| `/Buzzer` | `Bool` | **Latches** — see §7.7 |
 
 ### Internal (arbiter inputs)
 
@@ -231,7 +234,7 @@ Everything stateful lives on the host, so the container is disposable:
 
 ## 7. Defects Found and Fixed
 
-Five real bugs were caught by testing rather than by reading. Each is recorded
+Nine real bugs were caught by testing rather than by reading. Each is recorded
 because all five were **silent** — no crash, no error, just wrong behaviour.
 
 ### 7.1 The LiDAR "hardware fault" was a race condition
@@ -318,6 +321,88 @@ Also fixed: an inline `pkill -f "ros2 launch"` inside a `docker exec` matched
 `scripts/kill_all.sh`, which matches by executable name and skips itself and the
 ROS daemon.
 
+### 7.6 The servo axes were swapped
+
+I had `s1` = pan and `s2` = tilt, and every comment, parameter name and piece of
+gaze maths inherited that assumption. A bench test with single commands and
+someone watching the head showed otherwise:
+
+| Command | Observed |
+|---|---|
+| `{s1: 0, s2: 90}` | head angled **down** |
+| `{s1: 30, s2: 90}` | head level |
+| `{s1: 70, s2: 90}` | head angled **up** |
+| `{s1: 40, s2: 60}` | head turned **right** |
+| `{s1: 40, s2: 120}` | head turned **left** |
+
+So **`s1` is tilt** (larger = up) and **`s2` is pan** (larger = left). The gaze
+controller would have panned when it meant to tilt — a plausible-looking but
+completely wrong behaviour, and one that no log message would ever reveal.
+
+**Fix:** the `s1`/`s2` naming is kept (it matches the message and the hardware),
+but the keyboard mapping, the gaze step maths and every comment now say which
+axis is which. Verified afterwards:
+
+```
+baseline        s1=40  s2=90
+look UP         s1=62 (+22)   s2=90  (unchanged)
+look LEFT       s1=63 (~0)    s2=110 (+20)
+```
+
+> This is the one defect that could not be found by reading code or logs. It
+> needed a human watching the robot.
+
+### 7.7 The buzzer latched on and never stopped
+
+The chassis driver treats `/Buzzer` as a **level**, not an edge:
+
+```python
+if msg.data:  self.car.set_beep(1)   # ON, and it stays on
+else:         self.car.set_beep(0)   # OFF
+```
+
+The arbiter published `Bool(true)` on every mode change and never `Bool(false)`.
+One mode switch therefore started a beep that would have sounded until the
+robot was power-cycled.
+
+**Fix:** `_beep()` now pulses true then false via a one-shot 0.15 s timer, so
+the OFF is always sent. `beep_on_mode_change` also defaults to **false** — the
+feature is not worth the risk during normal operation — and `shutdown()` sends
+false, so an interrupted beep cannot survive.
+
+### 7.8 `q` was both "strafe left" and "quit"
+
+Pressing `q` to strafe exited the teleop node instead. From the operator's side
+this looked like the terminal detaching, with no obvious way back.
+
+**Fix:** `q` is strafe-left only. Quit is **Ctrl+C**, and the exit path prints
+`restart with: ./m1.sh teleop`.
+
+### 7.9 `stop` reported success but the stack kept running
+
+After a stop, `m1.sh start` was refused with *"a robot stack is already
+running"*. Three independent causes:
+
+1. **The supervisor was never killed.** `start_robot.sh` holds the singleton
+   lock, and `ros2 launch` respawns its children (the LiDAR runs with
+   `respawn=True`), so killing nodes was undone immediately.
+2. **Every child inherited the lock fd.** `start_robot.sh` opened fd 9 and
+   spawned `ros2 launch` without closing it, so the whole process tree held the
+   same flock. Confirmed via `/proc/<pid>/fd` — 14 processes had it open.
+3. **The EKF pattern matched the wrong string.** The pattern said
+   `ekf_filter_node` (the ROS *node name*) but the binary is `ekf_node`. Four
+   orphaned EKF processes had accumulated.
+
+**Fix:** `stop_all.sh` now stops supervisor → launch parents → stray nodes,
+with SIGINT escalating to SIGKILL; both launches use `9>&-` so the lock means
+exactly one thing; and the EKF pattern is corrected in both cleanup scripts. It
+also reports whether the lock is actually free rather than leaving you to find
+out on the next start.
+
+> Lesson: a teardown path is not tested until it is run **twice in a row**.
+> Three stop/start bugs surfaced in sequence because each one was hidden behind
+> the previous one.
+
 ---
 
 ## 8. Validation Results
@@ -367,8 +452,15 @@ Reproduce: `./m1.sh` then `scripts/validate_safety.py` (wheels off the ground).
 | top-right | FORWARD_RIGHT | **0.14** | **−0.14** | 0.00 |
 | *silence* | — | **0.00** | 0.00 | 0.00 |
 
-PTZ inside the deadzone: centre→`40/90` (unchanged), slightly-left→`56/90`,
-slightly-up→`56/102`. Proportional response confirmed.
+PTZ inside the deadzone, after the axis fix (§7.6) — `s1` = tilt, `s2` = pan:
+
+```
+baseline        s1=40  s2=90
+look UP         s1=62 (+22)   s2=90  (unchanged)   -> tilts up
+look LEFT       s1=63 (~0)    s2=110 (+20)         -> pans left
+```
+
+Both axes respond in the correct direction and independently.
 
 ### 8.3 SLAM on the operator VM
 
@@ -416,11 +508,19 @@ cd /home/pi
 ### Keyboard teleop
 
 ```
-        W                            I  tilt up
-   Q    S    E        J  pan left  K  tilt down  L  pan right
-   A         D                    U  re-centre
- W/S forward/back   Q/E strafe    A/D rotate
- SPACE E-STOP (latched)   1/2/3  KEYBOARD/GAZE/EEG
+ CHASSIS (mecanum)                 GIMBAL
+        W                              I   tilt up    (s1 +)
+   Q    S    E                         K   tilt down  (s1 -)
+   A         D                J  pan left (s2 +)  L  pan right (s2 -)
+                                      U   re-centre
+
+   W/S  forward / back
+   Q/E  strafe left / right
+   A/D  rotate CCW / CW
+
+ SPACE   E-STOP (latched - press 1 to resume)
+ 1 2 3   KEYBOARD / GAZE / EEG mode
+ Ctrl+C  quit          (q is STRAFE, not quit)
 ```
 
 ### Gaze / EEG
@@ -437,21 +537,45 @@ python3 scripts/test_eeg_udp.py --ip 127.0.0.1 --sequence   # no headset needed
 
 ---
 
-## 10. Servo Convention — Needs One Physical Check
+## 10. Servo Convention — Confirmed by Hand
 
-Verified working: `s1=40, s2=90` is the rest pose. `s1` is pan, `s2` is tilt
-(the driver maps `s1`→PWM ch2, `s2`→PWM ch3, and hard-clamps `s2` to 0..110).
+Both the rest pose and the **axis mapping** were verified on the physical robot
+by sending single commands and watching the head.
 
-**The sign convention is not yet confirmed physically.** Gazing left increases
-`s1`; gazing up increases `s2`. Whether that is the intuitive direction on your
-unit is a 10-second test. If it feels inverted:
+| | Axis | Larger value means | Rest pose |
+|---|---|---|---|
+| **`s1`** | **TILT** (up/down) | look **up** | **40** |
+| **`s2`** | **PAN** (left/right) | look **left** | **90** |
+
+Observed: `s1` 0 = angled down, 30 = level, 70 = angled up. `s2` 60 = right,
+90 = centre, 120 = left.
+
+The driver maps `s1`→PWM channel 2 and `s2`→PWM channel 3, and hard-clamps `s2`
+to 0..110.
+
+### Travel limits are NOT yet confirmed
+
+Only the *directions* above were observed. The configured ranges are the vendor
+joystick controller's values and have not been checked against the mechanical
+stops:
+
+| | Configured range | Source |
+|---|---|---|
+| `s1` | 0 .. 180 | vendor joystick |
+| `s2` | 0 .. 110 | chassis driver hard clamp |
+
+Move the servos slowly the first time and stop before they buzz or stall. If a
+limit is wrong, set it in `config/m1_params.yaml` (`servo_s1_min/max`,
+`servo_s2_min/max`) — no code change needed.
+
+### If a direction feels inverted
 
 ```bash
 ros2 run m1_control gaze_control_node --ros-args \
     -p invert_pan:=true -p invert_tilt:=true
 ```
 
-Do this once on the bench, then set it in `config/m1_params.yaml`.
+Then make it permanent in `config/m1_params.yaml`.
 
 ---
 
@@ -517,7 +641,8 @@ Do this once on the bench, then set it in `config/m1_params.yaml`.
 
 ## 14. Next Steps
 
-1. **Confirm the servo sign convention** (§10) — one bench test.
+1. ~~Confirm the servo axis convention~~ — **done**, see §10. Travel limits
+   still unconfirmed; check them slowly on the bench.
 2. **Run `operator-pc/SETUP.md` on the VM** to finish the operator side.
 3. **Floor trial**: elevate → verify → lower, per handbook §11.
 4. **Calibrate the gaze model** (GazeModel, ~3 min, 4 postures).

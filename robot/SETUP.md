@@ -288,7 +288,7 @@ ros2 run yahboomcar_bringup Mcnamu_driver_M1
 **Verify** in a second terminal (`./m1.sh shell`):
 
 ```bash
-ros2 topic echo /voltage --once      # expect >= 10.3 (11.7 measured)
+ros2 topic echo /voltage --once      # expect >= 10.3 (12.3 measured)
 ros2 topic echo /edition --once      # expect '3.6'
 ```
 
@@ -299,16 +299,46 @@ Stop it with `Ctrl+C`.
 
 ### 9.2 Servo / gimbal
 
-With the driver running:
+With the driver running, send one command at a time and **watch the head**:
 
 ```bash
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 ```
 
-**Verify:** the camera head moves to its rest pose. `s1` = pan, `s2` = tilt.
+**Verify:** the camera head sits at its rest pose, looking roughly straight
+ahead and slightly down.
 
-> On this robot the rest pose is **`s1=40, s2=90`** — not `90/35` as some
-> documentation states. Confirm yours visually.
+Now confirm the axis mapping, because the names are not what you would guess:
+
+```bash
+# s1 = TILT: larger looks UP
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 70, s2: 90}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 30, s2: 90}"
+
+# s2 = PAN: larger looks LEFT
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 120}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 60}"
+```
+
+| | Axis | Larger value |
+|---|---|---|
+| **`s1`** | **TILT** (up/down) | look **up** |
+| **`s2`** | **PAN** (left/right) | look **left** |
+
+Finish by re-centring:
+
+```bash
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
+```
+
+> **`s1` is tilt, not pan** — this is the opposite of what the parameter names
+> suggest, and getting it wrong makes the gaze controller pan when it means to
+> tilt. Confirmed on this robot; see `docs/report.md` §10.
+>
+> **Ranges are not confirmed.** `s1` is configured 0..180 and `s2` 0..110 (the
+> driver hard-clamps `s2`). Those are the vendor joystick limits and have not
+> been checked against the mechanical stops — move slowly and stop before the
+> servo buzzes or stalls.
 
 ### 9.3 Camera
 
@@ -445,13 +475,24 @@ This proves:
 ```
 
 ```
-        W                            I  tilt up
-   Q    S    E        J  pan left  K  tilt down  L  pan right
-   A         D                    U  re-centre
- W/S forward/back   Q/E strafe    A/D rotate
- SPACE E-STOP (latched)   1/2/3  KEYBOARD/GAZE/EEG
+ CHASSIS (mecanum)                 GIMBAL
+        W                              I   tilt up    (s1 +)
+   Q    S    E                         K   tilt down  (s1 -)
+   A         D                J  pan left (s2 +)  L  pan right (s2 -)
+                                      U   re-centre
+
+   W/S  forward / back
+   Q/E  strafe left / right
+   A/D  rotate CCW / CW
+
+ SPACE   E-STOP (latched - press 1 to resume)
+ 1 2 3   KEYBOARD / GAZE / EEG mode
+ Ctrl+C  quit          (q is STRAFE, not quit)
 ```
 
+> **`q` strafes left — it does not quit.** Quitting is Ctrl+C. When the node
+> exits it prints `restart with: ./m1.sh teleop`.
+>
 > Keys are not "held" — a command stays alive for 0.25 s after the last press
 > and then decays to zero, so a single tap gives a short nudge.
 

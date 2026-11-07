@@ -76,8 +76,11 @@ watchdog `0.35 s`.
 | Area | State |
 |---|---|
 | Chassis, PTZ, camera, LiDAR | Working (validated on hardware) |
+| Servo axis mapping | Working — `s1`=tilt, `s2`=pan, confirmed by hand |
 | Arbiter + watchdog | Working — 12/12 safety checks pass |
 | Gaze control | Working (zone mapping + PTZ verified) |
 | EEG control | Working (UDP end-to-end verified) |
 | SLAM on operator PC | Working |
+| start / stop / restart | Working — verified over two consecutive cycles |
+| Servo travel limits | **Not confirmed** against mechanical stops |
 | VM-side teleop | **In progress** |

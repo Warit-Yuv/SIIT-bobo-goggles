@@ -326,7 +326,7 @@ you stack on top, updating is free.
 
 ---
 
-## Part 7 — The five bugs, as lessons
+## Part 7 — The bugs, as lessons
 
 These are the most instructive part of the project. Every one was **silent** —
 no crash, no error, just wrong behaviour.
@@ -458,6 +458,58 @@ Fixed with a `flock` singleton lock. A second start now refuses:
 matched **its own command line** and killed the session. Patterns must never
 match the process that runs them.
 
+### Lesson 6: Some bugs can only be found by watching
+
+The servo axes were backwards in every comment, parameter name and line of gaze
+maths. No log, no test, no amount of reading could reveal it — `s1` looked
+exactly as valid when it was panning instead of tilting.
+
+It took one command and a pair of eyes:
+
+```
+{s1: 70, s2: 90}   ->  head tilts UP      so s1 is TILT
+{s1: 40, s2: 120}  ->  head turns LEFT    so s2 is PAN
+```
+
+> **Lesson:** automated tests prove the code does *what you specified*. They
+> cannot tell you that you specified the wrong thing. For anything physical,
+> watch it move once.
+
+### Lesson 7: A "level" topic is not an "edge" topic
+
+The buzzer latched on forever after one mode change. The driver treats
+`/Buzzer` as a level:
+
+```python
+if msg.data: set_beep(1)    # ON, and stays on
+else:        set_beep(0)    # OFF
+```
+
+Publishing `true` and never `false` is a permanent beep. This is common: LEDs,
+relays and enable lines all behave this way.
+
+> **Lesson:** before publishing to an actuator, find out whether it is
+> edge-triggered or level-held. If it is level-held, you own both halves of the
+> signal.
+
+### Lesson 8: Test teardown by running it twice
+
+Three separate bugs hid behind each other in `stop`:
+
+1. the supervisor holding the lock was never killed;
+2. every child inherited the lock file descriptor, so the whole tree held it;
+3. the EKF cleanup pattern matched its *node name* (`ekf_filter_node`) instead
+   of its *binary* (`ekf_node`), orphaning four processes.
+
+Each one was invisible until the previous one was fixed. And because the
+singleton guard refused to start a second stack, the failure surfaced as
+*"a robot stack is already running"* — which sounds like a state problem, not
+three cleanup bugs.
+
+> **Lesson:** start→stop→start. If you only ever test one direction, you are
+> testing half the system. And a guard that blocks you is often hiding the bug
+> rather than being the bug.
+
 ---
 
 ## Part 8 — What's finished
@@ -488,7 +540,7 @@ match the process that runs them.
 
 | Item | Why | Effort |
 |---|---|---|
-| Servo direction | needs your eyes on the physical head | 1 min |
+| Servo **travel limits** | direction confirmed, ranges are still the vendor's | 2 min |
 | Gaze model calibration | needs you in front of the webcam | 5 min |
 | EEG with real headset | needs the Muse 2 | 10 min |
 | Floor trial | needs space + a spotter | 15 min |
@@ -515,27 +567,34 @@ docker exec ros-humble-dev bash -lc \
 
 **Pass:** ~10 Hz, steady. You just saw it at 10.03 Hz with 328 real returns.
 
-### Step 2 — Confirm servo direction (1 minute)
+### Step 2 — Servo direction (already confirmed)
 
-The robot is running. Tell the head to look left, then up:
+The head's axes are **not** what the parameter names suggest:
 
-```bash
-ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 70, s2: 90}"
-ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 60}"
-```
+| | Axis | Larger value |
+|---|---|---|
+| **`s1`** | **TILT** (up/down) | look **up** |
+| **`s2`** | **PAN** (left/right) | look **left** |
 
-**Watch the camera head.**
+This was verified by hand: `s1` 0 = down, 30 = level, 70 = up; `s2` 60 = right,
+90 = centre, 120 = left. Rest pose is `s1=40, s2=90`.
 
-- If `s1: 70` turns it **left** (from the robot's point of view) and `s2: 60`
-  tilts it **up**, you're done.
-- If either is backwards, note it — you'll set `invert_pan` / `invert_tilt`
-  later. This is the only convention I could not verify without your eyes.
-
-Then re-centre:
+What is **not** confirmed is the **travel range**. The configured limits are the
+vendor joystick values (`s1` 0..180, `s2` 0..110 — the driver hard-clamps `s2`)
+and have never been checked against the mechanical stops. Test them slowly and
+stop before the servo buzzes or stalls:
 
 ```bash
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 5, s2: 90}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 100, s2: 90}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 20}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 160}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 ```
+
+If a limit is wrong, change `servo_s1_min/max` or `servo_s2_min/max` in
+`config/m1_params.yaml` — no code change needed.
 
 ### Step 3 — Keyboard drive (2 minutes)
 
@@ -665,7 +724,7 @@ If all three are right, the robot side is fine and the problem is on the PC.
 
 ## Part 11 — How to think about debugging
 
-The pattern behind all five bugs:
+The pattern behind all of them:
 
 ### 1. Verify at the lowest level first
 
