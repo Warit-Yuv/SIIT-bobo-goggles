@@ -23,6 +23,14 @@ control_arbiter_node:
 
     initial_mode: 1            # 1 = KEYBOARD
     publish_rate_hz: 20.0
+
+    # Keyboard works in EVERY mode. A non-zero keyboard command wins for this
+    # long, then the active mode resumes on its own. Safe because a keyboard
+    # command needs a human holding a key - unlike an EEG gesture, it cannot
+    # arrive by accident.
+    keyboard_override: true
+    keyboard_override_sec: 0.4
+
     # Beep on mode change. OFF by default: the buzzer latches on the chassis
     # driver (true -> set_beep(1), false -> set_beep(0)), so a beep that is not
     # explicitly turned off sounds forever. The arbiter now pulses on/off, but
@@ -56,3 +64,36 @@ image_throttle_node:
     input_topic: /image_raw/compressed
     output_topic: /image_throttled/compressed
     target_rate_hz: 20.0
+
+gaze_control_node:
+  ros__parameters:
+    # PTZ aiming is POSITIONAL: the gaze offset maps to an absolute angle, so
+    # the head stops where your eyes stop and returns when you look back to
+    # centre. (An integrating version ran away to the travel limit.)
+    #
+    # Total degrees of travel used across the deadzone radius. Lower = calmer
+    # and finer; raise if the head does not follow far enough.
+    servo_pan_span: 30.0
+    servo_tilt_span: 20.0
+    # Low-pass per tick: 1.0 = instant/jittery, 0.2 = very smooth/laggy.
+    servo_smoothing: 0.35
+
+    dwell_time_sec: 0.40
+    deadzone_radius_ratio: 0.25
+    enable_strafe: true
+    gaze_link_timeout_sec: 0.6
+
+    drive_speed_x: 0.20
+    drive_speed_y: 0.20
+    turn_speed_z: 0.60
+
+    # s1 = TILT (larger = up), s2 = PAN (larger = left)
+    servo_s1_center: 40.0
+    servo_s2_center: 90.0
+    servo_s1_min: 0.0
+    servo_s1_max: 180.0
+    servo_s2_min: 0.0
+    servo_s2_max: 110.0
+
+    # Never claim the mode automatically; the operator decides.
+    assert_mode: false

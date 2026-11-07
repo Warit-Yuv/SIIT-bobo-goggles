@@ -85,6 +85,15 @@ def launch_setup(context, *args, **kwargs):
     # ---------------- RViz ----------------
     if arg('rviz').lower() == 'true':
         cfg = arg('rviz_config')
+        if not cfg:
+            # Ship a config that already has LaserScan (Best Effort), Map,
+            # RobotModel (/robot_description), TF, Odometry and the camera
+            # image. Hand-adding those displays, and remembering that /scan
+            # must be Best Effort, is the most common way to end up staring at
+            # an empty RViz.
+            cfg = os.path.join(
+                get_package_share_directory('m1_control'), 'config',
+                'm1_operator.rviz')
         actions.append(Node(
             package='rviz2', executable='rviz2', name='rviz2',
             output='screen',

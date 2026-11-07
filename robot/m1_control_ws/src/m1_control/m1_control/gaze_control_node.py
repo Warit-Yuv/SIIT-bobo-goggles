@@ -110,11 +110,17 @@ class GazeControlNode(Node):
         self.declare_parameter('drive_speed_y', 0.20)
         self.declare_parameter('turn_speed_z', 0.60)
 
-        self.declare_parameter('servo_gain_pan', 1.5)
-        self.declare_parameter('servo_gain_tilt', 1.5)
-        self.declare_parameter('servo_rate_limit_hz', 12.0)
-        self.declare_parameter('servo_s1_center', 40.0)
-        self.declare_parameter('servo_s2_center', 90.0)
+        # ---- PTZ aiming (positional, see tick()) ----
+        # Total degrees of travel used across the deadzone radius. Smaller =
+        # finer and calmer; larger = the head follows your eyes further.
+        self.declare_parameter('servo_pan_span', 30.0)
+        self.declare_parameter('servo_tilt_span', 20.0)
+        # Low-pass factor per tick (1.0 = instant, 0.2 = very smooth).
+        self.declare_parameter('servo_smoothing', 0.35)
+
+        self.declare_parameter('servo_rate_limit_hz', 20.0)
+        self.declare_parameter('servo_s1_center', 40.0)   # tilt centre
+        self.declare_parameter('servo_s2_center', 90.0)   # pan centre
         self.declare_parameter('servo_s1_min', 0.0)
         self.declare_parameter('servo_s1_max', 180.0)
         self.declare_parameter('servo_s2_min', 0.0)
@@ -136,16 +142,19 @@ class GazeControlNode(Node):
         self.drive_vx = float(gp('drive_speed_x').value)
         self.drive_vy = float(gp('drive_speed_y').value)
         self.turn_wz = float(gp('turn_speed_z').value)
-        self.gain_pan = float(gp('servo_gain_pan').value)
-        self.gain_tilt = float(gp('servo_gain_tilt').value)
+        self.pan_span = float(gp('servo_pan_span').value)
+        self.tilt_span = float(gp('servo_tilt_span').value)
+        self.servo_smoothing = float(np.clip(gp('servo_smoothing').value, 0.01, 1.0))
         self.invert_pan = bool(gp('invert_pan').value)
         self.invert_tilt = bool(gp('invert_tilt').value)
         self.assert_mode = bool(gp('assert_mode').value)
 
         # Raw servo positions, named as the message/hardware name them.
         #   s1 = TILT (larger = up)      s2 = PAN (larger = left)
-        self.s1 = float(gp('servo_s1_center').value)      # tilt
-        self.s2 = float(gp('servo_s2_center').value)      # pan
+        self.pan_center = float(gp('servo_s2_center').value)
+        self.tilt_center = float(gp('servo_s1_center').value)
+        self.s1 = self.tilt_center                        # tilt
+        self.s2 = self.pan_center                         # pan
         self.s1_min, self.s1_max = (float(gp('servo_s1_min').value),
                                     float(gp('servo_s1_max').value))
         self.s2_min, self.s2_max = (float(gp('servo_s2_min').value),
@@ -287,23 +296,41 @@ class GazeControlNode(Node):
         twist = Twist()
 
         if zone == ZONE_CENTER:
-            # Fine PTZ aiming. Scale by the deadzone radius so full deflection
-            # at the deadzone edge gives the maximum step.
+            # PTZ aiming is POSITIONAL, not integrating.
+            #
+            # An earlier version added a small step to the servo angle on
+            # every tick, which is rate control: holding the eyes slightly off
+            # centre drove the head further and further until it hit the travel
+            # limit and stayed there ("it turns left too much"). That is
+            # joystick behaviour, and it makes fine aiming impossible.
+            #
+            # Here the gaze offset maps directly to an absolute target angle,
+            # so:
+            #   * looking slightly left  -> a slightly left angle, and it STOPS
+            #   * looking back to centre -> the head returns to centre
+            #   * the range is inherently bounded by the span below
             #
             # Axis mapping: gaze is in image coordinates (+dx = right,
             # +dy = down). Servo s1 = tilt (larger = up), s2 = pan (larger =
-            # left). So both steps are negated:
-            #   looking left  (dx < 0) -> s2 increases -> pan left
-            #   looking up    (dy < 0) -> s1 increases -> tilt up
-            pan_step = -(dx / max(1e-6, deadzone_r)) * self.gain_pan
-            tilt_step = -(dy / max(1e-6, deadzone_r)) * self.gain_tilt
+            # left). Both offsets are therefore negated.
+            frac_x = float(np.clip(-dx / max(1e-6, deadzone_r), -1.0, 1.0))
+            frac_y = float(np.clip(-dy / max(1e-6, deadzone_r), -1.0, 1.0))
             if self.invert_pan:
-                pan_step = -pan_step
+                frac_x = -frac_x
             if self.invert_tilt:
-                tilt_step = -tilt_step
-            # pan drives s2, tilt drives s1
-            self.s2 = float(np.clip(self.s2 + pan_step, self.s2_min, self.s2_max))
-            self.s1 = float(np.clip(self.s1 + tilt_step, self.s1_min, self.s1_max))
+                frac_y = -frac_y
+
+            # Full deadzone deflection == half of the configured span.
+            pan_target = self.pan_center + frac_x * (self.pan_span * 0.5)
+            tilt_target = self.tilt_center + frac_y * (self.tilt_span * 0.5)
+
+            pan_target = float(np.clip(pan_target, self.s2_min, self.s2_max))
+            tilt_target = float(np.clip(tilt_target, self.s1_min, self.s1_max))
+
+            # Low-pass so tracker jitter does not vibrate the servo.
+            a = self.servo_smoothing
+            self.s2 += a * (pan_target - self.s2)
+            self.s1 += a * (tilt_target - self.s1)
             self._publish_servo()
         else:
             # Dwell gate: rejects saccades, which would otherwise cause

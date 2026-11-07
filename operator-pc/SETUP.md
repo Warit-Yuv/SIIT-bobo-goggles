@@ -47,12 +47,38 @@ export ROS_DOMAIN_ID=30          # MUST match the robot
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 
 source /opt/ros/humble/setup.bash
-source ~/m1_control_ws/install/setup.bash   # after step 3
+source ~/m1_control_ws/install/setup.bash
 
 echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID | ROS=$ROS_DISTRO | RMW=$RMW_IMPLEMENTATION"
 EOF
 source ~/.bashrc
 ```
+
+> **Where does the workspace live?** `~/m1_control_ws` — i.e.
+> `/home/rescue/m1_control_ws`. Check with `ls ~/m1_control_ws`; you should see
+> `build  install  log  src  scripts  config  integrations`.
+>
+> **The `source` line must actually be there.** If it is missing you get:
+>
+> ```
+> Package 'm1_control' not found: ..., searching: [...]
+> ```
+>
+> The search list in that error is the fastest way to tell: if
+> `/home/rescue/m1_control_ws/install/m1_control` is **not** in it, the line is
+> missing or the workspace was never built. Both are fixed by:
+>
+> ```bash
+> cd ~/m1_control_ws
+> colcon build --symlink-install --packages-select m1_control
+> echo 'source ~/m1_control_ws/install/setup.bash' >> ~/.bashrc
+> source ~/.bashrc
+> ```
+>
+> **Order matters.** Put this `source` line *after* your other workspace
+> sources (`ros2_ws`, `turtlebot3_ws`, `radar_ws`, ...). Each `source` prepends
+> to `AMENT_PREFIX_PATH`, and the last one sourced wins any name collision. An
+> overlay must come last.
 
 Verify:
 
@@ -60,6 +86,7 @@ Verify:
 echo $ROS_DOMAIN_ID       # must print 30
 echo $ROS_DISTRO          # must print humble
 echo $RMW_IMPLEMENTATION  # must print rmw_cyclonedds_cpp
+ros2 pkg prefix m1_control
 ```
 
 > **`RMW_IMPLEMENTATION` must match the robot.** This is not a tuning choice —
@@ -266,6 +293,16 @@ ros2 run nav2_map_server map_saver_cli -f ~/maps/room1
 Two supported setups. **Both end at the same topic** (`/gaze/point`), so the
 robot side is identical.
 
+> **Want the GazeModel GUI with Calibrate (C) and Quick fix (F)?** That app is
+the PySide6 window in `github.com/lANXEZ/GazeModel` — the one with the dot
+calibration and the accuracy test. It runs on **Windows** (§7.1) and its
+calibration and quick-fix buttons keep working exactly as before; only the
+output is redirected to the robot instead of a floating pointer. Nothing about
+the calibration workflow changes.
+>
+> `gaze_hud_node` (the alternative below) is a plain OpenCV window with no
+> calibration UI. Use §7.1 if you want the calibration workflow.
+
 ### 7.1 Option A — GazeModel natively on Windows (recommended)
 
 **Why native Windows:** GazeModel is a PySide6 desktop app whose output is a
@@ -361,12 +398,33 @@ after silence: STOPPED (pass)
 
 | Region | Behaviour |
 |---|---|
-| Inside deadzone (25 % of half-screen) | Chassis **still**; gaze offsets drive PTZ pan/tilt proportionally |
+| Inside deadzone (25 % of half-screen) | Chassis **still**; the gaze offset sets the head angle **positionally** |
 | Outside, held ≥ **0.40 s** | Drive / strafe / turn in that direction |
 | Gaze stops arriving > **0.6 s** | Velocity zeroed (link watchdog) |
 
 The dwell gate exists to reject **saccades** — without it, every natural glance
 away from centre would trigger a spurious drive command.
+
+#### The head angle is positional, not integrating
+
+Looking slightly left moves the head slightly left **and it stays there**.
+Looking back to centre returns it. It does not keep drifting.
+
+An earlier version added a step on every tick, which is rate control - holding
+your eyes off-centre drove the head to the travel limit and pinned it there
+("it turns left too much"). Three parameters control the new behaviour:
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `servo_pan_span` | 30 deg | degrees of pan used across the deadzone radius |
+| `servo_tilt_span` | 20 deg | same for tilt |
+| `servo_smoothing` | 0.35 | low-pass; lower = calmer but laggier |
+
+```bash
+# Calmer, less travel
+ros2 run m1_control gaze_control_node --ros-args \
+    -p servo_pan_span:=20.0 -p servo_smoothing:=0.2
+```
 
 ### 7.5 If pan/tilt move the wrong way
 
@@ -471,15 +529,24 @@ ros2 run m1_control sensor_sync_node --ros-args -p slop:=0.25
 ## 10. Run Everything
 
 ```bash
-# Terminal 1 - operator stack (gaze HUD + SLAM + RViz)
+# Terminal 1 - operator stack (SLAM + RViz with the preconfigured layout)
 ros2 launch m1_control m1_operator.launch.py
 
-# Terminal 2 - RViz only, if you prefer separate windows
-ros2 run rviz2 rviz2
-
-# Terminal 3 - sensor sync (optional)
-ros2 run m1_control sensor_sync_node
+# Terminal 2 - control panel: mode buttons, battery, E-STOP
+ros2 run m1_control m1_panel
 ```
+
+The launch file ships an RViz layout (`config/m1_operator.rviz`) that already
+contains:
+
+| Display | Topic | Reliability |
+|---|---|---|
+| LaserScan | `/scan` | **Best Effort** |
+| Map | `/map` | Reliable |
+| **RobotModel** | `/robot_description` | Transient Local |
+| TF | — | — |
+| Odometry | `/odom` | Reliable |
+| Image | `/image_throttled/compressed` | **Best Effort** |
 
 Useful launch arguments:
 
@@ -489,11 +556,56 @@ ros2 launch m1_control m1_operator.launch.py slam:=false rviz:=false
 ros2 launch m1_control m1_operator.launch.py gaze_source:=mouse    # click to aim
 ```
 
+### The robot model does not appear
+
+RViz gets the URDF from `/robot_description`, which `robot_state_publisher` on
+the Pi publishes **latched** (`TRANSIENT_LOCAL`). If the RobotModel display is
+empty:
+
+```bash
+ros2 topic echo /robot_description --once | head -3   # must print URDF XML
+ros2 run tf2_ros tf2_echo base_link laser             # TF must resolve
+```
+
+If `/robot_description` is empty, the robot-side bringup is not running. If TF
+does not resolve, your `RMW_IMPLEMENTATION` does not match the robot.
+
+### Two mappers fighting over `/map`
+
+Symptom: the map in RViz flickers or resets, as if two maps are alternating.
+That is exactly what is happening — `ros2 launch` leaves children behind when a
+terminal is closed or SSH drops, so two `async_slam_toolbox` instances both
+publish `/map`.
+
+```bash
+# Check
+ros2 topic info /map          # "Publisher count" must be 0 or 1
+ps -eo pid,cmd | grep [a]sync_slam_toolbox
+
+# Fix
+~/m1_control_ws/scripts/kill_vm.sh          # stop the operator stack cleanly
+~/m1_control_ws/scripts/kill_vm.sh --status # report only
+```
+
+Then start **one** stack. Never run `m1_operator.launch.py` twice.
+
 ---
 
 ## 11. Control Modes
 
-Switch from any machine on domain 30:
+### Use the panel (recommended)
+
+```bash
+ros2 run m1_control m1_panel
+```
+
+An always-on-top window with four mode buttons, a large E-STOP, live battery,
+gaze zone and video rate. Keys `1` `2` `3` `0` also work while it is focused.
+
+A button is the right interface for this: when the robot is moving and you want
+it to stop, you should not be typing a `ros2 topic pub` command.
+
+### Or from a terminal
 
 ```bash
 ros2 topic pub --once /control_mode std_msgs/msg/UInt8 "{data: 1}"   # KEYBOARD
@@ -503,8 +615,25 @@ ros2 topic pub --once /control_mode std_msgs/msg/UInt8 "{data: 0}"   # E-STOP
 ```
 
 **E-STOP is latched** — it keeps holding zero until you explicitly select
-another mode. Only the active mode's topic is forwarded, so keyboard, gaze and
-EEG can never fight each other.
+another mode.
+
+### The keyboard works in every mode
+
+You do not have to switch to KEYBOARD to nudge the robot. A non-zero keyboard
+command wins for **0.4 s**, then the active mode resumes by itself:
+
+| Situation | Result |
+|---|---|
+| GAZE mode, press `W` | drives forward immediately |
+| release `W` | gaze takes control back, no mode change needed |
+| EEG mode, press `A` | rotates left immediately |
+| E-STOP latched | **keyboard is ignored** — E-STOP outranks everything |
+
+This is safe because a keyboard command requires a human actively holding a
+key; it cannot arrive by accident the way a misclassified EEG gesture can.
+
+Disable it with `-p keyboard_override:=false` if you ever want strict
+mode exclusivity.
 
 Safety envelope enforced by the arbiter on the robot:
 

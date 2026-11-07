@@ -89,6 +89,13 @@ class ControlArbiterNode(Node):
         self.declare_parameter('publish_rate_hz', 20.0)
         self.declare_parameter('beep_on_mode_change', False)
 
+        # Keyboard works in every mode. A non-zero keyboard command wins for
+        # this long, then control returns to the active mode by itself.
+        # 0.4 s is long enough to hold a key and short enough that the gaze or
+        # EEG source takes back over as soon as you let go.
+        self.declare_parameter('keyboard_override', True)
+        self.declare_parameter('keyboard_override_sec', 0.4)
+
         self.timeout = float(self.get_parameter('watchdog_timeout_sec').value)
         self.max_vx = float(self.get_parameter('max_linear_x').value)
         self.max_vy = float(self.get_parameter('max_linear_y').value)
@@ -113,6 +120,13 @@ class ControlArbiterNode(Node):
 
         # Timestamps of recent mode switches, for churn detection.
         self._mode_switch_times = []
+
+        # Keyboard override state.
+        self.keyboard_override = bool(self.get_parameter('keyboard_override').value)
+        self.keyboard_override_sec = float(
+            self.get_parameter('keyboard_override_sec').value)
+        self._kb_twist = Twist()
+        self._kb_time = self.get_clock().now()
 
         # ---------------- interfaces ----------------
         # Actuator topics: RELIABLE. Setpoints must not be dropped.
@@ -255,6 +269,20 @@ class ControlArbiterNode(Node):
 
     # ---------------------------------------------------------- input sinks
     def _kb_vel_cb(self, msg: Twist):
+        # Keyboard is always accepted, in ANY mode.
+        #
+        # The operator asked for this explicitly: with gaze or EEG driving, the
+        # keyboard should still be able to nudge the robot without switching
+        # modes first. It is safe to always honour because a keyboard command
+        # requires a human actively pressing a key - it cannot arrive by
+        # accident the way a misclassified EEG gesture can.
+        #
+        # Precedence is resolved in control_loop(): a non-zero keyboard command
+        # wins for `keyboard_override_sec`, then control returns to the active
+        # mode automatically. Nothing is permanently taken over.
+        kb = self.clamp_velocity(msg)
+        self._kb_twist = kb
+        self._kb_time = self.get_clock().now()
         if self.active_mode == MODE_KEYBOARD:
             self._accept(msg)
 
@@ -267,7 +295,8 @@ class ControlArbiterNode(Node):
             self._accept(msg)
 
     def _kb_servo_cb(self, msg: Vector3):
-        if self.active_mode == MODE_KEYBOARD:
+        # Gimbal is keyboard-only by design; gaze drives it in GAZE mode.
+        if self.active_mode == MODE_KEYBOARD or self.keyboard_override:
             self._set_servo(msg.x, msg.y)
 
     def _gaze_servo_cb(self, msg: Vector3):
@@ -296,11 +325,28 @@ class ControlArbiterNode(Node):
             self._publish_servo()
 
         # Latched E-STOP: hold zero until an operator selects another mode.
+        # This outranks the keyboard override - an emergency stop must never be
+        # overridable by a key press.
         if self.active_mode == MODE_ESTOP:
             self.cmd_vel_pub.publish(Twist())
             return
 
-        elapsed = (self.get_clock().now() - self.last_command_time).nanoseconds / 1e9
+        now = self.get_clock().now()
+
+        # ---------------- keyboard override ----------------
+        # A recent, non-zero keyboard command wins regardless of mode, then
+        # expires on its own so the active mode resumes without the operator
+        # having to do anything.
+        if self.keyboard_override:
+            kb_age = (now - self._kb_time).nanoseconds / 1e9
+            kb_active = (kb_age <= self.keyboard_override_sec and
+                         self._magnitude(self._kb_twist) > 1e-6)
+            if kb_active:
+                self.cmd_vel_pub.publish(self._kb_twist)
+                self.timed_out = False
+                return
+
+        elapsed = (now - self.last_command_time).nanoseconds / 1e9
         if elapsed > self.timeout:
             if not self.timed_out:
                 self.cmd_vel_pub.publish(Twist())
@@ -316,6 +362,11 @@ class ControlArbiterNode(Node):
             return
 
         self.cmd_vel_pub.publish(self.latest_twist)
+
+    @staticmethod
+    def _magnitude(twist):
+        return max(abs(twist.linear.x), abs(twist.linear.y),
+                   abs(twist.angular.z))
 
     def shutdown(self):
         try:
