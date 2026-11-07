@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# =============================================================================
+# env.sh - canonical ROS 2 environment for the ROSMASTER M1.
+#
+# Source this, never hand-type the source chain:
+#     source /root/m1_control_ws/scripts/env.sh
+#
+# Sourcing order matters: base ROS -> driver underlay -> chassis underlay ->
+# our overlay. Later entries win, which is why the overlay comes last.
+# =============================================================================
+
+# Unique domain: keeps this robot isolated from other ROS 2 traffic on the LAN.
+export ROS_DOMAIN_ID=30
+
+# Hardware identifiers consumed by Yahboom's launch files.
+export ROBOT_TYPE=M1
+export RPLIDAR_TYPE=tmini          # c1 | tmini
+export CAMERA_TYPE=usb             # usb | nuwa
+
+# PTZ rest pose verified on this robot (s1=pan, s2=tilt).
+export INIT_SERVO_S1=40
+export INIT_SERVO_S2=90
+
+# Layer 1 - core ROS 2 Humble
+source /opt/ros/humble/setup.bash
+
+# Layer 2 - third-party drivers (usb_cam, ydlidar, robot_localization, slam)
+if [ -f /root/yahboomcar_ros2_ws/software/library_ws/install/setup.bash ]; then
+    source /root/yahboomcar_ros2_ws/software/library_ws/install/setup.bash
+fi
+
+# Layer 3 - Yahboom chassis apps and messages
+if [ -f /root/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash ]; then
+    source /root/yahboomcar_ros2_ws/yahboomcar_ws/install/setup.bash
+fi
+
+# Layer 4 - our overlay
+if [ -f /root/m1_control_ws/install/setup.bash ]; then
+    source /root/m1_control_ws/install/setup.bash
+fi
+
+export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+
+# FastDDS is the only RMW shipped in this image, so no RMW_IMPLEMENTATION is
+# exported. CycloneDDS is not installed - setting it would break every node.
+unset RMW_IMPLEMENTATION
+
+if [ "${M1_QUIET:-0}" != "1" ]; then
+    echo "--------------------------------------------------------"
+    echo -e "ROS_DOMAIN_ID: \033[32m${ROS_DOMAIN_ID}\033[0m | ROS: \033[34m${ROS_DISTRO:-none}\033[0m"
+    echo -e "robot: \033[32m${ROBOT_TYPE}\033[0m | lidar: \033[32m${RPLIDAR_TYPE}\033[0m | camera: \033[32m${CAMERA_TYPE}\033[0m"
+    echo -e "overlay: \033[32m$( [ -f /root/m1_control_ws/install/setup.bash ] && echo loaded || echo MISSING )\033[0m"
+    echo "--------------------------------------------------------"
+fi

@@ -1,0 +1,83 @@
+# slam_toolbox configuration for the ROSMASTER M1 + YDLIDAR Tmini Plus.
+#
+# The stock online_async profile warns on two counts and then drops scans:
+#   "minimum laser range setting (0.0 m) exceeds the capabilities of the used
+#    Lidar"                                        -> range_min is 0.03 m
+#   "maximum laser range setting (20.0 m) exceeds ... (12.0 m)"
+#                                                   -> range_max is 12.0 m
+# It also defaults its transform timeout to 0, which is fine when TF is local
+# but drops scans over Wi-Fi, where the scan can arrive a few ms before the
+# matching odom->base_footprint transform. Raising `transform_timeout` is what
+# stops the "Message Filter dropping message ... queue is full" spam.
+#
+# Measured on this robot: /scan 10.03 Hz, /tf 20.9 Hz, /odom 10.6 Hz.
+slam_toolbox:
+  ros__parameters:
+
+    # ----- frames -----
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint
+    scan_topic: /scan
+    use_sim_time: false
+
+    # ----- solver -----
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ----- sensor model: must match the Tmini Plus -----
+    mode: mapping
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02      # 50 Hz map->odom
+    map_update_interval: 1.0
+    resolution: 0.05
+    max_laser_range: 12.0               # Tmini Plus hardware maximum
+    min_laser_range: 0.03               # Tmini Plus hardware minimum
+
+    # Wi-Fi tolerance. Without this the node logs "queue is full" and drops
+    # every scan that arrives before its matching transform.
+    transform_timeout: 0.5
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: true
+
+    # ----- scan matching -----
+    use_scan_matching: true
+    use_scan_barycenter: true
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # ----- loop closure -----
+    do_loop_closing: true
+    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+
+    # ----- correlation -----
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # ----- scan matcher penalties -----
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

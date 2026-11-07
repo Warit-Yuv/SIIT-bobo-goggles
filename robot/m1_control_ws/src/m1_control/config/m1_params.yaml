@@ -1,0 +1,49 @@
+# Shared parameters for the m1_control nodes.
+# Loaded by the launch files; edit here rather than in the launch scripts.
+
+control_arbiter_node:
+  ros__parameters:
+    watchdog_timeout_sec: 0.35
+    max_linear_x: 0.25
+    max_linear_y: 0.20
+    max_angular_z: 0.80
+
+    # Servo centres verified on this robot:
+    #   ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
+    default_servo_s1: 40
+    default_servo_s2: 90
+    servo_s1_min: 0
+    servo_s1_max: 180
+    servo_s2_min: 0
+    servo_s2_max: 110          # driver hard-clamps s2 to 0..110
+
+    initial_mode: 1            # 1 = KEYBOARD
+    publish_rate_hz: 20.0
+    beep_on_mode_change: true
+
+wasd_teleop_node:
+  ros__parameters:
+    speed_trans: 0.20
+    speed_strafe: 0.20
+    speed_rot: 0.60
+    servo_step: 5.0
+    servo_s1_center: 40.0
+    servo_s2_center: 90.0
+    servo_s1_min: 0.0
+    servo_s1_max: 180.0
+    servo_s2_min: 0.0
+    servo_s2_max: 110.0
+    hold_time_sec: 0.25
+    publish_rate_hz: 20.0
+
+eeg_udp_bridge:
+  # Tuned on the command line / launch `arguments`, not here: the bridge parses
+  # its own argparse options (--speed, --steer, --link-timeout, ...) before ROS
+  # starts, so it stays runnable standalone for `--dry-run` testing.
+  ros__parameters: {}
+
+image_throttle_node:
+  ros__parameters:
+    input_topic: /image_raw/compressed
+    output_topic: /image_throttled/compressed
+    target_rate_hz: 20.0

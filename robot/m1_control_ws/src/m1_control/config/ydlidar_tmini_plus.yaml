@@ -1,0 +1,35 @@
+# YDLIDAR Tmini Plus - parameters verified on this robot.
+#
+# Identified from the device itself:
+#   Model: Tmini Plus   Firmware: 1.2   Hardware: 1
+#   Serial: 2026000800080141   Baudrate: 230400
+#
+# Measured result with these settings:
+#   /scan at 10.03 Hz, angle_min -pi .. angle_max +pi, range 0.03 .. 12.0 m
+#
+# Kept in our overlay (instead of referencing the vendor file) so the values are
+# version-controlled and a vendor image update cannot silently change them.
+
+ydlidar_ros2_driver_node:
+  ros__parameters:
+    port: /dev/rplidar          # udev symlink -> CP210x 10c4:ea60
+    frame_id: laser             # matches the static TF base_link -> laser
+    baudrate: 230400
+    lidar_type: 1               # TYPE_TRIANGLE
+    device_type: 0              # YDLIDAR_TYPE_SERIAL
+    sample_rate: 4              # 4 kHz, reported by the device
+    intensity_bit: 8
+    abnormal_check_count: 4
+    fixed_resolution: true
+    reversion: true
+    inverted: true
+    auto_reconnect: true        # re-open the port if the USB link drops
+    isSingleChannel: false
+    intensity: true
+    support_motor_dtr: false
+    angle_max: 180.0
+    angle_min: -180.0
+    range_max: 12.0
+    range_min: 0.03
+    frequency: 10.0
+    invalid_range_is_inf: true

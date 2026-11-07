@@ -1,0 +1,33 @@
+# ---- ROS 2 / colcon build artefacts ----
+build/
+install/
+log/
+logs/
+*.egg-info/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Runtime data (never commit) ----
+*.bag
+*.db3
+*.mcap
+# SLAM maps are large binaries; keep them out unless you mean to publish one
+*.pgm
+*.pgm.map
+recordings/
+
+# ---- Local overrides (may contain IPs, credentials) ----
+local.env
+*.local.yaml

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Drive the gaze pipeline with synthetic gaze points, for testing without eyes.
+
+Publishes /gaze/point and reports what the control node does with it.
+
+    python3 test_gaze.py                 # run the scripted sequence
+    python3 test_gaze.py --hold 2        # stay in each zone 2 s
+    python3 test_gaze.py --udp 127.0.0.1 # test the UDP path instead of ROS
+
+Sequence: centre -> forward -> centre -> strafe right -> centre -> forward-right
+-> centre -> silence (to prove the link timeout stops the robot).
+"""
+
+import argparse
+import json
+import socket
+import sys
+import time
+
+# Normalized gaze targets: (label, u, v). Centre is (0.5, 0.5).
+SEQUENCE = [
+    ('centre (deadzone: PTZ only)', 0.50, 0.50),
+    ('forward', 0.50, 0.12),
+    ('centre', 0.50, 0.50),
+    ('strafe right', 0.90, 0.50),
+    ('centre', 0.50, 0.50),
+    ('forward-right', 0.78, 0.22),
+    ('centre', 0.50, 0.50),
+]
+
+
+def run_udp(host, port, hold):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    print(f'[test] UDP target {host}:{port}')
+    for label, u, v in SEQUENCE:
+        print(f'[test] -> {label}  (u={u}, v={v})')
+        end = time.time() + hold
+        while time.time() < end:
+            sock.sendto(json.dumps({'type': 'gaze', 'u': u, 'v': v,
+                                    'valid': True, 'model': 'test'}).encode(),
+                        (host, port))
+            time.sleep(1 / 30)
+    print('[test] -> silence (link timeout should stop the robot)')
+    time.sleep(1.5)
+    print('[test] done')
+
+
+def run_ros(hold):
+    import rclpy
+    from geometry_msgs.msg import Point, Twist, Vector3
+    from rclpy.node import Node
+    from std_msgs.msg import String
+
+    rclpy.init()
+    node = rclpy.create_node('gaze_test_driver')
+    pub = node.create_publisher(Point, '/gaze/point', 10)
+
+    state = {'vel': None, 'servo': None, 'zone': ''}
+    node.create_subscription(Twist, '/cmd_vel/gaze',
+                             lambda m: state.__setitem__('vel', m), 10)
+    node.create_subscription(Vector3, '/servo/gaze',
+                             lambda m: state.__setitem__('servo', m), 10)
+    node.create_subscription(String, '/gaze/zone',
+                             lambda m: state.__setitem__('zone', m.data), 10)
+
+    def spin(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.01)
+
+    spin(1.0)
+    print(f'{"target":<30} {"zone":<18} {"vx":>6} {"vy":>6} {"wz":>6}  pan/tilt')
+    print('-' * 84)
+
+    for label, u, v in SEQUENCE:
+        end = time.time() + hold
+        while time.time() < end:
+            msg = Point()
+            msg.x, msg.y, msg.z = u, v, 0.0
+            pub.publish(msg)
+            rclpy.spin_once(node, timeout_sec=0.01)
+        vel = state['vel']
+        srv = state['servo']
+        vx = vel.linear.x if vel else 0.0
+        vy = vel.linear.y if vel else 0.0
+        wz = vel.angular.z if vel else 0.0
+        pt = f'{srv.x:.0f}/{srv.y:.0f}' if srv else '--'
+        print(f'{label:<30} {state["zone"]:<18} '
+              f'{vx:6.2f} {vy:6.2f} {wz:6.2f}  {pt}')
+
+    print('\n[test] stopping publisher; waiting for the link timeout...')
+    spin(1.2)
+    vel = state['vel']
+    stopped = vel is not None and max(abs(vel.linear.x), abs(vel.linear.y),
+                                      abs(vel.angular.z)) < 1e-6
+    print(f'[test] after silence: {"STOPPED (pass)" if stopped else "STILL MOVING (FAIL)"}')
+
+    node.destroy_node()
+    rclpy.shutdown()
+    return 0 if stopped else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--hold', type=float, default=1.0,
+                    help='seconds per zone (> dwell time of 0.4 s)')
+    ap.add_argument('--udp', default=None,
+                    help='send UDP to this host instead of publishing ROS')
+    ap.add_argument('--port', type=int, default=9100)
+    a = ap.parse_args()
+
+    if a.udp:
+        run_udp(a.udp, a.port, a.hold)
+        return 0
+    return run_ros(a.hold)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
