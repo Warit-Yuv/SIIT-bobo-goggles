@@ -103,7 +103,7 @@ These differ from common documentation — verified on this unit:
 | LiDAR device | `/dev/rplidar` (not `/dev/ydlidar`) |
 | Servo rest pose | **`s1=40, s2=90`** (not `90/35`) |
 | Camera format | `yuyv2rgb` @ 30 fps (MJPG is locked to 120 Hz at 640×480) |
-| DDS | **FastDDS only** — CycloneDDS is not installed |
+| DDS | **CycloneDDS on both machines** — a mismatch silently breaks `/tf_static` and SLAM |
 
 > Do **not** export `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`. It is not
 > installed, and setting it makes every node fail to start.

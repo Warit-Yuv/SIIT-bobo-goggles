@@ -562,7 +562,8 @@ re-arm a controller.
 | Camera `Select timeout` | MJPG at 30 fps | Use `pixel_format:=yuyv2rgb` |
 | Camera dark | 120 Hz shutter | Same fix — YUYV 30 Hz is 4× brighter |
 | Robot drives erratically | Two `/cmd_vel` publishers | `ros2 topic info /cmd_vel`; `m1.sh stop --hard` |
-| Nodes exit instantly | `RMW_IMPLEMENTATION` set | `unset RMW_IMPLEMENTATION` |
+| Nodes exit instantly | `RMW_IMPLEMENTATION` unset while the PC uses CycloneDDS | Export `rmw_cyclonedds_cpp` on **both** machines |
+| `/tf` arrives but SLAM makes no map | DDS mismatch breaks `/tf_static` | Same — `tf2_echo base_link laser` proves it |
 | `AMENT_TRACE_SETUP_FILES: unbound variable` | `set -u` active while sourcing ROS setup files | Fixed in `env.sh`; if you see it, update your copy |
 | Servo does not move | `yahboomcar_msgs` not sourced | Use `scripts/env.sh` |
 | Video freezes after seconds | UDP buffers | `tune_network.sh apply`, reboot |

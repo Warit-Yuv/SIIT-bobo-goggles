@@ -66,9 +66,29 @@ unset _m1_restore_nounset
 
 export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
 
-# FastDDS is the only RMW shipped in this image, so no RMW_IMPLEMENTATION is
-# exported. CycloneDDS is not installed - setting it would break every node.
-unset RMW_IMPLEMENTATION
+# ---------------------------------------------------------------------------
+# DDS middleware: CycloneDDS on BOTH machines.
+#
+# This is not a preference - the two machines must use the SAME RMW
+# implementation. /tf_static is published with TRANSIENT_LOCAL durability and
+# that QoS is not reliably delivered across different DDS vendors. Measured
+# with the Pi on FastDDS and the operator PC on CycloneDDS:
+#
+#     /tf        20.05 Hz   (dynamic transforms arrive)
+#     /tf_static never      (base_link -> laser missing)
+#     /map       never      (slam_toolbox cannot transform, silently does nothing)
+#
+# Both machines have rmw_cyclonedds_cpp installed, so CycloneDDS is used on
+# both. It is also the better choice over Wi-Fi: lower latency and fewer
+# dropped frames on fragmented image traffic.
+# ---------------------------------------------------------------------------
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+# Socket buffer tuning for Cyclone. Only set when the file actually exists so a
+# missing config can never stop the stack from starting.
+if [ -f /root/m1_control_ws/config/cyclonedds.xml ]; then
+    export CYCLONEDDS_URI=file:///root/m1_control_ws/config/cyclonedds.xml
+fi
 
 if [ "${M1_QUIET:-0}" != "1" ]; then
     echo "--------------------------------------------------------"

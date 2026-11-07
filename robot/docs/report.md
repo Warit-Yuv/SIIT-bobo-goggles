@@ -31,7 +31,7 @@ implemented, built and validated against real hardware:
 | Cross-machine DDS | **Working** | Zero-config discovery, Pi↔VM, 1.3 ms |
 | start / stop / restart | **Working** | Two consecutive cycles, 0 leftovers |
 
-**Nine defects were found and fixed during validation.** They are documented in
+**Ten defects were found and fixed during validation.** They are documented in
 §7 because each one would have been a silent failure in operation.
 
 ---
@@ -46,7 +46,7 @@ what the real machine reports. These differences matter:
 | YDLIDAR **Tmini** | **Tmini Plus**, FW 1.2, HW 1, S/N `2026000800080141` |
 | LiDAR at `/dev/ydlidar` | **`/dev/rplidar`** (udev rule maps `10c4:ea60`) |
 | Servo centre `s1=90, s2=35` | **`s1=40, s2=90`** — and **`s1` is tilt, `s2` is pan** (verified by hand, §10) |
-| CycloneDDS recommended | **Not installed.** FastDDS only — exporting `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` breaks every node |
+| CycloneDDS recommended | **Required on both machines.** A mismatch silently breaks `/tf_static` and SLAM (§7.10) |
 | Arbiter runs on operator PC | **Moved to the Pi** (see §3.1) |
 | `topic_tools throttle` | **Not installed** — replaced with our own node |
 | `laser_link` TF frame | URDF publishes **`laser_Link`**; driver publishes **`laser`** |
@@ -54,16 +54,30 @@ what the real machine reports. These differences matter:
 
 ### Why this matters
 
-The handbook's `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` line, copied verbatim,
-would make **every node fail to start**. Verified:
+An earlier version of this report claimed CycloneDDS was not installed and
+therefore had to be disabled. **That was wrong**, and acting on it cost real
+time. Both machines have `rmw_cyclonedds_cpp`:
 
 ```
-$ ls /opt/ros/humble/lib/ | grep ^librmw_
-librmw_fastrtps_cpp.so        <- the only DDS implementation present
+$ ls /opt/ros/humble/lib/ | grep -E '^librmw_.*\.so'
+librmw_cyclonedds_cpp.so      <- present, and required
+librmw_fastrtps_cpp.so
 librmw_implementation.so
 ```
 
-`scripts/env.sh` therefore explicitly *unsets* it, with a comment explaining why.
+More importantly, the two machines must use the **same** implementation.
+`/tf_static` is published with `TRANSIENT_LOCAL` durability, and that QoS is
+not reliably delivered across different DDS vendors. Measured with the Pi on
+FastDDS and the operator PC on CycloneDDS:
+
+| | Result |
+|---|---|
+| `/tf` (dynamic) | 20.05 Hz — fine |
+| `/tf_static` (`base_link`→`laser`) | **never arrived** |
+| `/map` | **never produced** — slam_toolbox silently did nothing |
+
+`scripts/env.sh` therefore exports `rmw_cyclonedds_cpp` on the robot, and
+`operator-pc/SETUP.md` does the same on the PC. See §7.10.
 
 ---
 
@@ -234,7 +248,7 @@ Everything stateful lives on the host, so the container is disposable:
 
 ## 7. Defects Found and Fixed
 
-Nine real bugs were caught by testing rather than by reading. Each is recorded
+Ten real bugs were caught by testing rather than by reading. Each is recorded
 because all five were **silent** — no crash, no error, just wrong behaviour.
 
 ### 7.1 The LiDAR "hardware fault" was a race condition
@@ -402,6 +416,58 @@ out on the next start.
 > Lesson: a teardown path is not tested until it is run **twice in a row**.
 > Three stop/start bugs surfaced in sequence because each one was hidden behind
 > the previous one.
+
+### 7.10 A DDS mismatch silently disabled SLAM
+
+This is the most expensive defect in the project, and the only one I got
+*backwards* in this report.
+
+The robot ran FastDDS; the operator PC had `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+in its `.bashrc`. On the surface everything worked:
+
+| Check | Result |
+|---|---|
+| DDS discovery | 39 topics visible from the PC |
+| `/scan` | 10.12 Hz |
+| `/image_throttled/compressed` | 20.27 Hz |
+| `/odom` | 9.97 Hz |
+| `/tf` | 20.05 Hz |
+
+Every stream a person would think to check was healthy. But
+`slam_toolbox` produced **no map at all**, with no error beyond one startup
+`queue is full` line.
+
+**Root cause:** `/tf_static` is published with `TRANSIENT_LOCAL` durability.
+That QoS is not reliably delivered between different DDS vendors. So:
+
+- `/tf` (dynamic, `VOLATILE`) — arrived
+- `/tf_static` (latched, `TRANSIENT_LOCAL`) — **never arrived**
+- therefore `base_link` → `laser` did not exist on the PC
+- therefore slam_toolbox could not transform a single scan, and quietly did
+  nothing
+
+Confirmed by asking for the transform directly:
+
+```
+$ ros2 run tf2_ros tf2_echo base_link laser
+Invalid frame ID "base_link" passed to canTransform argument target_frame
+```
+
+**Fix:** put both machines on `rmw_cyclonedds_cpp` (both already had it — the
+earlier claim in this report that it was missing was simply wrong). After the
+change:
+
+```
+base_link -> laser          Translation: [0.006, 0.000, 0.149]     OK
+odom -> base_footprint      Translation: [0.342, 0.000, 0.000]     OK
+/map                        93 occupied, 741 free, 151x41 @ 5 cm   OK
+```
+
+> **Lesson:** "all my topics are flowing" is not the same as "the system
+> works". A latched topic can be missing while every streaming topic is
+> perfect. When a consumer silently does nothing, check the *transforms* and
+> the *latched* topics first — and treat a mixed-vendor DDS setup as a
+> defect, not a configuration choice.
 
 ---
 
@@ -581,9 +647,9 @@ Then make it permanent in `config/m1_params.yaml`.
 
 ## 11. Known Limitations
 
-1. **CycloneDDS is not available.** FastDDS is used. Measured throughput is
-   already sufficient (20 Hz video, 10 Hz scan, no buffer overruns), so
-   installing CycloneDDS is optional, not required.
+1. **Both machines must use CycloneDDS.** This is a requirement, not a
+   preference — see §7.10. A mismatch does not error; it silently breaks
+   `/tf_static` and therefore SLAM.
 
 2. **`sensor_sync_node` produces a schematic overlay**, not a calibrated
    projection — this camera publishes no `CameraInfo`, so a true 3D projection
@@ -613,7 +679,8 @@ Then make it permanent in `config/m1_params.yaml`.
 | Robot drives erratically | Rogue `/cmd_vel` publisher | `ros2 topic info /cmd_vel`; `./m1.sh stop --hard` |
 | Video freezes after seconds | UDP buffers too small | `sudo scripts/tune_network.sh apply` |
 | Camera `Select timeout` | 120 Hz MJPG forced to 30 fps | Use `pixel_format:=yuyv2rgb` (already set) |
-| Nodes exit immediately | `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` | `unset RMW_IMPLEMENTATION` |
+| Nodes exit immediately | `RMW_IMPLEMENTATION` unset while the PC uses CycloneDDS | Export `rmw_cyclonedds_cpp` on **both** machines |
+| `/tf` arrives but SLAM makes no map | DDS mismatch breaks `/tf_static` | Same — see §7.10 |
 | VM sees no topics | Domain ID mismatch / not bridged | `echo $ROS_DOMAIN_ID` = 30 both sides |
 | Servo not moving | `yahboomcar_msgs` not sourced | Source Layer 3 before Layer 4 |
 | `queue is full` spam in SLAM | TF timeout too short for Wi-Fi | `transform_timeout: 0.5` (already set) |

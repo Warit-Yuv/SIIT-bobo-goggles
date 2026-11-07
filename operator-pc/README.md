@@ -70,7 +70,7 @@ Not installed (and not needed here): `robot_localization`, `usb_cam`,
 # 1. Environment (once)
 echo 'export ROS_DOMAIN_ID=30' >> ~/.bashrc
 echo 'source /opt/ros/humble/setup.bash' >> ~/.bashrc
-echo 'unset RMW_IMPLEMENTATION' >> ~/.bashrc
+echo 'export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp' >> ~/.bashrc   # must match the robot
 source ~/.bashrc
 
 # 2. Copy the workspace from the robot
@@ -92,7 +92,8 @@ ros2 launch m1_control m1_operator.launch.py
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ros2 topic list` empty | Domain mismatch / NAT mode | `ROS_DOMAIN_ID=30`, adapter → **Bridged** |
-| Nodes exit instantly | `RMW_IMPLEMENTATION` set | `unset RMW_IMPLEMENTATION` |
+| Nodes exit instantly | `RMW_IMPLEMENTATION` not set | Export `rmw_cyclonedds_cpp` (must match the robot) |
+| `/tf` ok but no map | DDS mismatch breaks `/tf_static` | `tf2_echo base_link laser` to confirm |
 | Image display black | QoS mismatch | Set display reliability to **Best Effort** |
 | SLAM `queue is full` spam | TF timeout too short | Use `config/slam_toolbox_m1.yaml` |
 | Gaze pointer far off | Stale calibration | Press **F** (quick fix) or **C** (recalibrate) |

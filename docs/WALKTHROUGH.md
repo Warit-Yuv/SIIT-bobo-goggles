@@ -510,6 +510,52 @@ three cleanup bugs.
 > testing half the system. And a guard that blocks you is often hiding the bug
 > rather than being the bug.
 
+### Lesson 9: "All my topics are flowing" is not "it works"
+
+This is the most expensive bug in the project, and the most deceptive.
+
+The robot ran one DDS middleware (FastDDS), the operator PC another
+(CycloneDDS). Every stream anyone would think to check was perfect:
+
+| Check | Result |
+|---|---|
+| DDS discovery | 39 topics visible |
+| `/scan` | 10.12 Hz |
+| `/image_throttled/compressed` | 20.27 Hz |
+| `/odom` | 9.97 Hz |
+| `/tf` | 20.05 Hz |
+
+And SLAM produced **no map at all** — no error, just silence.
+
+The cause is subtle. ROS publishes transforms on two topics:
+
+- **`/tf`** — the moving transforms, published continuously
+- **`/tf_static`** — the fixed ones (where the laser sits on the chassis),
+  published **once** and *latched* so late joiners still receive it
+
+"Latched" means `TRANSIENT_LOCAL` durability, and that specific QoS is **not
+reliably delivered between different DDS vendors**. So the dynamic transforms
+arrived, the static one never did, the robot had no idea where its own laser
+was, and slam_toolbox quietly did nothing.
+
+```
+$ ros2 run tf2_ros tf2_echo base_link laser
+Invalid frame ID "base_link" passed to canTransform argument target_frame
+```
+
+One line of output identified it. Fixing it was changing one environment
+variable so both machines used the same middleware:
+
+```
+base_link -> laser        Translation: [0.006, 0.000, 0.149]     OK
+/map                      93 occupied, 741 free, 151x41 @ 5 cm   OK
+```
+
+> **Lesson:** a latched topic can be missing while every streaming topic looks
+> perfect. When a consumer silently does nothing, check the **transforms** and
+> the **latched** topics first. And treat a mixed-vendor DDS setup as a defect,
+> not a configuration choice — the two ends must match.
+
 ---
 
 ## Part 8 — What's finished

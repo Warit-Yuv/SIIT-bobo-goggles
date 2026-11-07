@@ -42,14 +42,14 @@ cat >> ~/.bashrc <<'EOF'
 
 # ===== ROS 2 Humble (ROSMASTER M1 operator) =====
 export ROS_DOMAIN_ID=30          # MUST match the robot
+
+# CycloneDDS - MUST match the robot exactly.
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
 source /opt/ros/humble/setup.bash
 source ~/m1_control_ws/install/setup.bash   # after step 3
 
-# FastDDS is what the robot runs. Do NOT export RMW_IMPLEMENTATION:
-# CycloneDDS is not installed on either machine and setting it breaks every node.
-unset RMW_IMPLEMENTATION
-
-echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID | ROS=$ROS_DISTRO"
+echo "ROS_DOMAIN_ID=$ROS_DOMAIN_ID | ROS=$ROS_DISTRO | RMW=$RMW_IMPLEMENTATION"
 EOF
 source ~/.bashrc
 ```
@@ -57,15 +57,27 @@ source ~/.bashrc
 Verify:
 
 ```bash
-echo $ROS_DOMAIN_ID      # must print 30
-echo $ROS_DISTRO         # must print humble
+echo $ROS_DOMAIN_ID       # must print 30
+echo $ROS_DISTRO          # must print humble
+echo $RMW_IMPLEMENTATION  # must print rmw_cyclonedds_cpp
 ```
 
-> **Why `unset RMW_IMPLEMENTATION` matters:** the handbook recommends
-> `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`, but CycloneDDS is not installed on
-> either machine. Setting it makes every node fail to start with
-> `failed to load rmw implementation`. FastDDS handles the measured load
-> (20 Hz video + 10 Hz scan) without difficulty.
+> **`RMW_IMPLEMENTATION` must match the robot.** This is not a tuning choice —
+> a mismatch breaks SLAM in a way that looks like nothing is wrong.
+>
+> `/tf_static` is published with `TRANSIENT_LOCAL` durability, and that QoS is
+> not reliably delivered between different DDS vendors. With the robot on
+> FastDDS and this PC on CycloneDDS, measured:
+>
+> | | Result |
+> |---|---|
+> | `/scan`, `/odom`, `/tf` | all healthy (10–20 Hz) |
+> | `/tf_static` (`base_link`→`laser`) | **never arrived** |
+> | `/map` | **never produced** — slam_toolbox silently did nothing |
+>
+> Both machines have `rmw_cyclonedds_cpp` installed, so CycloneDDS is used on
+> both. Verify with `ros2 run tf2_ros tf2_echo base_link laser` — if it says
+> *Invalid frame ID "base_link"*, your RMW does not match the robot.
 
 ---
 
@@ -510,7 +522,8 @@ Safety envelope enforced by the arbiter on the robot:
 | Symptom | Cause | Fix |
 |---|---|---|
 | `ros2 topic list` empty | Domain mismatch / NAT mode | `echo $ROS_DOMAIN_ID`=30; set adapter to **Bridged** |
-| Nodes exit instantly | `RMW_IMPLEMENTATION` set | `unset RMW_IMPLEMENTATION` |
+| Nodes exit instantly | `RMW_IMPLEMENTATION` not set, or a name typo | Export `rmw_cyclonedds_cpp` — it must match the robot |
+| `/tf` arrives but SLAM makes no map | DDS mismatch breaks `/tf_static` | `ros2 run tf2_ros tf2_echo base_link laser`; fix `RMW_IMPLEMENTATION` |
 | Image display black | QoS mismatch | Set display reliability to **Best Effort** |
 | Video freezes after seconds | Kernel buffers | Apply §2, then reboot |
 | SLAM `queue is full` spam | TF timeout too short | Use `config/slam_toolbox_m1.yaml` |
@@ -536,7 +549,8 @@ ros2 topic hz /scan
 ## 13. Checklist
 
 - [ ] `ROS_DOMAIN_ID=30` and `ROS_DISTRO=humble` in `~/.bashrc`
-- [ ] `unset RMW_IMPLEMENTATION` in `~/.bashrc`
+- [ ] `ROS_DOMAIN_ID=30`, `ROS_DISTRO=humble`, `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+- [ ] `tf2_echo base_link laser` resolves (proves `/tf_static` arrives)
 - [ ] `/etc/sysctl.conf` tuned, `rmem_default` **still 212992**
 - [ ] `~/m1_control_ws` copied and `colcon build` succeeded
 - [ ] `ros2 topic list` shows `/scan`, `/odom`, `/image_throttled/compressed`
