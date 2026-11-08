@@ -207,6 +207,8 @@ ros2 topic hz /image_throttled/compressed      # expect ~20 Hz, not ~2 Hz
 | GUI shows `no data` | DDS env unset in that process | Launch via `~/m1_console.sh`, never `ros2 run` |
 | Camera ~2 Hz, other topics fine | Multicast over Wi-Fi | Unicast peer in `cyclonedds.xml` (§7.14) |
 | `AMENT_TRACE_SETUP_FILES: unbound variable` | `set -u` around ROS setup | Bracket the `source` with `set +u` |
+| Console segfaults when a button is pressed | Worker thread touched a widget | Fixed in `m1_console` via Qt signals (§7.15) |
+| Window freezes for ~10 s at a time | Blocking SSH probe on the GUI thread | Fixed — probe runs on a worker |
 
 > `/scan` and the image are published **Best Effort**. A *Reliable* subscriber
 > connects but receives nothing — the most confusing ROS 2 failure mode there is.

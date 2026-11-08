@@ -835,6 +835,14 @@ def main(args=None):
 
     class Console(QtWidgets.QMainWindow):
 
+        # Cross-thread channels. Worker threads (SSH commands, link probes)
+        # must never touch a widget; they emit these and Qt delivers them on
+        # the GUI thread. Touching a widget from a worker segfaults the whole
+        # process, not just the thread.
+        log_signal = QtCore.pyqtSignal(str)
+        link_signal = QtCore.pyqtSignal(bool)
+        recheck_signal = QtCore.pyqtSignal()
+
         def __init__(self):
             super().__init__()
             self.setWindowTitle('ROSMASTER M1 — Operator Console')
@@ -844,6 +852,12 @@ def main(args=None):
             self.held = set()
             self.audio_on = False
             self._last_jpeg = None
+            self._link_busy = False
+
+            # Connections must exist before anything can emit.
+            self.log_signal.connect(self._append_log)
+            self.link_signal.connect(self._apply_link)
+            self.recheck_signal.connect(self._check_link)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -1152,7 +1166,19 @@ def main(args=None):
 
         # ------------------------------------------------------------ helpers
         def logline(self, text):
-            self.log.appendPlainText(f'{time.strftime("%H:%M:%S")}  {text}')
+            """Append a line to the log. Safe to call from ANY thread.
+
+            Qt widgets may only be touched from the GUI thread. Calling
+            appendPlainText() directly from an SSH worker thread makes Qt try
+            to queue QTextBlock/QTextCursor across threads, which it cannot do
+            without qRegisterMetaType - and the result is a segfault, not an
+            exception. Emitting a signal instead lets Qt deliver the string to
+            the GUI thread properly.
+            """
+            self.log_signal.emit(f'{time.strftime("%H:%M:%S")}  {text}')
+
+        def _append_log(self, line):
+            self.log.appendPlainText(line)
 
         def _style(self, widget, name):
             widget.setObjectName(name)
@@ -1179,7 +1205,27 @@ def main(args=None):
                 self.banner.show()
 
         def _check_link(self):
-            ok = shell.test()
+            """Probe the robot off the GUI thread.
+
+            shell.test() is an SSH round trip that can take up to 10 s to
+            fail. Run on the GUI thread it froze the window for that long,
+            every 5 s - which looks exactly like the program hanging.
+            """
+            if self._link_busy:
+                return
+            self._link_busy = True
+
+            def work():
+                try:
+                    ok = shell.test()
+                except Exception:  # noqa: BLE001 - any failure means no link
+                    ok = False
+                self.link_signal.emit(ok)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _apply_link(self, ok):
+            self._link_busy = False
             if ok:
                 self.lbl_link.setText(f'● {node.robot_ip}')
                 self._style(self.lbl_link, 'good')
@@ -1205,7 +1251,9 @@ def main(args=None):
                 except Exception as exc:  # noqa: BLE001
                     self.logline(f'{action} failed: {exc}')
                 finally:
-                    QtCore.QTimer.singleShot(0, self._check_link)
+                    # Ask the GUI thread to re-probe the link; do not touch
+                    # widgets from here.
+                    self.recheck_signal.emit()
 
             threading.Thread(target=work, daemon=True).start()
             if action == 'start' and self.chk_autoview.isChecked():

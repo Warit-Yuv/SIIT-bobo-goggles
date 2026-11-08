@@ -35,10 +35,11 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Fourteen defects were found and fixed during validation.** They are documented
-in §7 because each one would have been a silent failure in operation. Three of
-them (§7.12, §7.13, §7.14) were found only by testing on the real operator
-station, and none of the three produced an error message when it failed.
+**Fifteen defects were found and fixed during validation.** They are documented
+in §7 because each one would have been a silent failure in operation. Four of
+them (§7.12 – §7.15) were found only by testing on the real operator station;
+three produced no error message at all when they failed, and the fourth killed
+the process.
 
 ---
 
@@ -614,6 +615,56 @@ Measured result: **2.6 Hz → 20.2 Hz**, matching the publisher exactly.
 > **Gotcha:** XML comments may not contain `--`. The first version of the
 > config used `-------` rules inside the comment block and Cyclone rejected the
 > file without any useful diagnostic. Use `=====` instead.
+
+### 7.15 Clicking a button in the GUI killed the whole process
+
+Pressing **Start** in the operator console terminated it with a segmentation
+fault. The only clue on the console:
+
+```
+QObject::connect: Cannot queue arguments of type 'QTextBlock'
+QObject::connect: Cannot queue arguments of type 'QTextCursor'
+[ros2run]: Segmentation fault
+```
+
+The Start button runs an SSH command, and it did so on a worker thread so the
+window would stay responsive. When the command finished, the worker logged the
+result — by calling `appendPlainText()` on a `QPlainTextEdit`. Qt widgets may
+only be touched from the GUI thread. To deliver a log line across threads Qt has
+to queue a `QTextBlock`/`QTextCursor` through the event loop, which requires
+those types to be registered with `qRegisterMetaType()`. They are not, so the
+call is undefined behaviour — and in practice it is a hard crash, not an
+exception. Nothing in the Python code could catch it.
+
+The same file also ran `shell.test()` — an SSH round trip with a 10 s timeout —
+directly on the GUI thread every 5 seconds. That did not crash, but it froze the
+window for the duration of every failed probe, which is its own kind of broken.
+
+**Fix:** two Qt signals on the window class.
+
+```python
+log_signal     = QtCore.pyqtSignal(str)    # any thread -> log widget
+link_signal    = QtCore.pyqtSignal(bool)   # probe result -> link label
+recheck_signal = QtCore.pyqtSignal()       # worker done -> re-probe
+```
+
+Worker threads now only emit; Qt delivers on the GUI thread because the
+connection is automatically queued when the emitter and receiver live in
+different threads. The link probe moved onto a worker thread as well, guarded by
+a busy flag so a slow probe cannot pile up.
+
+An AST check now walks every function used as a thread target and asserts it
+contains no widget method calls. It reports `CLEAN` for all three.
+
+> **Lesson:** in Qt, a widget is not thread-safe and the failure mode is a
+> segfault, not an exception. If work moves off the GUI thread, the *only*
+> permitted way back is a signal. "It usually works" is not evidence — the
+> unsafety is in the scheduler, not the code.
+
+> **Lesson:** the same audit applies to blocking I/O in the other direction. An
+> SSH call on the GUI thread does not crash, it just makes the application look
+> frozen — which users report as "it hung" and developers dismiss as "it was
+> busy".
 
 ---
 

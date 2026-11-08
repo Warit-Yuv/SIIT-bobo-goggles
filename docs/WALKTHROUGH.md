@@ -650,6 +650,40 @@ publisher:  20.0 Hz      receiver:  2.6 Hz
 > *consumed*, not where it is produced. And measure the largest topic — small
 > topics will happily survive a transport that cannot carry the big ones.
 
+### Lesson 14: A GUI is not thread-safe, and it does not tell you
+
+Pressing a button in the console killed the whole program:
+
+```
+QObject::connect: Cannot queue arguments of type 'QTextBlock'
+QObject::connect: Cannot queue arguments of type 'QTextCursor'
+[ros2run]: Segmentation fault
+```
+
+The button ran an SSH command on a worker thread so the window would stay
+responsive — good instinct. But when the command finished, that thread wrote the
+result into the log box. Qt widgets belong to the GUI thread, and moving a
+`QTextBlock` between threads needs a type registration that was never done. The
+result is not an exception you can catch; it is a crash.
+
+The fix is one small idea: worker threads are only allowed to **emit a signal**.
+Qt then delivers it on the GUI thread for you.
+
+```python
+log_signal = QtCore.pyqtSignal(str)     # worker -> log widget
+
+def logline(self, text):                # safe from any thread
+    self.log_signal.emit(f'{time.strftime("%H:%M:%S")}  {text}')
+```
+
+The same file had the opposite problem in the other direction: an SSH probe on
+the GUI thread with a 10-second timeout, every 5 seconds. That does not crash —
+it just freezes the window, which users report as "it hung".
+
+> **Lesson:** if work leaves the GUI thread, the *only* permitted way back is a
+> signal. And check the reverse too — blocking I/O on the GUI thread makes a
+> program that is working correctly look broken.
+
 ---
 
 ## Part 8 — What's finished
