@@ -446,10 +446,36 @@ wrong, because it looks right.
 | Head moves the wrong way | axis inverted | `invert_pan` / `invert_tilt` |
 | A calibration dot disappears | bar overlapping the dot area | Fixed — see `scripts/test_gaze_calib_layout.py` |
 
+### Choosing the camera
+
+**5 · Gaze → Camera** lists every camera that can actually deliver a frame. Pick
+one, press **Start gaze**, and the index is passed to the node.
+
+Press **↻** after plugging a camera in. The scan runs on a worker thread, so the
+window does not freeze while a device is opened.
+
+The list is filtered three ways, because the naive version is wrong on both
+platforms this runs on:
+
+| Filter | Why |
+|---|---|
+| **name** | a Raspberry Pi exposes a dozen `/dev/video*` nodes that are the ISP and codec blocks, not cameras |
+| **frame** | a camera also exposes a *metadata* node beside its capture node — it opens perfectly and never returns an image |
+| **device** | one physical camera shows up as several nodes; only one entry per lens is listed |
+
+A camera that cannot be opened at all is listed as **`[in use]`** rather than
+hidden. That matters: usually it means another process is holding it, and
+silently omitting it makes the operator pick the *other* camera and calibrate
+against the wrong lens without ever being told.
+
+If no camera is selected, **Start gaze refuses** instead of falling back to
+mouse. A silent mouse fallback looks like tracking and is not, which is exactly
+how "the tracker is broken" gets concluded.
+
 ### The camera index is not stable
 
-The node searches `/dev/video0`..`9` and opens the first one that can actually
-deliver a frame. A hard-coded index silently fails when the camera
+The node also searches `/dev/video0`..`9` and opens the first one that can
+actually deliver a frame, so it still works if started from a terminal. A hard-coded index silently fails when the camera
 re-enumerates, which happens on every unplug or host USB reset - and the symptom
 is identical to "the tracker is broken".
 

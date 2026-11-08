@@ -643,6 +643,120 @@ def make_servo_bar(QtCore, QtGui, QtWidgets):
     return ServoBar
 
 
+def list_cameras():
+    """Every camera this machine can actually deliver a frame from.
+
+    Returns a list of (index, label). The index is what OpenCV wants.
+
+    Three filters, in increasing cost, because the naive version is wrong on
+    both platforms this runs on:
+
+    1. NAME. A Raspberry Pi exposes a dozen /dev/video* nodes that are not
+       cameras at all - the ISP (pispbe), the HEVC decoder, the codec blocks.
+       They appear in the list and cannot produce a webcam frame.
+
+    2. FRAME. A camera also exposes a METADATA node alongside its capture
+       node. It opens perfectly and never returns an image, so isOpened() is
+       not enough - a frame has to be read.
+
+    3. INDEX. /dev/video0 is not stable. Unplugging the webcam, or the host
+       re-enumerating USB, moves it. That is what made the tracker "stop
+       seeing the face" with no explanation.
+
+    Filtering by name first matters for speed as much as correctness: probing
+    twenty nodes with OpenCV takes seconds and would freeze the window.
+
+    Never raises - a machine with no camera returns an empty list.
+    """
+    import glob
+    import re
+
+    # Substrings that identify nodes which are not capture devices. Kept
+    # deliberately specific: a generic "skip anything with isp in the name"
+    # would drop a real camera called "ISP Camera".
+    NOT_A_CAMERA = ('pispbe', 'rpi-hevc', 'bcm2835-codec', 'bcm2835-isp',
+                    'unicam-image', 'video-encoder', 'video-decoder')
+
+    # Human-readable names, if v4l2-ctl is available. Not required.
+    names = {}
+    try:
+        out = subprocess.run(['v4l2-ctl', '--list-devices'],
+                             capture_output=True, text=True, timeout=4).stdout
+        current = None
+        for line in out.splitlines():
+            if line and not line.startswith(('\t', ' ')):
+                current = line.split('(')[0].strip().rstrip(':')
+            elif line.strip().startswith('/dev/video') and current:
+                m = re.search(r'(\d+)$', line.strip())
+                if m:
+                    names[int(m.group(1))] = current
+    except Exception:  # noqa: BLE001 - names are a nicety, not required
+        pass
+
+    candidates = []
+    for node in sorted(glob.glob('/dev/video*')):
+        m = re.search(r'(\d+)$', node)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        label = names.get(idx, '')
+        if any(bad in label.lower() for bad in NOT_A_CAMERA):
+            continue
+        candidates.append((idx, label))
+
+    # Verify each candidate really delivers a frame. Bounded so a broken driver
+    # cannot hang the window.
+    verified = []
+    try:
+        import cv2
+    except ImportError:
+        # No OpenCV in this interpreter: fall back to the name filter alone.
+        return [(i, ('%s  (/dev/video%d)' % (n, i)) if n else '/dev/video%d' % i)
+                for i, n in candidates]
+
+    for idx, label in candidates:
+        base = ('%s  (/dev/video%d)' % (label, idx)) if label else '/dev/video%d' % idx
+        cap = None
+        try:
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if cap.isOpened():
+                ok, _frame = cap.read()
+                if ok:
+                    verified.append((idx, base, label, True))
+                else:
+                    # Opened but no frame: the metadata node beside a real
+                    # capture node. Recorded so it can be dropped below.
+                    verified.append((idx, base, label, False))
+            else:
+                # COULD NOT OPEN. This is very often "another process is
+                # holding it" rather than "not a camera", and hiding those is
+                # a trap: the operator sees only the other camera, picks it,
+                # and calibrates against the wrong lens without being told.
+                verified.append((idx, base + '   [in use]', label, None))
+        except Exception:  # noqa: BLE001 - one bad node must not hide the rest
+            verified.append((idx, base + '   [in use]', label, None))
+        finally:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    # One physical camera exposes several /dev/video* nodes: a capture node and
+    # a metadata node. If any node of a named device delivers a frame, drop the
+    # rest of that device's nodes - they are the same lens and listing them
+    # again just invites picking the one that never works.
+    working = {label for _i, _l, label, ok in verified if ok and label}
+    out = []
+    for idx, label, name, ok in verified:
+        if ok is False and name in working:
+            continue
+        if ok is None and name in working:
+            continue
+        out.append((idx, label))
+    return out
+
+
 def make_gaze_map(QtCore, QtGui, QtWidgets):
     """Square plot of the gaze point: raw (hollow) and corrected (solid)."""
 
@@ -2043,6 +2157,10 @@ def main(args=None):
         link_signal = QtCore.pyqtSignal(bool)
         recheck_signal = QtCore.pyqtSignal()
         view_signal = QtCore.pyqtSignal(bool)
+        # Camera enumeration runs on a worker thread because opening a camera
+        # can block for a second or more; the result comes back here so the
+        # widget is only ever touched from the GUI thread.
+        cams_signal = QtCore.pyqtSignal(object)
 
         def __init__(self):
             super().__init__()
@@ -2056,12 +2174,14 @@ def main(args=None):
             self._last_face = None
             self._map_sig = None
             self._link_busy = False
+            self._cam_index = None
 
             # Connections must exist before anything can emit.
             self.log_signal.connect(self._append_log)
             self.link_signal.connect(self._apply_link)
             self.recheck_signal.connect(self._check_link)
             self.view_signal.connect(self._apply_view_state)
+            self.cams_signal.connect(self._apply_cameras)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -2112,6 +2232,13 @@ def main(args=None):
             self.gaze_timer.timeout.connect(self._poll_gaze)
             self.gaze_timer.start(4000)
             self._poll_gaze()
+
+            # Populate the camera picker once at startup, and make the picker
+            # reflect the current source. Doing it here rather than in the
+            # panel builder keeps the window responsive: the scan runs on a
+            # worker thread and the result arrives on cams_signal.
+            self._on_gaze_src(0)
+            QtCore.QTimer.singleShot(300, self._refresh_cameras)
 
         # ------------------------------------------------------------- layout
         def _build_header(self):
@@ -2434,9 +2561,10 @@ def main(args=None):
             self.cmb_gaze_src.addItems(['Mediapipe', 'Mouse', 'External'])
             self.cmb_gaze_src.setToolTip(
                 'Mediapipe  iris tracking from the local webcam (real eye tracking)\n'
-                'Mouse      click the HUD window to aim (no dependencies)\n'
+                'Mouse      the HUD window follows the mouse pointer\n'
                 'External   wait for /gaze/point from another program')
             self.cmb_gaze_src.setFixedWidth(96)
+            self.cmb_gaze_src.currentIndexChanged.connect(self._on_gaze_src)
             row.addWidget(self.cmb_gaze_src)
             self.btn_gaze = QtWidgets.QPushButton('Start gaze')
             self.btn_gaze.setObjectName('primary')
@@ -2450,6 +2578,29 @@ def main(args=None):
             self.btn_gaze_stop.clicked.connect(self._stop_gaze)
             row.addWidget(self.btn_gaze_stop)
             gv.addLayout(row)
+
+            # Camera picker. Needed because /dev/video0 is not stable: unplug
+            # the webcam or reset the host USB and it comes back as
+            # /dev/video1, which the node then cannot find. Rather than make
+            # that a command-line problem, the available cameras are listed
+            # here and the chosen one is passed to the HUD at start.
+            crow = QtWidgets.QHBoxLayout()
+            crow.setSpacing(4)
+            lbl_cam = QtWidgets.QLabel('Camera')
+            lbl_cam.setObjectName('dim')
+            crow.addWidget(lbl_cam)
+            self.cmb_cam = QtWidgets.QComboBox()
+            self.cmb_cam.setToolTip(
+                'Which webcam the eye tracker uses. Only cameras that can '
+                'actually deliver a frame are listed.\n'
+                'Press Refresh after plugging one in.')
+            crow.addWidget(self.cmb_cam, 1)
+            self.btn_cam_refresh = QtWidgets.QPushButton('↻')
+            self.btn_cam_refresh.setFixedWidth(28)
+            self.btn_cam_refresh.setToolTip('Rescan for cameras')
+            self.btn_cam_refresh.clicked.connect(self._refresh_cameras)
+            crow.addWidget(self.btn_cam_refresh)
+            gv.addLayout(crow)
 
             row = QtWidgets.QHBoxLayout()
             self.btn_calib = QtWidgets.QPushButton('Calibrate…')
@@ -2827,6 +2978,67 @@ def main(args=None):
             except Exception:  # noqa: BLE001
                 return []
 
+        def _on_gaze_src(self, _i):
+            """Only eye tracking uses a camera, so only then is it relevant."""
+            is_eye = self.cmb_gaze_src.currentText() == 'Mediapipe'
+            self.cmb_cam.setEnabled(is_eye)
+            self.btn_cam_refresh.setEnabled(is_eye)
+            self.cmb_cam.setToolTip(
+                'Which webcam the eye tracker uses.' if is_eye else
+                'Only used by Mediapipe eye tracking.')
+
+        def _refresh_cameras(self):
+            """Rescan and repopulate the picker.
+
+            Runs the probe off the GUI thread: opening a camera can block for
+            a second or more, and doing that inside a button handler makes the
+            whole window appear to freeze.
+            """
+            self.btn_cam_refresh.setEnabled(False)
+            self.cmb_cam.clear()
+            self.cmb_cam.addItem('scanning…', None)
+
+            def work():
+                try:
+                    cams = list_cameras()
+                except Exception as exc:  # noqa: BLE001
+                    cams = []
+                    self.log_signal.emit(f'camera scan failed: {exc}')
+                self.cams_signal.emit(cams)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _apply_cameras(self, cams):
+            self.cmb_cam.clear()
+            if not cams:
+                # Say it here rather than at start time. "No camera" discovered
+                # at start looks like the tracker failed; discovered here it is
+                # obviously a camera problem.
+                self.cmb_cam.addItem('no camera found', None)
+                self.btn_cam_refresh.setEnabled(True)
+                self.logline('no camera found - plug one in and press ↻')
+                return
+            for idx, label in cams:
+                self.cmb_cam.addItem(label, idx)
+            self.btn_cam_refresh.setEnabled(True)
+            # Keep the previous choice if it is still present, so a refresh does
+            # not silently switch cameras on the operator.
+            want = getattr(self, '_cam_index', None)
+            if want is not None:
+                for i in range(self.cmb_cam.count()):
+                    if self.cmb_cam.itemData(i) == want:
+                        self.cmb_cam.setCurrentIndex(i)
+                        break
+            self._cam_index = self.cmb_cam.currentData()
+            self.logline(f'{len(cams)} camera(s): '
+                         + ', '.join(l for _i, l in cams))
+
+        def _selected_camera(self):
+            """The index to hand the HUD, or None."""
+            idx = self.cmb_cam.currentData()
+            self._cam_index = idx
+            return idx
+
         def _toggle_gaze(self):
             if self._gaze_pids():
                 self.logline('gaze already running')
@@ -2835,9 +3047,25 @@ def main(args=None):
             if not os.path.exists(wrapper):
                 self.logline(f'missing {wrapper} - see docs/GAZE.md')
                 return
+            src = self.cmb_gaze_src.currentText().lower()
+            args = ['bash', wrapper, src]
+            if src == 'mediapipe':
+                cam = self._selected_camera()
+                if cam is None:
+                    # Refuse rather than start something that cannot work.
+                    # Starting with no camera falls back to mouse gaze, which
+                    # looks like tracking and is not - that confusion cost
+                    # several rounds of debugging.
+                    self.logline('no camera selected - press ↻ and pick one, '
+                                 'or choose Mouse to drive without eye tracking')
+                    return
+                # The wrapper passes everything after the source through to
+                # `ros2 run ... --ros-args`, so this reaches the node.
+                args += ['-p', f'webcam_id:={int(cam)}']
+                self.logline(f'using camera index {int(cam)}')
             try:
                 subprocess.Popen(
-                    ['bash', wrapper, self.cmb_gaze_src.currentText().lower()],
+                    args,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
                 self.logline(
