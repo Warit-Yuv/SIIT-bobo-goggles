@@ -1,53 +1,71 @@
 # =============================================================================
 # ekf_m1.yaml - EKF fusion parameters for the ROSMASTER M1 (Layer 4 override)
 #
-# Derived from the vendor ekf_A1.yaml. The ONLY change is odom0_config, and it
-# fixes a real defect: rotating the robot by hand did not move /odom.
+# Identical to the vendor ekf_A1.yaml. Kept as a Layer-4 file so the robot's
+# fusion behaviour is version-controlled and can be changed without touching
+# vendor code.
 #
 # ---------------------------------------------------------------------------
-# THE BUG
+# WHY THE CONFIG IS UNCHANGED (a failed experiment, recorded so it is not
+# repeated)
 # ---------------------------------------------------------------------------
-# The vendor config fuses yaw and yaw-rate from BOTH wheel odometry and the
-# IMU:
+# Symptom reported: rotating the robot BY HAND, with the wheels off the ground,
+# did not move /odom, so the map never updated. Measured with
+# scripts/probe_rotation.py through a 61 degree hand turn:
 #
-#   odom0_config: [T, T, F,  F, F, T,   T, T, F,  F, F, T,  F, F, F]
-#                                ^yaw                  ^yaw-rate
-#   imu0_config:  [F, F, F,  F, F, T,   F, F, F,  F, F, T,  F, F, F]
-#                                ^yaw                  ^yaw-rate
+#   /imu/data   net -81.5 deg    the gyro saw the whole turn
+#   /odom       net  -7.4 deg    the EKF kept 9% of it
+#   /odom_raw   net  +0.0 deg    wheels off the ground, correctly zero
 #
-# With the wheels off the ground and the robot turned by hand, the encoders
-# report "not rotating" and hold that claim with a tight covariance. The EKF
-# averages the two sources, so it mostly believes the wheels.
+# The reasoning looked sound: yaw was fused from BOTH wheel odometry and the
+# IMU, the encoders insisted "not rotating" with a tight covariance, so the
+# filter mostly believed the wheels. Removing yaw and yaw-rate from
+# odom0_config made the IMU the sole authority on heading, and the hand-turn
+# test then passed perfectly (61.6 deg in, 61.5 deg out).
 #
-# Measured, rotating by hand through 81.9 degrees:
+# That was the wrong trade, and real driving exposed it immediately: the map
+# drifted far worse than before, and a short rotation left it visibly
+# misaligned.
 #
-#   /imu/data   net -81.5 deg    <- the sensor saw the whole turn
-#   /odom       net  -7.4 deg    <- the EKF kept 9% of it
-#   /odom_raw   net  +0.0 deg    <- wheels off the ground, correctly zero
+# The reason is that wheel odometry measures rotation GEOMETRICALLY - wheel
+# displacement over a known track width - so its error does not accumulate with
+# angle turned. Gyro yaw is an INTEGRAL, so it carries both bias (a constant
+# rate even when still) and scale error (a percentage of every rotation). With
+# no magnetometer (imu_filter_param.yaml sets use_mag: false) there is nothing
+# to correct either. Over a mapping session the integral walks away, and a large
+# rotation multiplies the scale error.
 #
-# slam_toolbox triggers on minimum_travel_heading measured against the
-# ODOMETRY pose, so with /odom barely moving it never fires and the map does
-# not update. That is why the map only changed when driving.
+# Wheel odometry is the better yaw source whenever the wheels are actually
+# turning, which is every normal moment of operation. The hand-turn test is an
+# artificial condition: it only happens when the robot is lifted, and a mapper
+# cannot survive being lifted anyway - it has no way to know its origin moved.
+#
+# So: keep fusing both. The IMU contributes yaw-rate, which is genuinely
+# accurate short-term and smooths the wheel estimate between encoder edges;
+# wheel odometry anchors the absolute angle so it cannot drift.
 #
 # ---------------------------------------------------------------------------
-# THE FIX
+# WHAT TO DO INSTEAD WHEN THE ROBOT IS MOVED
 # ---------------------------------------------------------------------------
-# Remove yaw and yaw-rate from odom0_config so the IMU is the single authority
-# on heading. Wheel odometry still supplies x, y, vx and vy, which it measures
-# well - mecanum wheels encode translation directly.
+# Being picked up is the "kidnapped robot" problem, and it is not solvable by
+# tuning. Use localisation against a saved map instead of mapping:
 #
-#   odom0_config: [T, T, F,  F, F, F,   T, T, F,  F, F, F,  F, F, F]
+#   scripts/m1_map.sh save NAME      save the map once
+#   scripts/m1_map.sh localize NAME  localise against it (AMCL)
+#   scripts/m1_map.sh relocalize X Y YAW
 #
-# TRADE-OFF: heading now comes from gyro integration, because this IMU has no
-# magnetometer (imu_filter_param.yaml sets use_mag: false). It will drift
-# slowly - a few degrees over a long session. For teleoperation mapping that is
-# the better failure: a map that follows the robot and drifts slightly beats a
-# map that ignores the robot entirely. If drift becomes a problem, add a
-# magnetometer or run AMCL against a saved map.
+# AMCL recovers the pose from the laser scan after the robot has been moved,
+# which no EKF configuration can do. See docs/MAPPING.md.
 #
-# Everything below the odom0_config block is the vendor file, unchanged.
+# ---------------------------------------------------------------------------
+# REMAINING KNOWN LIMITATION
+# ---------------------------------------------------------------------------
+# Driving into a wall makes the wheels slip, and slipping wheels report rotation
+# that did not happen. Because wheel yaw is trusted, a hard collision can still
+# corrupt the heading. Mitigations: drive slower near obstacles, and re-localise
+# (or reset the map) after a collision rather than driving on through it.
+#
 # =============================================================================
-### ekf config file ###
 ekf_filter_node:
     ros__parameters:
 
@@ -138,11 +156,13 @@ ekf_filter_node:
 # do not provide some of the state variables estimated by the filter. For example, a TwistWithCovarianceStamped message
 # has no pose information, so the first six values would be meaningless in that case. Each vector defaults to all false
 # if unspecified, effectively making this parameter required for each sensor.
-        # x, y and vx, vy from wheels; heading belongs to the IMU (see header).
+        # x, y, yaw and their rates from wheels. Yaw is restored deliberately:
+        # see the header for the measurement that showed IMU-only yaw drifting
+        # far worse than this.
         odom0_config: [true, true, false,
-                       false, false, false,
+                       false, false, true,
                        true, true, false,
-                       false, false, false,
+                       false, false, true,
                        false, false, false]
 
         #        [x_pos   , y_pos    , z_pos,

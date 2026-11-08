@@ -35,10 +35,11 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Eighteen defects were found and fixed during validation.** They are documented
-in §7 because each one would have been a silent failure in operation. Seven of
-them (§7.12 – §7.18) were found only by testing on the real operator station;
-most produced no error message at all when they failed.
+**Seventeen defects were found and fixed during validation**, and one more is
+recorded as a documented failure (§7.17) because the fix looked correct and made
+things worse. All are in §7 because each one would have been a silent failure in
+operation. Seven of them (§7.12 – §7.18) were found only by testing on the real
+operator station; most produced no error message at all when they failed.
 
 ---
 
@@ -720,23 +721,23 @@ times and drew a garbled map.
 > code looked like it was waiting for TF, not like it was throwing a
 > `TypeError`.
 
-### 7.17 The EKF threw away 91% of the robot's rotation
+### 7.17 A plausible fix that made things worse (the EKF yaw experiment)
 
-Rotating the robot by hand did not move `/odom`, so the map never updated. It
-looked like SLAM had stopped working.
+This one is recorded as a **failure**, because the reasoning was sound and the
+conclusion was still wrong — which is the more useful lesson.
 
-Measured with `scripts/probe_rotation.py`, turning by hand through 61 degrees
-with the wheels off the ground:
+**Symptom.** Rotating the robot by hand, wheels off the ground, did not move
+`/odom`, so the map never updated. Measured with `scripts/probe_rotation.py`
+through a 61° hand turn:
 
-| Source | Before fix | After fix |
+| Source | Before | After the "fix" |
 |---|---|---|
 | `/imu/data` (the sensor) | 81.9° | 61.6° |
 | `/odom` (what SLAM uses) | **7.7°** | **61.5°** |
 | `/odom_raw` (wheel encoders) | 0.0° | 1.6° |
 
-The gyro saw the whole turn. The EKF kept 9% of it.
-
-The vendor `ekf_A1.yaml` fuses yaw **and yaw-rate from both sources**:
+The gyro saw the whole turn; the EKF kept 9% of it. The vendor `ekf_A1.yaml`
+fuses yaw from **both** wheel odometry and the IMU:
 
 ```yaml
 odom0_config: [T, T, F,  F, F, T,   T, T, F,  F, F, T,  F, F, F]
@@ -745,34 +746,51 @@ imu0_config:  [F, F, F,  F, F, T,   F, F, F,  F, F, T,  F, F, F]
 ```
 
 With the wheels off the ground the encoders report "not rotating" and hold that
-claim with a tight covariance, so the filter mostly believed them. This is the
-correct behaviour for a differential-drive robot on the floor — wheel odometry
-genuinely is a good rotation source there — and completely wrong the moment the
-wheels are not the thing turning the robot.
+claim with a tight covariance, so the filter mostly believed them. Removing yaw
+and yaw-rate from `odom0_config` made the IMU the sole authority on heading, and
+the hand-turn test then passed perfectly: 61.6° in, 61.5° out.
 
-`slam_toolbox` triggers a scan match on `minimum_travel_heading`, measured
-against the **odometry** pose. With `/odom` barely moving it never fired, so the
-map only ever changed while driving.
+**Why it was wrong.** Real driving immediately showed the map drifting far worse
+than before, and a short rotation leaving it visibly misaligned.
 
-**Fix:** `config/ekf_m1.yaml`, a Layer-4 override that removes yaw and yaw-rate
-from `odom0_config`. The IMU becomes the single authority on heading; wheels
-still supply x, y, vx and vy, which mecanum encoders measure well.
+Wheel odometry measures rotation **geometrically** — wheel displacement over a
+known track width — so its error does not accumulate with the angle turned. Gyro
+yaw is an **integral**, so it carries both bias and scale error, and with no
+magnetometer (`use_mag: false`) there is nothing to correct either.
 
-**This also explains the wall-collision drift.** Driving into a wall makes the
-wheels slip. Slipping wheels report rotation that did not happen, and the old
-config trusted them — so a collision corrupted the heading and the map sheared
-while reversing out. With heading on the gyro, a slipping wheel can no longer
-lie about which way the robot is facing.
+Measured stationary drift with IMU-only yaw:
 
-> **Trade-off:** heading now comes from gyro integration, and this IMU has no
-> magnetometer (`use_mag: false`). It drifts a few degrees over a long session.
-> For teleoperation mapping that is the better failure: a map that follows the
-> robot and drifts slightly beats a map that ignores the robot entirely.
+```
+  mean angular_velocity.z : +0.000065 rad/s
+  => integrates to        : +0.2 deg/minute
+  over a 10 min session   : +2 deg
+```
 
-> **Lesson:** a fused sensor configuration encodes an assumption about which
-> source is trustworthy. That assumption can be true in the lab and false the
-> moment the robot is picked up. When two sensors disagree, check whether the
-> filter is *averaging* them — sometimes the right answer is to pick one.
+Only 2° over ten minutes — too small to explain a map going visibly wrong after
+a short rotation. So bias was not the main problem: **scale error** was. A gyro
+that mis-measures each rotation by a few percent produces an error proportional
+to how far you turn, which is exactly the reported behaviour ("I just rotate
+around a bit and now map unaligned").
+
+**Reverted.** `config/ekf_m1.yaml` now matches the vendor file. Wheel odometry
+anchors absolute heading so it cannot drift; the IMU contributes yaw-rate, which
+is accurate short-term and smooths the estimate between encoder edges. Both
+sources, each doing what it is good at.
+
+> **Lesson:** a fix that makes the failing test pass is not the same as a fix.
+> The hand-turn test was measuring an artificial condition — the robot lifted off
+> the ground — and optimising for it degraded the condition that actually
+> matters. Always ask which case is the common one.
+
+> **Lesson:** "it drifted" is two different faults. Bias is a constant rate that
+> accumulates with *time*; scale error is a percentage that accumulates with
+> *motion*. They need different measurements to tell apart, and a stationary test
+> will never find scale error.
+
+> **And the real answer to being lifted:** a mapper cannot survive it, because it
+> has no way to know its origin moved. That is the kidnapped-robot problem and it
+> is not solvable by tuning. Use localisation against a saved map instead —
+> see `docs/MAPPING.md` and `scripts/m1_map.sh`.
 
 ### 7.18 RViz could not draw the robot, and the URDF was innocent
 

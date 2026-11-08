@@ -53,7 +53,16 @@ The summary tells you which source is wrong:
 ```
 
 If `/imu` moved and `/odom` did not, the EKF is trusting the wheels over the
-gyro. That is `config/ekf_m1.yaml` — see `robot/docs/report.md` §7.17.
+gyro — which is **correct behaviour while the wheels are on the ground**, and
+only wrong when the robot is lifted.
+
+Do not "fix" this by making the IMU the sole authority on heading. That was
+tried: it makes the hand-turn test pass and makes real mapping much worse,
+because gyro yaw is an integral and carries scale error proportional to how far
+you turn. See `robot/docs/report.md` §7.17 for the measurements and the revert.
+
+If the robot is being lifted, that is the kidnapped-robot case, and the answer is
+localisation, not fusion tuning.
 
 ### Resetting a bad map mid-session
 
