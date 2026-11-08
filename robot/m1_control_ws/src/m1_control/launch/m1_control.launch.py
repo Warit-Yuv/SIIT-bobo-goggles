@@ -87,6 +87,40 @@ def launch_setup(context, *args, **kwargs):
     else:
         actions.append(LogInfo(msg='[control] audio bridge OFF'))
 
+    # ---------------- gaze pipeline ------------------------------------------
+    # These were in NO launch file at all, so the gaze path never worked unless
+    # you started two nodes by hand. The console's Calibrate button then said
+    # "no gaze source" with no indication that nothing was running.
+    #
+    # The split is deliberate:
+    #
+    #   gaze_udp_bridge    turns UDP from the eye tracker into ROS topics.
+    #                      Lives here because it publishes /gaze/raw, and the
+    #                      operator console calibrates against that.
+    #   gaze_control_node  turns a gaze point into a velocity command. Lives
+    #                      here because it is a CONTROL node: its output feeds
+    #                      the arbiter, and the arbiter is on the robot.
+    #
+    # gaze_hud_node is NOT started here - it needs a display and a webcam, so
+    # it belongs on the operator PC (m1_operator.launch.py).
+    if arg('gaze').lower() == 'true':
+        actions.append(Node(
+            package='m1_control',
+            executable='gaze_udp_bridge',
+            name='gaze_udp_bridge',
+            output='screen',
+            arguments=['--port', arg('gaze_port')],
+        ))
+        actions.append(Node(
+            package='m1_control',
+            executable='gaze_control_node',
+            name='gaze_control_node',
+            output='screen',
+            parameters=[params_file],
+        ))
+    else:
+        actions.append(LogInfo(msg='[control] gaze pipeline OFF'))
+
     return actions
 
 
@@ -110,5 +144,11 @@ def generate_launch_description():
         DeclareLaunchArgument('audio_device', default_value='plughw:2,0',
                               description='ALSA device for the USB headset '
                                           '(card 2 on this robot)'),
+        DeclareLaunchArgument('gaze', default_value='true',
+                              choices=['true', 'false'],
+                              description='Start the gaze UDP bridge and the '
+                                          'gaze -> /cmd_vel/gaze controller'),
+        DeclareLaunchArgument('gaze_port', default_value='9100',
+                              description='UDP port the eye tracker sends to'),
         OpaqueFunction(function=launch_setup),
     ])

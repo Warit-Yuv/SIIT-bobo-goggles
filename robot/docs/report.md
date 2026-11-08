@@ -35,7 +35,7 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Nineteen defects were found and fixed during validation**, and one more is
+**Twenty defects were found and fixed during validation**, and one more is
 recorded as a documented failure (§7.17) because the fix looked correct and made
 things worse. All are in §7 because each one would have been a silent failure in
 operation. Seven of them (§7.12 – §7.18) were found only by testing on the real
@@ -945,6 +945,41 @@ turning green would be exactly backwards.
 > hardware, which is different on every machine in the system. Name shared
 > control topics after the device they operate, never after the viewer's
 > perspective.
+
+### 7.21 The gaze pipeline was in no launch file at all
+
+The console's Calibrate button reported "no gaze source" with a working webcam.
+
+`gaze_udp_bridge` and `gaze_control_node` existed as executables but appeared in
+**no launch file**. `./m1.sh bg` started sixteen nodes and not one of them was
+part of the gaze path. The only way to run it was two `ros2 run` commands typed
+by hand, which is exactly the kind of thing nobody remembers after a week.
+
+Two more gaps sat behind that:
+
+* `gaze_hud_node` (the local-webcam path) never published `/gaze/raw`. Only
+  `gaze_udp_bridge` did, so calibrating against a webcam-driven gaze point was
+  impossible no matter how well the tracker worked.
+* The error text said "start it on the robot", which is misleading: there are
+  three legitimate places the gaze source can live, and the message named one
+  of them without explaining why.
+
+**Fix:**
+
+* Both gaze nodes are now in `m1_control.launch.py` behind `gaze:=true`, with
+  the reasoning for the split recorded next to them - the bridge publishes
+  `/gaze/raw` which the console calibrates against, and `gaze_control_node` is a
+  control node whose output feeds the arbiter, so both belong on the robot.
+* `gaze_hud_node` publishes `/gaze/raw` from `_hud_tick`, which every source
+  passes through. mediapipe, mouse and external all produce the same stream, so
+  the console never needs to know which one is running.
+* The calibration dialog now names both ways to start a source.
+
+Verified: 30 synthetic UDP packets to `:9100` produced
+`/gaze/raw = (0.62, 0.55, valid=1.0)` and `/gaze/point = (0.62, 0.55)`.
+
+> **Lesson:** an executable that is not in a launch file is a feature that does
+> not exist. "You can run it manually" means "it will be forgotten".
 
 ---
 

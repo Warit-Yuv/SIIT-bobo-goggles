@@ -946,8 +946,12 @@ class CalibDialog:
                 if raw is None or raw[3] > 2.0:
                     self.lbl.setText('No gaze source')
                     self.hint.setText(
-                        'The gaze bridge is not publishing /gaze/raw.\n'
-                        'Start it on the robot first, then retry.')
+                        'Nothing is publishing /gaze/raw yet.\n\n'
+                        'Either start the gaze pipeline on the robot:\n'
+                        '    ./m1.sh stop --hard && ./m1.sh bg\n'
+                        'or run the gaze HUD on this machine:\n'
+                        '    ros2 launch m1_control m1_operator.launch.py '
+                        'gaze_source:=mouse')
                     return
                 self.btn_go.setEnabled(False)
                 self.idx = 0

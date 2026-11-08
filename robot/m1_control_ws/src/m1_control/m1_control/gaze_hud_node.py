@@ -144,6 +144,18 @@ class GazeHUDNode(Node):
         self.servo_pub = self.create_publisher(Vector3, '/servo/gaze', 10)
         self.mode_pub = self.create_publisher(UInt8, '/control_mode', mode_qos)
 
+        # Publish the uncorrected gaze point so the operator console can
+        # calibrate against it.
+        #
+        # This was the gap that made "Calibrate" report "no gaze source" even
+        # with a perfectly working webcam: /gaze/raw only ever came from
+        # gaze_udp_bridge, so the local-webcam path (mediapipe or mouse) had no
+        # stream to calibrate from. The console cannot care which source
+        # produced a gaze point - it needs the same topic either way.
+        #
+        # z carries validity: 1.0 = a real fix, 0.0 = face lost / blink.
+        self.raw_pub = self.create_publisher(Point, '/gaze/raw', 10)
+
         self.create_subscription(CompressedImage, self.camera_topic,
                                  self.image_cb, sensor_qos)
         self.create_subscription(Float32, '/voltage', self.voltage_cb, sensor_qos)
@@ -279,6 +291,16 @@ class GazeHUDNode(Node):
     def _hud_tick(self):
         if self.gaze_source == 'mediapipe':
             self._update_gaze_from_webcam()
+
+        # Feed the calibration stream. Published here rather than in the
+        # individual source callbacks so every source - mediapipe, mouse or
+        # external - produces the same /gaze/raw, and the console never has to
+        # know which one is running.
+        raw = Point()
+        raw.x = float(self.gaze_u)
+        raw.y = float(self.gaze_v)
+        raw.z = 1.0 if self.gaze_valid else 0.0
+        self.raw_pub.publish(raw)
 
         frame = self.frame
         if frame is None:
