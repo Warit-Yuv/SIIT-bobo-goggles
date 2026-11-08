@@ -28,11 +28,17 @@ implemented, built and validated against real hardware:
 | Gaze control pipeline | **Working** | Zone mapping + PTZ axes verified |
 | EEG UDP bridge | **Working** | `GO`→vx 0.15, link-loss stop in 0.88 s |
 | SLAM (`slam_toolbox`) on VM | **Working** | 78 occupied cells, map 73×149 @ 5 cm |
-| Cross-machine DDS | **Working** | Zero-config discovery, Pi↔VM, 1.3 ms |
+| Cross-machine DDS | **Working** | Unicast peers, 20.2 Hz video Pi→VM (§7.14) |
 | start / stop / restart | **Working** | Two consecutive cycles, 0 leftovers |
+| Two-way voice relay | **Working** | 161/161 PCM packets, per-direction mute |
+| GAZE+EEG fusion mode | **Working** | 5/5 priority tests (gaze steers, EEG stops) |
+| Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
+| Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Eleven defects were found and fixed during validation.** They are documented in
-§7 because each one would have been a silent failure in operation.
+**Fourteen defects were found and fixed during validation.** They are documented
+in §7 because each one would have been a silent failure in operation. Three of
+them (§7.12, §7.13, §7.14) were found only by testing on the real operator
+station, and none of the three produced an error message when it failed.
 
 ---
 
@@ -197,16 +203,19 @@ Everything stateful lives on the host, so the container is disposable:
     └── logs/
 ```
 
-### Node inventory (8 executables)
+### Node inventory (11 executables)
 
 | Node | Runs on | Purpose |
 |---|---|---|
 | `control_arbiter_node` | **Pi** | Mode mux, clamping, 350 ms watchdog |
 | `wasd_teleop_node` | Pi (TTY) | Keyboard mecanum + PTZ |
-| `eeg_udp_bridge` | **Pi** | UDP :9000 → `/cmd_vel/eeg` |
-| `gaze_udp_bridge` | **Pi** | UDP :9100 → `/gaze/point` |
+| `eeg_udp_bridge` | **Pi** | UDP :9000 → `/cmd_vel/eeg`, `/eeg/stop` |
+| `gaze_udp_bridge` | **Pi** | UDP :9100 → `/gaze/point`, with calibration |
 | `gaze_control_node` | **Pi** | Deadzone/dwell → `/cmd_vel/gaze` |
 | `image_throttle_node` | **Pi** | 30 Hz → 20 Hz compressed |
+| `audio_bridge` | **Pi + PC** | 2-way voice, raw PCM over UDP |
+| `m1_console` | **PC** | Operator GUI (PyQt5) |
+| `m1_panel` | PC | Small always-on-top mode/battery panel |
 | `sensor_sync_node` | PC | `ApproximateTimeSynchronizer` camera+scan |
 | `gaze_hud_node` | PC | Local-webcam HUD + overlay |
 
@@ -218,12 +227,16 @@ Everything stateful lives on the host, so the container is disposable:
 
 | Topic | Type | Rate (measured) | QoS |
 |---|---|---|---|
-| `/image_throttled/compressed` | `CompressedImage` | **20.08 Hz** | BEST_EFFORT |
+| `/image_throttled/compressed` | `CompressedImage` | **20.20 Hz** | BEST_EFFORT |
 | `/scan` | `LaserScan` | **10.02 Hz** | BEST_EFFORT |
 | `/odom` | `Odometry` | **10.59 Hz** | RELIABLE |
 | `/tf` | `TFMessage` | **20.91 Hz** | RELIABLE |
 | `/voltage` | `Float32` | 10.0 Hz | BEST_EFFORT |
 | `/map` | `OccupancyGrid` | on update | RELIABLE |
+| `/audio/status` | `String` | 1 Hz | RELIABLE |
+
+> The image rate is only achievable with the unicast-peer DDS config. With
+default multicast over Wi-Fi it measured **2.6 Hz** — see §7.14.
 
 ### PC → Robot (actuation, RELIABLE)
 
@@ -231,8 +244,10 @@ Everything stateful lives on the host, so the container is disposable:
 |---|---|---|
 | `/cmd_vel` | `Twist` | **Arbiter only** — 1 publisher |
 | `/Servo` | `ServoControl` | `s1`=**tilt** (larger = up), `s2`=**pan** (larger = left) |
-| `/control_mode` | `UInt8` | 0=E-STOP, 1=KEYBOARD, 2=GAZE, 3=EEG |
+| `/control_mode` | `UInt8` | 0=E-STOP, 1=KEYBOARD, 2=GAZE, 3=EEG, 4=GAZE+EEG |
 | `/Buzzer` | `Bool` | **Latches** — see §7.7 |
+| `/audio/enable`, `/audio/mic`, `/audio/speaker` | `Bool` | Voice relay control |
+| `/gaze/calib` | `Float32MultiArray` | `[offset_x, offset_y, gain_x, gain_y]` |
 
 ### Internal (arbiter inputs)
 
@@ -241,7 +256,11 @@ Everything stateful lives on the host, so the container is disposable:
 | `/cmd_vel/keyboard`, `/cmd_vel/gaze`, `/cmd_vel/eeg` | `Twist` |
 | `/servo/keyboard`, `/servo/gaze` | `Vector3` |
 | `/gaze/point` | `Point` (u,v ∈ 0..1) |
+| `/gaze/raw` | `Point` (uncorrected, `z`=valid) |
+| `/gaze/calib_state` | `Float32MultiArray` |
+| `/gaze/zone` | `String` |
 | `/eeg/raw_class` | `String` |
+| `/eeg/stop` | `Bool` |
 | `/gaze/zone` | `String` |
 
 ---
@@ -498,6 +517,104 @@ to change mode.
 > mode. Assert only when you are actually producing commands — and prefer a
 > loud warning over a silent block.
 
+### 7.12 The operator console kept a private copy of the servo limits
+
+The head turned much further one way than the other. Config, arbiter and teleop
+all agreed on symmetric limits, so the config was not the problem.
+
+The operator console had the limits written as literals inside
+`nudge_servo()`:
+
+```python
+self.servo['s1'] = min(180.0, max(0.0, self.servo['s1'] + d_tilt))
+self.servo['s2'] = min(110.0, max(0.0, self.servo['s2'] + d_pan))
+```
+
+For pan that is 90 units to the right and only 20 to the left — exactly the
+asymmetry being reported. Worse, the console on the operator VM had never been
+re-synced after the Pi was fixed, so the two machines were running different
+limit sets and neither was wrong on its own terms.
+
+**Fix:** the console declares the same `servo_*` ROS parameters as the arbiter
+and reads them at startup. There is now one authoritative definition, and a
+copy that drifts is impossible rather than merely discouraged.
+
+> **Lesson:** a limit duplicated in a GUI is a limit that will drift. If two
+> processes must agree on a number, make one of them read it from the other —
+> do not write it down twice.
+
+### 7.13 A GUI that starts with the wrong environment shows nothing, forever
+
+The console displayed `no data` for battery, mode and video while the robot was
+demonstrably publishing all three.
+
+The GUI had been launched through `bash -lc`, which sources `.profile` but not
+`.bashrc` — and Ubuntu's default `.bashrc` returns early for non-interactive
+shells anyway. `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION` were therefore unset in
+the GUI's process. With the default domain 0 and the default RMW, the GUI was
+on a completely separate DDS network: not an error, not a warning, just silence.
+
+**Fix:** two layers, because one is not enough.
+
+1. A launcher (`~/m1_console.sh`) exports the domain, RMW and Cyclone config
+   explicitly before starting the GUI. It also brackets the ROS `setup.bash`
+   sourcing with `set +u`, since those scripts read unset variables and abort
+   under `set -u`.
+2. The GUI compares its own environment against the expected values at startup
+   and shows a **red banner** naming both mismatched variables if they differ.
+
+> **Lesson:** a DDS mismatch is a *silent* failure, so it needs an *active*
+> check. Anything that can only fail silently deserves an assertion at startup.
+
+### 7.14 Wi-Fi multicast crippled the camera feed
+
+The operator GUI showed `0 fps` and "waiting for camera", while the robot was
+publishing compressed frames at a clean 20 Hz.
+
+Small topics were fine. `/control_mode_state` and `/voltage` are ~100 bytes at
+1 Hz and arrived perfectly, which made DDS look healthy. But measuring the
+actual rate **on the operator side** told a different story:
+
+```
+$ ros2 topic hz /image_throttled/compressed     # on the VM
+average rate: 2.6
+```
+
+One frame is 58 377 bytes. At 20 Hz that is about **9.3 Mbit/s**.
+
+The Pi reaches the operator VM over Wi-Fi. Wi-Fi transmits **multicast** frames
+at the lowest basic rate, with no acknowledgement and no retransmission, so a
+lost multicast frame is simply lost. A 100-byte topic survives that. A 58 kB
+JPEG published 20 times a second does not — roughly 7 of every 8 frames died in
+transit, and nothing anywhere reported an error.
+
+**Fix:** switch from multicast to unicast peers in `config/cyclonedds.xml` on
+both machines:
+
+```xml
+<AllowMulticast>spdp</AllowMulticast>   <!-- discovery only -->
+<Discovery>
+    <ParticipantIndex>none</ParticipantIndex>
+    <Peers><Peer address="10.0.0.102"/></Peers>
+</Discovery>
+```
+
+Multicast is retained for participant discovery — it is small, and it is what
+finds the peer in the first place — while all user data goes over unicast,
+which is acknowledged and retransmitted. The interface is also pinned by name,
+which stops the host-network container from selecting `docker0` (172.17.0.1)
+instead of `wlan0`.
+
+Measured result: **2.6 Hz → 20.2 Hz**, matching the publisher exactly.
+
+> **Lesson:** "the small messages arrive" does not mean the transport is
+> healthy. Measure the rate of the *largest* topic on the *receiving* machine.
+> Wi-Fi and multicast are a poor combination for anything bandwidth-heavy.
+
+> **Gotcha:** XML comments may not contain `--`. The first version of the
+> config used `-------` rules inside the comment block and Cyclone rejected the
+> file without any useful diagnostic. Use `=====` instead.
+
 ---
 
 ## 8. Validation Results
@@ -630,6 +747,73 @@ ros2 run m1_control eeg_udp_bridge
 python3 scripts/test_eeg_udp.py --ip 127.0.0.1 --sequence   # no headset needed
 ```
 
+### GAZE+EEG fusion (mode 4)
+
+Mode 4 combines the two input channels that are each incomplete on their own:
+gaze is continuous but noisy and cannot express "stop", while EEG is discrete
+but reliable and can express a deliberate command. Fusion uses each for what it
+is good at.
+
+| Input | Effect in FUSION |
+|---|---|
+| Gaze | steers the robot continuously |
+| EEG **STOP** (jaw clench) | halts immediately, outranks gaze |
+| EEG turn / strafe | takes over briefly as an override |
+| EEG **REST** (zero) | **ignored** — gaze stays in charge |
+| Keyboard | wins for 0.4 s in any mode |
+
+The distinction between EEG STOP and EEG REST is the whole safety story. Both
+produce a zero `Twist` on `/cmd_vel/eeg`, so the bridge raises `/eeg/stop` only
+for a genuine clench. Without that, the robot would stutter every time the
+classifier rested.
+
+Validation — 5/5 priority tests:
+
+| Test | Result |
+|---|---|
+| Gaze alone steers | `vx = 0.20` |
+| EEG STOP halts | `vx = 0.00` |
+| STOP released resumes | `vx = 0.20` |
+| Keyboard overrides | `vx = -0.12` |
+| Keyboard released resumes | `vx = 0.20` |
+
+### Operator console (on the PC)
+
+```bash
+~/m1_console.sh
+```
+
+One window for the whole session: start/stop the robot, pick a mode, drive,
+watch the camera, calibrate gaze, and control the voice link. Details in
+`operator-pc/README.md`.
+
+> Launch it through the wrapper, never `ros2 run` directly — the wrapper sets
+> the DDS environment, and a missing domain does not produce an error, only an
+> empty GUI (§7.13).
+
+### Two-way voice
+
+Started automatically by the launch file in the `robot` role and muted until
+`/audio/enable` arrives.
+
+```bash
+# manual, on the PC
+ros2 run m1_control audio_bridge --role operator \
+    --peer-ip 10.0.0.54 --device-in plughw:2,0 --device-out plughw:2,0
+
+ros2 topic pub --once /audio/enable std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /audio/mic    std_msgs/msg/Bool "{data: false}"   # mute me
+ros2 topic echo /audio/status
+```
+
+Raw PCM 16 kHz mono, 640-byte chunks every 20 ms, 60 ms jitter buffer. Ports are
+derived from `--role`: the robot listens on 9201 and sends to 9200.
+
+`/audio/status` reports `enabled`, `mic`, `spk`, `sent`, `recv`, `drop` and
+`live`. Note that **`live` means audio arrived** — i.e. the *other* side is
+transmitting. On the robot, `live=false` with `sent` climbing is normal until
+the operator-side bridge is running.
+
 ---
 
 ## 10. Servo Convention — Confirmed by Hand
@@ -648,20 +832,52 @@ Observed: `s1` 0 = angled down, 30 = level, 70 = angled up. `s2` 60 = right,
 The driver maps `s1`→PWM channel 2 and `s2`→PWM channel 3, and hard-clamps `s2`
 to 0..110.
 
-### Travel limits are NOT yet confirmed
+### Travel limits — measured with the camera as the sensor
 
-Only the *directions* above were observed. The configured ranges are the vendor
-joystick controller's values and have not been checked against the mechanical
-stops:
+The configured ranges below were **measured**, not copied from the vendor
+joystick defaults. The method matters because it needs no extra hardware: the
+camera is mounted on the head, so any head movement shows up as image motion.
 
-| | Configured range | Source |
-|---|---|---|
-| `s1` | 0 .. 180 | vendor joystick |
-| `s2` | 0 .. 110 | chassis driver hard clamp |
+The first attempt used phase correlation between the frame at the start and the
+frame at each position. That failed — the head moves too far per step and phase
+correlation wraps around, producing nonsense. The working method stepped the
+servo by 4–6 units and used **ORB feature matching with a median consensus**
+between *consecutive* frames, then integrated the per-step shifts. Each step is
+small enough for feature matching to stay locked, and the consensus filter
+discards mismatched features.
 
-Move the servos slowly the first time and stop before they buzz or stall. If a
-limit is wrong, set it in `config/m1_params.yaml` (`servo_s1_min/max`,
-`servo_s2_min/max`) — no code change needed.
+Results:
+
+| `s2` (pan) | Behaviour |
+|---|---|
+| 0 → ~112 | moves freely, linear (~48 px per 6 units) |
+| 112 → 120 | **no image change at all** with ~980 matched features |
+
+The flat tail is the proof: the frame does not move, so the servo is not
+moving. That is the firmware clamp, and it sits at 110.
+
+This is the origin of the asymmetry an operator notices as "it turns further
+right than left": with the rest pose at 90, the head has **90 units of travel
+to the right but only 20 to the left**. The asymmetry was never a configuration
+bug — it is the geometry of a clamp at 110 combined with a centre of 90.
+
+| | Measured usable | Configured range | Centre |
+|---|---|---|---|
+| `s1` (tilt) | 0 .. 90 | **5 .. 75** (±35) | 40 |
+| `s2` (pan) | 0 .. 110 | **80 .. 100** (±10) | 90 |
+
+Pan is deliberately narrowed well inside the mechanical limit. A camera that
+swings ~90° loses the view straight ahead, and driving forward while blind is
+the dangerous failure. ±10° keeps the path in frame. Tilt keeps a wide range
+because looking down at the floor in front of the robot is genuinely useful
+when navigating.
+
+If a limit needs changing, set it in `config/m1_params.yaml`
+(`servo_s1_min/max`, `servo_s2_min/max`). The same values are ROS parameters on
+every node that touches the servos, including the operator console, so there is
+no second copy to drift out of sync — see §7.12 for what happens when there is.
+
+Move the servos slowly the first time and stop before they buzz or stall.
 
 ### If a direction feels inverted
 

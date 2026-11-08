@@ -34,6 +34,8 @@ setup(
             'gaze_control_node = m1_control.gaze_control_node:main',
             'gaze_udp_bridge = m1_control.gaze_udp_bridge:main',
             'm1_panel = m1_control.m1_panel:main',
+            'audio_bridge = m1_control.audio_bridge:main',
+            'm1_console = m1_control.m1_console:main',
         ],
     },
 )

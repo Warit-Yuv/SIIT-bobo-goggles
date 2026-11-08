@@ -66,6 +66,13 @@ class GazeUdpCore:
                 self.u = min(1.0, max(0.0, float(msg['u'])))
                 self.v = min(1.0, max(0.0, float(msg['v'])))
             except (KeyError, TypeError, ValueError):
+                # A packet with no coordinates can still be meaningful: a
+                # tracker that has lost the face often sends just
+                # {"valid": false}. Ignoring it entirely would leave the last
+                # good position marked valid, and the robot would keep driving
+                # on a gaze that no longer exists. Honour the invalid flag.
+                if 'valid' in msg and not bool(msg.get('valid')):
+                    self.valid = False
                 return
             self.valid = bool(msg.get('valid', True))
             self.model = str(msg.get('model', ''))
@@ -147,11 +154,75 @@ def main(argv=None):
         def __init__(self):
             super().__init__('gaze_udp_bridge')
             self.pub = self.create_publisher(Point, '/gaze/point', 10)
+            # Raw, uncorrected sample. The operator console subscribes to this
+            # to run calibration, so it must be published even when the
+            # corrected value is being held at centre.
+            self.raw_pub = self.create_publisher(Point, '/gaze/raw', 10)
+
+            # Calibration. Every eye tracker has a resting bias - the operator
+            # looks straight ahead and the model reports u=0.62 instead of 0.5.
+            # Without correcting that, "neutral" steering pulls the robot to
+            # one side forever, and the operator fights the offset all session.
+            #
+            #   corrected = (raw - offset) * gain + 0.5
+            #
+            # The offset is the RAW value the tracker reports at rest, so the
+            # defaults must be 0.5 and 1.0 - that makes the expression collapse
+            # to `corrected = raw`, i.e. a true passthrough. Defaulting the
+            # offset to 0.0 instead would add 0.5 to every sample and pin the
+            # output at 1.0, which looks exactly like "calibration is broken".
+            self.declare_parameter('gaze_offset_x', 0.5)
+            self.declare_parameter('gaze_offset_y', 0.5)
+            self.declare_parameter('gaze_gain_x', 1.0)
+            self.declare_parameter('gaze_gain_y', 1.0)
+
+            gp = self.get_parameter
+            # Plain attributes, not live parameter lookups. set_parameters()
+            # from inside a callback silently failed to take effect here (the
+            # echo topic kept reporting the old values), so the calibration is
+            # held in memory and the parameters are only the startup default.
+            self._calib_vals = [
+                float(gp('gaze_offset_x').value),
+                float(gp('gaze_offset_y').value),
+                float(gp('gaze_gain_x').value),
+                float(gp('gaze_gain_y').value),
+            ]
+
+            # The operator console drives calibration over this topic rather
+            # than by calling `ros2 param set`: pub/sub works no matter which
+            # machine the console runs on, and needs no ROS env in a subprocess.
+            from std_msgs.msg import Float32MultiArray
+            self.create_subscription(
+                Float32MultiArray, '/gaze/calib', self._calib_cb, 10)
+            self.calib_pub = self.create_publisher(
+                Float32MultiArray, '/gaze/calib_state', 10)
+
             self.was_alive = False
             self.create_timer(1.0 / args.rate, self.tick)
+            self.create_timer(1.0, self._report_calib)
             self.get_logger().info(
                 f'Gaze UDP -> /gaze/point @ {args.rate:.0f} Hz | '
                 f'port {args.port} | link timeout {args.link_timeout}s')
+
+        def _calib(self):
+            return tuple(self._calib_vals)
+
+        def _calib_cb(self, msg):
+            data = list(msg.data)
+            if len(data) < 4:
+                self.get_logger().warn(
+                    f'/gaze/calib needs 4 floats [ox, oy, gx, gy], got {len(data)}')
+                return
+            self._calib_vals = [float(v) for v in data[:4]]
+            self.get_logger().info(
+                'Calibration set: offset=(%.3f, %.3f) gain=(%.2f, %.2f)'
+                % tuple(self._calib_vals))
+            self._report_calib()
+
+        def _report_calib(self):
+            from std_msgs.msg import Float32MultiArray
+            self.calib_pub.publish(
+                Float32MultiArray(data=[float(v) for v in self._calib_vals]))
 
         def tick(self):
             u, v, valid, alive = core.state(time.monotonic())
@@ -167,9 +238,22 @@ def main(argv=None):
                 # zeroes the velocity. Silence is the safe signal.
                 return
 
+            raw = Point()
+            raw.z = 1.0 if valid else 0.0
+            if valid:
+                raw.x, raw.y = float(u), float(v)
+            self.raw_pub.publish(raw)
+
             msg = Point()
             if valid:
-                msg.x, msg.y = float(u), float(v)
+                ox, oy, gx, gy = self._calib()
+                # Clamp after correction: a bad gain must not be able to push
+                # the commanded point outside the unit square, where the zone
+                # lookup would fall off the end.
+                cx = (float(u) - ox) * gx + 0.5
+                cy = (float(v) - oy) * gy + 0.5
+                msg.x = min(1.0, max(0.0, cx))
+                msg.y = min(1.0, max(0.0, cy))
             else:
                 # Blink / face briefly lost: hold at the deadzone centre so the
                 # chassis stays still and the PTZ holds its angle, instead of

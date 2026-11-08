@@ -46,12 +46,18 @@ MODE_ESTOP = 0
 MODE_KEYBOARD = 1
 MODE_GAZE = 2
 MODE_EEG = 3
+#: Gaze and EEG together. Gaze gives continuous proportional control, EEG
+#: provides discrete overrides (STOP always wins), keyboard overrides both.
+#: This is the mode intended for the bed-bound operator: they can steer by
+#: looking and stop by clenching, without switching modes.
+MODE_FUSION = 4
 
 MODE_NAMES = {
     MODE_ESTOP: 'E-STOP',
     MODE_KEYBOARD: 'KEYBOARD',
     MODE_GAZE: 'GAZE',
     MODE_EEG: 'EEG',
+    MODE_FUSION: 'GAZE+EEG',
 }
 
 
@@ -80,10 +86,15 @@ class ControlArbiterNode(Node):
         # checked against the mechanical stops.
         self.declare_parameter('default_servo_s1', 40)
         self.declare_parameter('default_servo_s2', 90)
-        self.declare_parameter('servo_s1_min', 0)
-        self.declare_parameter('servo_s1_max', 180)
-        self.declare_parameter('servo_s2_min', 0)
-        self.declare_parameter('servo_s2_max', 110)
+        # Symmetric about the rest pose. Measured with the camera as the
+        # sensor: pan is driver-clamped at 110, so +-20 is the widest symmetric
+        # window around 90. Deliberately narrowed further to +-10: a camera
+        # that swings ~90 degrees loses the view straight ahead, which is
+        # dangerous while driving forward. 80..100 keeps the path visible.
+        self.declare_parameter('servo_s1_min', 5)
+        self.declare_parameter('servo_s1_max', 75)
+        self.declare_parameter('servo_s2_min', 80)
+        self.declare_parameter('servo_s2_max', 100)
 
         self.declare_parameter('initial_mode', MODE_KEYBOARD)
         self.declare_parameter('publish_rate_hz', 20.0)
@@ -128,6 +139,9 @@ class ControlArbiterNode(Node):
         self._kb_twist = Twist()
         self._kb_time = self.get_clock().now()
 
+        # EEG jaw-clench stop flag (FUSION mode).
+        self._eeg_stop = False
+
         # ---------------- interfaces ----------------
         # Actuator topics: RELIABLE. Setpoints must not be dropped.
         actuator_qos = QoSProfile(
@@ -156,6 +170,8 @@ class ControlArbiterNode(Node):
         self.create_subscription(Twist, '/cmd_vel/keyboard', self._kb_vel_cb, 10)
         self.create_subscription(Twist, '/cmd_vel/gaze', self._gaze_vel_cb, 10)
         self.create_subscription(Twist, '/cmd_vel/eeg', self._eeg_vel_cb, 10)
+        # Latched STOP from the EEG bridge. See _eeg_stop_cb().
+        self.create_subscription(Bool, '/eeg/stop', self._eeg_stop_cb, 10)
 
         self.create_subscription(Vector3, '/servo/keyboard', self._kb_servo_cb, 10)
         self.create_subscription(Vector3, '/servo/gaze', self._gaze_servo_cb, 10)
@@ -287,12 +303,24 @@ class ControlArbiterNode(Node):
             self._accept(msg)
 
     def _gaze_vel_cb(self, msg: Twist):
-        if self.active_mode == MODE_GAZE:
+        if self.active_mode in (MODE_GAZE, MODE_FUSION):
             self._accept(msg)
 
     def _eeg_vel_cb(self, msg: Twist):
         if self.active_mode == MODE_EEG:
             self._accept(msg)
+        elif self.active_mode == MODE_FUSION:
+            # In FUSION, EEG is the override channel and gaze is the steering.
+            #
+            # EEG only wins when it says something *deliberate*: a stop (all
+            # zero) or a turn. A zero EEG command must NOT overwrite gaze, or
+            # the robot would stutter every time the classifier rests. So:
+            #   * non-zero EEG  -> take it (STOP / LEFT / RIGHT / strafe)
+            #   * zero EEG      -> ignore, leave gaze in charge
+            eeg = self.clamp_velocity(msg)
+            if self._magnitude(eeg) > 1e-6:
+                self._accept(eeg)
+                self._fusion_eeg_until = self.get_clock().now()
 
     def _kb_servo_cb(self, msg: Vector3):
         # Gimbal is keyboard-only by design; gaze drives it in GAZE mode.
@@ -300,8 +328,24 @@ class ControlArbiterNode(Node):
             self._set_servo(msg.x, msg.y)
 
     def _gaze_servo_cb(self, msg: Vector3):
-        if self.active_mode == MODE_GAZE:
+        if self.active_mode in (MODE_GAZE, MODE_FUSION):
             self._set_servo(msg.x, msg.y)
+
+    def _eeg_stop_cb(self, msg: Bool):
+        """EEG jaw-clench STOP. Outranks gaze in FUSION mode.
+
+        STOP and REST both produce a zero Twist on /cmd_vel/eeg, so the bridge
+        raises /eeg/stop only for a real clench. In FUSION that distinction is
+        the whole safety story: a clench must halt the robot even though gaze
+        is still publishing a drive command 20 times a second.
+        """
+        if self.active_mode not in (MODE_EEG, MODE_FUSION):
+            return
+        self._eeg_stop = bool(msg.data)
+        if self._eeg_stop:
+            self.cmd_vel_pub.publish(Twist())
+            self.latest_twist = Twist()
+            self.get_logger().warn('EEG STOP - robot halted by jaw clench')
 
     def _set_servo(self, s1_target, s2_target):
         new_s1 = int(max(self.s1_min, min(self.s1_max, round(float(s1_target)))))
@@ -332,6 +376,13 @@ class ControlArbiterNode(Node):
             return
 
         now = self.get_clock().now()
+
+        # ---------------- EEG STOP (FUSION) ----------------
+        # Highest priority after E-STOP: a deliberate clench outranks gaze.
+        if self.active_mode == MODE_FUSION and self._eeg_stop:
+            self.cmd_vel_pub.publish(Twist())
+            self.timed_out = False
+            return
 
         # ---------------- keyboard override ----------------
         # A recent, non-zero keyboard command wins regardless of mode, then

@@ -581,6 +581,75 @@ tracking a face.
 > to it is claiming the robot. A source should only ever *offer* commands on
 > its own topic and let the operator decide who is in charge.
 
+### Lesson 11: The number you wrote down twice
+
+The head turned much further one way than the other. The configuration was
+symmetric, the arbiter was symmetric, the teleop node was symmetric. The bug was
+in the operator GUI, which had its own copy of the limits typed into the code:
+
+```python
+self.servo['s2'] = min(110.0, max(0.0, ...))   # 90 right, 20 left
+```
+
+Nobody had written a wrong number. They had written the *right* number in two
+places, and only one of them got fixed.
+
+Worse: the GUI on the operator PC had never been re-synced with the robot, so
+the two machines disagreed and neither was internally inconsistent.
+
+**Fix:** the GUI reads the same ROS parameters as the arbiter. There is now one
+definition, and a drifting copy is impossible rather than merely discouraged.
+
+> **Lesson:** if two processes must agree on a number, make one of them read it
+> from the other. Never write it down twice — the second copy is the one that
+> gets forgotten.
+
+### Lesson 12: Some failures have no error message
+
+Three of this project's hardest bugs shared a property: **when they failed, they
+said nothing.**
+
+| Bug | What you saw | What was actually wrong |
+|---|---|---|
+| DDS domain never set (§7.13) | GUI showing `no data` | Process on a different DDS network |
+| Multicast over Wi-Fi (§7.14) | Camera at 2 Hz | 7 of every 8 frames silently dropped |
+| Duplicated limit (above) | Asymmetric servo | Two copies of one number |
+
+None produced a warning. None produced a log line. Each one looked exactly like
+"the feature is broken" rather than "the environment is wrong".
+
+The fixes that worked were all the same shape — **make the silent thing loud**:
+
+- The GUI compares its own environment against expected values at startup and
+  shows a red banner naming the mismatched variable.
+- The camera rate is displayed as a number, so 2 fps is visible rather than
+  invisible.
+- Servo limits live in one place, so there is no second value to compare.
+
+> **Lesson:** a failure that can only happen silently deserves an explicit
+> startup assertion. "It should be configured correctly" is not a check.
+
+### Lesson 13: Measure the biggest thing, on the receiving end
+
+"The small messages arrive" felt like proof that the network was fine. Mode
+state at 1 Hz arrived perfectly. Voltage at 1 Hz arrived perfectly. So the
+camera must be broken.
+
+It was not. A 100-byte message and a 58 000-byte message have completely
+different survival rates over Wi-Fi multicast, and measuring `ros2 topic hz` on
+the *publisher* proved nothing about what arrived.
+
+The number that mattered came from running the measurement on the **receiving**
+machine:
+
+```
+publisher:  20.0 Hz      receiver:  2.6 Hz
+```
+
+> **Lesson:** when a stream looks broken, measure its rate where it is
+> *consumed*, not where it is produced. And measure the largest topic — small
+> topics will happily survive a transport that cannot carry the big ones.
+
 ---
 
 ## Part 8 — What's finished
@@ -596,6 +665,8 @@ tracking a face.
 | Arbiter + watchdog | **12/12 safety checks** |
 | Gaze control | zone mapping + PTZ verified |
 | EEG bridge | `GO` → 0.15 m/s, link-loss stop 0.88 s |
+| Gaze + EEG fusion | **5/5 priority tests** |
+| Two-way voice | 161/161 PCM packets, per-direction mute |
 | Container | hot-plug works, 0 zombies |
 
 ### ✅ Operator PC — verified working
@@ -603,19 +674,20 @@ tracking a face.
 | Component | Evidence |
 |---|---|
 | ROS 2 Humble | present |
-| DDS discovery | **zero-config**, 1.3 ms latency |
-| All streams | 20.08 / 10.02 / 10.59 / 20.91 Hz |
+| DDS discovery | unicast peers, **20.2 Hz** video |
+| All streams | 20.20 / 10.02 / 10.59 / 20.91 Hz |
 | `slam_toolbox` | **78 occupied cells**, map 73×149 @ 5 cm |
+| Operator console | 6 panels, no layout defects, live camera |
+| Gaze calibration | **8/8 checks** |
 
 ### ⚠️ Not yet confirmed
 
 | Item | Why | Effort |
 |---|---|---|
-| Servo **travel limits** | direction confirmed, ranges are still the vendor's | 2 min |
 | Gaze model calibration | needs you in front of the webcam | 5 min |
 | EEG with real headset | needs the Muse 2 | 10 min |
 | Floor trial | needs space + a spotter | 15 min |
-| VM-side teleop | not written yet | your task |
+| Operator-side microphone | VMware is not passing the Windows mic through | — |
 
 ---
 
@@ -650,22 +722,34 @@ The head's axes are **not** what the parameter names suggest:
 This was verified by hand: `s1` 0 = down, 30 = level, 70 = up; `s2` 60 = right,
 90 = centre, 120 = left. Rest pose is `s1=40, s2=90`.
 
-What is **not** confirmed is the **travel range**. The configured limits are the
-vendor joystick values (`s1` 0..180, `s2` 0..110 — the driver hard-clamps `s2`)
-and have never been checked against the mechanical stops. Test them slowly and
-stop before the servo buzzes or stalls:
+What is now **measured** is the travel range. The head carries the camera, so a
+moving servo shows up as a moving image — that turns the camera into a servo
+position sensor with no extra hardware.
+
+Pan (`s2`) moves freely and linearly from 0 to about 112, then **stops dead**:
+at 112, 116 and 120 the image does not change at all (~980 matched features, zero
+shift). That flat tail is the firmware clamp. With a centre of 90 this gives 90
+units of travel right but only 20 left — exactly the asymmetry that feels like
+"it turns further one way".
+
+Configured limits are therefore **`s1` 5..75** and **`s2` 80..100**. Pan is
+narrowed well inside the mechanical stop on purpose: a camera that swings ~90°
+loses the view straight ahead, and driving forward while blind is the dangerous
+failure. Tilt stays wide because looking down in front of the robot is useful.
 
 ```bash
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 5, s2: 90}"
-ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 100, s2: 90}"
-ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 20}"
-ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 160}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 75, s2: 90}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 80}"
+ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 100}"
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 ```
 
-If a limit is wrong, change `servo_s1_min/max` or `servo_s2_min/max` in
-`config/m1_params.yaml` — no code change needed.
+If a limit needs changing, set `servo_s1_min/max` or `servo_s2_min/max` in
+`config/m1_params.yaml`. Every node that touches the servos — including the
+operator console — reads them as ROS parameters, so there is no second copy to
+drift out of sync.
 
 ### Step 3 — Keyboard drive (2 minutes)
 

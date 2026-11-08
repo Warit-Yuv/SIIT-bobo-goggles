@@ -88,10 +88,12 @@ class WASDTeleopNode(Node):
         self.declare_parameter('servo_step', 5.0)
         self.declare_parameter('servo_s1_center', 40.0)   # tilt, near level
         self.declare_parameter('servo_s2_center', 90.0)   # pan, straight ahead
-        self.declare_parameter('servo_s1_min', 0.0)
-        self.declare_parameter('servo_s1_max', 180.0)
-        self.declare_parameter('servo_s2_min', 0.0)
-        self.declare_parameter('servo_s2_max', 110.0)     # driver hard limit
+        # Symmetric about centre (see control_arbiter_node.py for the
+        # measurement). Pan 80..100 is a deliberately narrow window: a camera
+        # that swings ~90 degrees loses the view straight ahead, which is
+        # dangerous while driving forward.
+        self.declare_parameter('servo_s2_min', 80.0)
+        self.declare_parameter('servo_s2_max', 100.0)
         self.declare_parameter('hold_time_sec', 0.25)
         self.declare_parameter('publish_rate_hz', 20.0)
 

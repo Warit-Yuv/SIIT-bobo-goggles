@@ -9,27 +9,56 @@
   /tf_static never did - so slam_toolbox could not transform the scans and
   silently produced no map at all.
 
-  SocketReceiveBufferSize is the important setting. A 640x480 JPEG arrives as
-  many UDP fragments; the DDS must hold all of them while reassembling. The
-  kernel ceiling is raised separately (scripts/tune_network.sh); this asks
-  Cyclone to actually use a large buffer. 10 MB is comfortably inside the
-  16 MB net.core.rmem_max on this robot.
+  ============================================================
+  WHY UNICAST PEERS (this is the important part)
+  ============================================================
+  The Pi reaches the operator VM over Wi-Fi (wlan0). Wi-Fi sends multicast
+  frames at the lowest basic rate, with no acknowledgement and no
+  retransmission, so a lost multicast frame is simply lost.
+
+  That asymmetry is invisible on small topics. /control_mode_state and
+  /voltage are ~100 bytes at 1 Hz and arrived perfectly. A 640x480 JPEG is
+  ~58 kB and is published 20 times a second - about 9.3 Mbit/s of multicast -
+  and the operator PC received it at 2.6 Hz instead of 20 Hz. The camera
+  looked broken; the network was.
+
+  Setting AllowMulticast to "spdp" keeps multicast for participant discovery
+  only (cheap, small, and it is what finds the peer in the first place), while
+  all user data goes over unicast. Unicast over Wi-Fi is acknowledged and
+  retransmitted, and here it runs at 433 Mbit/s - far more than the video
+  needs.
+
+  If either machine's address changes, update the Peer below on BOTH sides.
+
+  SocketReceiveBufferSize is the second important setting. A large JPEG
+  arrives as several UDP fragments and the DDS must hold all of them while
+  reassembling. The kernel ceiling is raised separately
+  (scripts/tune_network.sh); this asks Cyclone to actually use a large buffer.
+  10 MB is comfortably inside the 16 MB net.core.rmem_max on this robot.
 -->
 <CycloneDDS xmlns="https://cdds.io/config">
     <Domain id="any">
         <General>
-            <!-- Let Cyclone pick the active interface (wlan0 on the Pi,
-                 ens33 on the VM). The older NetworkInterfaceAddress element is
-                 deprecated and warns on every node start. -->
+            <!-- Naming the interface explicitly stops Cyclone from picking
+                 docker0 (172.17.0.1) inside the host-network container, which
+                 would make the robot invisible to the operator. -->
             <Interfaces>
-                <NetworkInterface autodetermine="true"/>
+                <NetworkInterface name="wlan0"/>
             </Interfaces>
-            <AllowMulticast>true</AllowMulticast>
+            <!-- Discovery only. User data goes unicast to the Peer below. -->
+            <AllowMulticast>spdp</AllowMulticast>
             <!-- Explicit "B" unit: a bare number is deprecated and warns on
                  every node start. 65500 B stays under a typical 64 KiB
                  datagram ceiling while leaving room for RTPS headers. -->
             <MaxMessageSize>65500B</MaxMessageSize>
         </General>
+        <Discovery>
+            <ParticipantIndex>none</ParticipantIndex>
+            <Peers>
+                <!-- The operator VM. -->
+                <Peer address="10.0.0.102"/>
+            </Peers>
+        </Discovery>
         <Internal>
             <SocketReceiveBufferSize min="10MB"/>
         </Internal>

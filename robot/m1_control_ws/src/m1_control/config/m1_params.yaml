@@ -14,12 +14,20 @@ control_arbiter_node:
     # Confirmed working:
     #   ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
     # Ranges are the vendor joystick limits, NOT checked against mechanical stops.
-    default_servo_s1: 40
-    default_servo_s2: 90
-    servo_s1_min: 0
-    servo_s1_max: 180
-    servo_s2_min: 0
-    servo_s2_max: 110          # driver hard-clamps s2 to 0..110
+    # Servo limits are SYMMETRIC about the rest pose, measured on the robot by
+    # moving the head and watching for image change in the camera (which sits
+    # on the head). Asymmetric limits are what made the head travel much
+    # further one way than the other.
+    #
+    #   s1 = TILT, centre 40.  Measured usable 0..90; +-35 is conservative.
+    #   s2 = PAN,  centre 90.  The vendor driver hard-clamps s2 to 0..110, so
+    #                          the widest symmetric travel is 70..110 (+-20),
+    #                          but we narrow it to 80..100 (+-10) so the camera
+    #                          keeps the path ahead in view while driving.
+    servo_s1_min: 5
+    servo_s1_max: 75
+    servo_s2_min: 80
+    servo_s2_max: 100
 
     initial_mode: 1            # 1 = KEYBOARD
     publish_rate_hz: 20.0
@@ -46,10 +54,11 @@ wasd_teleop_node:
     # s1 = TILT (larger = up), s2 = PAN (larger = left)
     servo_s1_center: 40.0
     servo_s2_center: 90.0
-    servo_s1_min: 0.0
-    servo_s1_max: 180.0
-    servo_s2_min: 0.0
-    servo_s2_max: 110.0
+    # Symmetric about centre - see the note in control_arbiter_node above.
+    servo_s1_min: 5.0
+    servo_s1_max: 75.0
+    servo_s2_min: 80.0
+    servo_s2_max: 100.0
     hold_time_sec: 0.25
     publish_rate_hz: 20.0
 
@@ -73,7 +82,7 @@ gaze_control_node:
     #
     # Total degrees of travel used across the deadzone radius. Lower = calmer
     # and finer; raise if the head does not follow far enough.
-    servo_pan_span: 30.0
+    servo_pan_span: 10.0
     servo_tilt_span: 20.0
     # Low-pass per tick: 1.0 = instant/jittery, 0.2 = very smooth/laggy.
     servo_smoothing: 0.35
@@ -90,10 +99,11 @@ gaze_control_node:
     # s1 = TILT (larger = up), s2 = PAN (larger = left)
     servo_s1_center: 40.0
     servo_s2_center: 90.0
-    servo_s1_min: 0.0
-    servo_s1_max: 180.0
-    servo_s2_min: 0.0
-    servo_s2_max: 110.0
+    # Symmetric about centre - see the note in control_arbiter_node above.
+    servo_s1_min: 5.0
+    servo_s1_max: 75.0
+    servo_s2_min: 80.0
+    servo_s2_max: 100.0
 
     # Never claim the mode automatically; the operator decides.
     assert_mode: false

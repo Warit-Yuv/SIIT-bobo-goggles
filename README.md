@@ -26,7 +26,8 @@ with live 2D LiDAR SLAM.
 | Folder | Contents |
 |---|---|
 | [`robot/`](robot/) | **Robot side** — ROS 2 overlay, host scripts, engineering report |
-| [`operator-pc/`](operator-pc/) | **Operator side** — VM setup guide, VM teleop (in progress) |
+| [`operator-pc/`](operator-pc/) | **Operator side** — VM setup, operator console, voice, gaze calibration |
+| [`tools/`](tools/) | Development helpers (vision bridge for AI-assisted debugging) |
 
 ## Start here
 
@@ -63,6 +64,7 @@ Wi-Fi link just died.
 | `1` Keyboard | WASD + QE, IJKL gimbal | `/cmd_vel/keyboard` |
 | `2` Gaze | deadzone → PTZ, dwell → drive | `/cmd_vel/gaze` |
 | `3` EEG | Muse 2 gestures | `/cmd_vel/eeg` |
+| `4` Gaze + EEG | gaze steers, EEG clench stops | both, fused |
 
 ```bash
 ros2 topic pub --once /control_mode std_msgs/msg/UInt8 "{data: 1}"
@@ -82,5 +84,14 @@ watchdog `0.35 s`.
 | EEG control | Working (UDP end-to-end verified) |
 | SLAM on operator PC | Working |
 | start / stop / restart | Working — verified over two consecutive cycles |
-| Servo travel limits | **Not confirmed** against mechanical stops |
-| VM-side teleop | **In progress** |
+| Servo travel limits | Working — measured with the camera as a sensor |
+| Gaze + EEG fusion (mode 4) | Working — 5/5 priority tests |
+| Two-way voice | Working — per-direction mute, raw PCM over UDP |
+| Operator console (PyQt5) | Working — 6 panels, in-window teleop |
+| Gaze calibration | Working — 8/8 checks, 5-point offset + gain |
+
+Fourteen defects were found and fixed during hardware validation. Three of them
+were **silent** — no error, no warning, just a feature that did not work:
+a duplicated limit in the GUI, a DDS environment that never got set, and
+Wi-Fi multicast quietly dropping 7 of every 8 video frames. All are written up
+in [`robot/docs/report.md`](robot/docs/report.md) §7.

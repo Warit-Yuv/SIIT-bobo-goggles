@@ -113,7 +113,7 @@ class GazeControlNode(Node):
         # ---- PTZ aiming (positional, see tick()) ----
         # Total degrees of travel used across the deadzone radius. Smaller =
         # finer and calmer; larger = the head follows your eyes further.
-        self.declare_parameter('servo_pan_span', 30.0)
+        self.declare_parameter('servo_pan_span', 10.0)
         self.declare_parameter('servo_tilt_span', 20.0)
         # Low-pass factor per tick (1.0 = instant, 0.2 = very smooth).
         self.declare_parameter('servo_smoothing', 0.35)
@@ -121,10 +121,12 @@ class GazeControlNode(Node):
         self.declare_parameter('servo_rate_limit_hz', 20.0)
         self.declare_parameter('servo_s1_center', 40.0)   # tilt centre
         self.declare_parameter('servo_s2_center', 90.0)   # pan centre
-        self.declare_parameter('servo_s1_min', 0.0)
-        self.declare_parameter('servo_s1_max', 180.0)
-        self.declare_parameter('servo_s2_min', 0.0)
-        self.declare_parameter('servo_s2_max', 110.0)
+        # Symmetric about centre; see control_arbiter_node.py for the
+        # measurement that produced these numbers.
+        self.declare_parameter('servo_s1_min', 5.0)
+        self.declare_parameter('servo_s1_max', 75.0)
+        self.declare_parameter('servo_s2_min', 80.0)
+        self.declare_parameter('servo_s2_max', 100.0)
 
         self.declare_parameter('invert_pan', False)
         self.declare_parameter('invert_tilt', False)

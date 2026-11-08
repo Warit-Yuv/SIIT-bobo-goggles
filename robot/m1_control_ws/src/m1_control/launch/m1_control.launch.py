@@ -64,6 +64,29 @@ def launch_setup(context, *args, **kwargs):
             emulate_tty=True,
         ))
 
+    # ---------------- audio relay -------------------------------------------
+    # Started here so the operator console's Voice panel has something to talk
+    # to. It stays muted until /audio/enable arrives, so the robot's
+    # microphone is never live by accident - a real concern in someone's home.
+    # Ports are derived from --role (robot listens on 9201, sends to 9200), so
+    # they are deliberately not launch arguments: a typo there would silently
+    # give one-way audio.
+    if arg('audio').lower() == 'true':
+        actions.append(Node(
+            package='m1_control',
+            executable='audio_bridge',
+            name='audio_bridge',
+            output='screen',
+            arguments=[
+                '--role', 'robot',
+                '--peer-ip', arg('audio_peer'),
+                '--device-in', arg('audio_device'),
+                '--device-out', arg('audio_device'),
+            ],
+        ))
+    else:
+        actions.append(LogInfo(msg='[control] audio bridge OFF'))
+
     return actions
 
 
@@ -79,5 +102,13 @@ def generate_launch_description():
         DeclareLaunchArgument('teleop', default_value='false',
                               choices=['true', 'false'],
                               description='Start keyboard teleop (needs a TTY)'),
+        DeclareLaunchArgument('audio', default_value='true',
+                              choices=['true', 'false'],
+                              description='Start the 2-way voice relay'),
+        DeclareLaunchArgument('audio_peer', default_value='10.0.0.102',
+                              description='Operator PC address for voice UDP'),
+        DeclareLaunchArgument('audio_device', default_value='plughw:2,0',
+                              description='ALSA device for the USB headset '
+                                          '(card 2 on this robot)'),
         OpaqueFunction(function=launch_setup),
     ])

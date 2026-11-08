@@ -335,10 +335,13 @@ ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 > suggest, and getting it wrong makes the gaze controller pan when it means to
 > tilt. Confirmed on this robot; see `docs/report.md` §10.
 >
-> **Ranges are not confirmed.** `s1` is configured 0..180 and `s2` 0..110 (the
-> driver hard-clamps `s2`). Those are the vendor joystick limits and have not
-> been checked against the mechanical stops — move slowly and stop before the
-> servo buzzes or stalls.
+> **Ranges are measured, not guessed.** `s1` is configured **5..75** and `s2`
+> **80..100**. The measurement used the camera as the sensor: the head carries
+> the camera, so a moving servo means a moving image. Pan was found to stop
+> dead at 110, which with a centre of 90 gives 90 units of travel one way and
+> only 20 the other — the asymmetry an operator notices immediately. Pan is now
+> deliberately narrowed to ±10 so the camera keeps the path ahead in view while
+> driving. See `docs/report.md` §10 for the full method and numbers.
 
 ### 9.3 Camera
 

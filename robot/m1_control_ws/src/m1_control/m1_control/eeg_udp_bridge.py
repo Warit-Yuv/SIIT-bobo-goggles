@@ -217,7 +217,7 @@ def run_ros(args, core):
     from rclpy.node import Node
     from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                            ReliabilityPolicy)
-    from std_msgs.msg import UInt8
+    from std_msgs.msg import Bool, UInt8
 
     class EEGBridge(Node):
 
@@ -236,6 +236,14 @@ def run_ros(args, core):
 
             self.pub = self.create_publisher(Twist, args.topic, actuator_qos)
             self.mode_pub = self.create_publisher(UInt8, '/control_mode', mode_qos)
+
+            # STOP and REST both map to a zero Twist, so /cmd_vel/eeg alone
+            # cannot tell "the operator clenched their jaw" from "the
+            # classifier is idle". In GAZE+EEG fusion that difference decides
+            # whether to halt or to keep steering, so STOP gets its own latched
+            # signal. Only a genuine STOP raises it.
+            self.stop_pub = self.create_publisher(Bool, '/eeg/stop', actuator_qos)
+            self._stop_latched = False
 
             self.zero_left = 0
             self.prev = None
@@ -260,6 +268,17 @@ def run_ros(args, core):
         def tick(self):
             now = time.monotonic()
             vx, vy, wz = core.velocity(now)
+
+            # Publish the STOP flag whenever the classifier's last accepted
+            # command is STOP. It is de-asserted as soon as any other command
+            # is accepted, so a clench holds the robot and a later GO releases
+            # it.
+            is_stop = (core.last_cmd == 'STOP' and core.link_ok)
+            if is_stop != self._stop_latched:
+                self._stop_latched = is_stop
+                self.stop_pub.publish(Bool(data=is_stop))
+                self.get_logger().info(
+                    f"EEG STOP {'latched' if is_stop else 'released'}")
 
             if (vx, vy, wz) != self.prev:
                 self.get_logger().info(
