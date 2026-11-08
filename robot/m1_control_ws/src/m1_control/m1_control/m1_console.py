@@ -1607,6 +1607,11 @@ class CalibDialog:
             def __init__(self, node, area_rect, parent=None):
                 super().__init__(parent)
                 self.node = node
+                # This dialog handles keys itself (SPACE advances a posture,
+                # Escape cancels), so it must be able to RECEIVE them. Without
+                # StrongFocus the dialog cannot take focus at all and every key
+                # goes to whichever child widget happens to hold it.
+                self.setFocusPolicy(QtCore.Qt.StrongFocus)
                 # GLOBAL screen rect this dialog should cover - the whole
                 # console window, which is maximised, so in practice the whole
                 # screen.
@@ -1763,6 +1768,16 @@ class CalibDialog:
                 self.btn_go.clicked.connect(self.start)
                 self.btn_cancel = QtWidgets.QPushButton('Cancel  (Esc)')
                 self.btn_cancel.clicked.connect(self.reject)
+                # In a QDialog every QPushButton is an autoDefault button, and
+                # the first one becomes the default. SPACE and Return then
+                # activate whichever button currently holds focus - and during
+                # a run btn_go is disabled, so focus falls to Cancel. Pressing
+                # SPACE on a posture card therefore CLOSED the calibration
+                # instead of starting the posture: the dialog's keyPressEvent
+                # never ran, because the focused button consumed the key first.
+                for _b in (self.btn_go, self.btn_cancel):
+                    _b.setAutoDefault(False)
+                    _b.setDefault(False)
                 row.addWidget(self.btn_go)
                 row.addWidget(self.btn_cancel)
                 bv.addLayout(row)
@@ -1778,9 +1793,14 @@ class CalibDialog:
                 if e.key() == QtCore.Qt.Key_Escape:
                     self.reject()
                     return
-                if (e.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return)
-                        and self.phase == 'intro'):
-                    self._leave_intro()
+                if e.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return,
+                               QtCore.Qt.Key_Enter):
+                    # Swallow these WHATEVER the phase. QDialog's own handler
+                    # treats Return as "press the default button" and Escape as
+                    # reject, so falling through to super() is how a stray key
+                    # closes a calibration that is three minutes in.
+                    if self.phase == 'intro':
+                        self._leave_intro()
                     return
                 super().keyPressEvent(e)
 
@@ -1939,6 +1959,9 @@ class CalibDialog:
                 self.block_idx = -1
                 self.captured = []
                 self.anim.start(33)
+                # Take focus back from the buttons we just disabled, so the
+                # first SPACE reaches keyPressEvent instead of a button.
+                self.setFocus(QtCore.Qt.OtherFocusReason)
                 self._begin_point()
 
             def _timing(self):
@@ -1969,6 +1992,9 @@ class CalibDialog:
                 self.status.setText(
                     f'posture {self.block_idx + 1} of '
                     f'{len(cls.PROFILES[self.profile]["blocks"])}')
+                # The dialog itself must hold focus, or the key goes to
+                # whichever button happens to have it.
+                self.setFocus(QtCore.Qt.OtherFocusReason)
                 self.update()
 
             def _leave_intro(self):
