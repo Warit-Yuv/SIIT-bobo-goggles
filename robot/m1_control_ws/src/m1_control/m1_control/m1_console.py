@@ -1118,6 +1118,7 @@ def main(args=None):
         log_signal = QtCore.pyqtSignal(str)
         link_signal = QtCore.pyqtSignal(bool)
         recheck_signal = QtCore.pyqtSignal()
+        view_signal = QtCore.pyqtSignal(bool)
 
         def __init__(self):
             super().__init__()
@@ -1135,6 +1136,7 @@ def main(args=None):
             self.log_signal.connect(self._append_log)
             self.link_signal.connect(self._apply_link)
             self.recheck_signal.connect(self._check_link)
+            self.view_signal.connect(self._apply_view_state)
 
             central = QtWidgets.QWidget()
             self.setCentralWidget(central)
@@ -1173,6 +1175,13 @@ def main(args=None):
             self.link_timer.start(5000)
             self._check_link()
             self._check_dds()
+
+            # Keep the View state honest even if the stack was started or
+            # stopped outside the GUI.
+            self.view_timer = QtCore.QTimer(self)
+            self.view_timer.timeout.connect(self._poll_view)
+            self.view_timer.start(3000)
+            self._poll_view()
 
         # ------------------------------------------------------------- layout
         def _build_header(self):
@@ -1334,7 +1343,7 @@ def main(args=None):
             hints = QtWidgets.QLabel(
                 'W/S forward · Q/E strafe · A/D rotate\n'
                 'I/K tilt · J/L pan · U centre\n'
-                '0–4 mode · Space stop')
+                '0–4 mode · Space stop · Ctrl+Q quit')
             hints.setObjectName('dim')
             right.addWidget(hints)
             right.addStretch(1)
@@ -1343,13 +1352,27 @@ def main(args=None):
 
             # -- view -----------------------------------------------------
             g = QtWidgets.QGroupBox('View')
-            gv = QtWidgets.QHBoxLayout(g)
+            gv = QtWidgets.QVBoxLayout(g)
+            gv.setSpacing(6)
+            self.lbl_view = QtWidgets.QLabel('● view stopped')
+            self.lbl_view.setObjectName('dim')
+            gv.addWidget(self.lbl_view)
+            row = QtWidgets.QHBoxLayout()
             self.btn_slam = QtWidgets.QPushButton('Launch SLAM + RViz')
             self.btn_slam.clicked.connect(self._launch_view)
-            gv.addWidget(self.btn_slam)
+            row.addWidget(self.btn_slam)
             self.btn_killview = QtWidgets.QPushButton('Stop view')
+            self.btn_killview.setEnabled(False)
             self.btn_killview.clicked.connect(self._kill_view)
-            gv.addWidget(self.btn_killview)
+            row.addWidget(self.btn_killview)
+            gv.addLayout(row)
+            self.chk_stopview = QtWidgets.QCheckBox(
+                'Stop the view when I close this window')
+            self.chk_stopview.setChecked(True)
+            self.chk_stopview.setToolTip(
+                'Otherwise SLAM and RViz are left running, and the next launch '
+                'adds a second mapper - two maps then fight over /map.')
+            gv.addWidget(self.chk_stopview)
             v.addWidget(g)
             return panel
 
@@ -1575,25 +1598,88 @@ def main(args=None):
             self.logline('calibration reset to neutral')
 
         def _launch_view(self):
+            """Start SLAM + RViz, but only ever one copy.
+
+            Clicking this twice used to start a second slam_toolbox, and two
+            mappers publishing /map with different maps makes the map appear to
+            jump around - which reads as "the map keeps resetting" rather than
+            "two mappers are running". The guard is a flock in the child shell
+            rather than a Python flag: the flag would be lost if the console
+            restarted while an orphaned stack survived, and an orphaned stack is
+            exactly how this happens in the first place.
+            """
             self.logline('launching SLAM + RViz…')
+            # flock -n fails immediately if another copy holds the lock, and
+            # the lock is released automatically when that process dies - no
+            # stale lock file to clean up.
+            cmd = (
+                'exec flock -n /tmp/m1_operator.lock '
+                'ros2 launch m1_control m1_operator.launch.py'
+            )
             try:
                 subprocess.Popen(
-                    ['bash', '-lc', 'ros2 launch m1_control m1_operator.launch.py'],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    start_new_session=True)
-                self.logline('view launched')
+                    ['bash', '-lc', cmd],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, start_new_session=True)
+                self.logline('view launched (single instance enforced)')
+                # The launch takes a few seconds to come up, so do not claim it
+                # is running yet - the poll timer will confirm.
+                QtCore.QTimer.singleShot(6000, self._poll_view)
             except Exception as exc:  # noqa: BLE001
                 self.logline(f'launch failed: {exc}')
 
         def _kill_view(self):
+            """Stop SLAM + RViz and report what was actually stopped.
+
+            Runs on a worker: kill_vm.sh waits ~4 s for a clean shutdown, and
+            doing that on the GUI thread would freeze the window for the whole
+            time.
+            """
             self.logline('stopping view…')
             script = os.path.expanduser('~/m1_control_ws/scripts/kill_vm.sh')
             if not os.path.exists(script):
                 self.logline(f'missing {script}')
                 return
-            subprocess.Popen(['bash', script], start_new_session=True,
-                             stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+
+            def work():
+                try:
+                    r = subprocess.run(['bash', script], capture_output=True,
+                                       text=True, timeout=60)
+                    out = (r.stdout or '') + (r.stderr or '')
+                    # Report only the summary lines; the full listing is noisy.
+                    for line in out.splitlines():
+                        s = line.strip()
+                        if s.startswith('[') or 'Publisher count' in s \
+                                or s.startswith('(nothing'):
+                            self.logline(s)
+                    self.logline(f'view stopped (rc={r.returncode})')
+                except Exception as exc:  # noqa: BLE001
+                    self.logline(f'stop failed: {exc}')
+                finally:
+                    self.view_signal.emit(False)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _view_running(self):
+            """True if an operator-side launch is already alive."""
+            try:
+                r = subprocess.run(['pgrep', '-f', 'm1_operator.launch.py'],
+                                   capture_output=True, text=True, timeout=3)
+                return r.returncode == 0 and bool(r.stdout.strip())
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _poll_view(self):
+            # pgrep is local and returns in a few milliseconds, so unlike the
+            # SSH link probe this is safe on the GUI thread.
+            self.view_signal.emit(self._view_running())
+
+        def _apply_view_state(self, running):
+            self.lbl_view.setText('● SLAM + RViz running' if running
+                                  else '● view stopped')
+            self._style(self.lbl_view, 'good' if running else 'dim')
+            self.btn_slam.setEnabled(not running)
+            self.btn_killview.setEnabled(running)
 
         # --------------------------------------------------------------- keys
         def keyPressEvent(self, event):
@@ -1607,6 +1693,13 @@ def main(args=None):
                 return
             if key == QtCore.Qt.Key_Space:
                 self._estop()
+                return
+            if (key == QtCore.Qt.Key_Q
+                    and event.modifiers() & QtCore.Qt.ControlModifier):
+                # Route through close() so closeEvent runs and the view is
+                # cleaned up. Calling app.quit() directly would skip it and
+                # leave SLAM running.
+                self.close()
                 return
 
             mapping = {
@@ -1765,7 +1858,33 @@ def main(args=None):
                 self._style(self.lbl_audio, 'warn')
 
         def closeEvent(self, event):
+            """Stop the robot, then clean up anything this window started.
+
+            Closing the console used to leave SLAM and RViz running. The next
+            launch then added a *second* slam_toolbox, and two mappers
+            publishing /map with different maps makes the map appear to jump
+            around. That is the whole reason "2 maps are fighting" happened, so
+            the cleanup belongs here rather than in the user's memory.
+
+            The kill script is started detached and not waited for: it needs a
+            few seconds to shut nodes down cleanly, and blocking the close for
+            that long would look like the window had hung.
+            """
             node.estop()
+
+            if self.chk_stopview.isChecked() and self._view_running():
+                script = os.path.expanduser(
+                    '~/m1_control_ws/scripts/kill_vm.sh')
+                if os.path.exists(script):
+                    try:
+                        subprocess.Popen(
+                            ['bash', script],          # view-only, no --all,
+                            start_new_session=True,    # so this process is
+                            stdout=subprocess.DEVNULL,  # not in the kill list
+                            stderr=subprocess.DEVNULL)
+                    except Exception:  # noqa: BLE001 - never block closing
+                        pass
+
             stop_event.set()
             event.accept()
 
