@@ -113,6 +113,12 @@ class AudioBridgeCore:
         self.packets_recv = 0
         self.packets_dropped = 0
         self.last_rx = 0.0
+        # Subprocess health, reported so a dead arecord/aplay is visible in the
+        # GUI instead of looking like a quiet room.
+        self.capture_ok = False
+        self.playback_ok = False
+        self.capture_restarts = 0
+        self.playback_restarts = 0
         self.lock = threading.Lock()
 
     # ------------------------------------------------------------- controls
@@ -137,6 +143,13 @@ class AudioBridgeCore:
                 'dropped': self.packets_dropped,
                 # "live" means audio arrived in the last second.
                 'live': (now - self.last_rx) < 1.0 if self.last_rx else False,
+                # Subprocess health. A dead arecord/aplay is the difference
+                # between "nobody spoke" and "this end cannot hear anything",
+                # and the two look identical from the packet counters alone.
+                'cap_ok': self.capture_ok,
+                'play_ok': self.playback_ok,
+                'cap_restarts': self.capture_restarts,
+                'play_restarts': self.playback_restarts,
             }
 
     # --------------------------------------------------------------- threads
@@ -162,8 +175,12 @@ class AudioBridgeCore:
     def start(self):
         if self.device_in:
             self._tx_proc = self._spawn(self._arecord_cmd(), 'capture')
+            with self.lock:
+                self.capture_ok = self._tx_proc is not None
         if self.device_out:
             self._rx_proc = self._spawn(self._aplay_cmd(), 'playback')
+            with self.lock:
+                self.playback_ok = self._rx_proc is not None
 
         threading.Thread(target=self._tx_loop, daemon=True).start()
         threading.Thread(target=self._rx_loop, daemon=True).start()
@@ -180,17 +197,44 @@ class AudioBridgeCore:
 
     # ---------------------------------------------------------------- uplink
     def _tx_loop(self):
-        """Our microphone -> peer."""
-        if self._tx_proc is None:
-            return
+        """Our microphone -> peer.
+
+        Restarts `arecord` if it dies. The first version `break`ed out of the
+        loop on EOF, which silently killed the whole uplink for the rest of the
+        session: the process stayed alive, the ROS node stayed registered, the
+        GUI kept showing a packet counter, and nothing was ever transmitted
+        again. Measured on the robot after a few hours: both `arecord` and
+        `aplay` were zombies and no UDP port was bound at all.
+
+        An audio device that disappears (USB re-enumeration, a suspend, an
+        ALSA underrun) is a normal event, not a reason to give up.
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         # Never block the capture pipe if the network stalls.
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
 
         while not self.stop_event.is_set():
-            chunk = self._tx_proc.stdout.read(CHUNK_BYTES)
+            proc = self._tx_proc
+            if proc is None or proc.poll() is not None:
+                if not self._restart_capture():
+                    # Device genuinely unavailable - back off rather than spin.
+                    self.stop_event.wait(2.0)
+                    continue
+                proc = self._tx_proc
+
+            try:
+                chunk = proc.stdout.read(CHUNK_BYTES)
+            except (ValueError, OSError):
+                # Pipe closed under us; treat like EOF and restart.
+                chunk = b''
+
             if not chunk:
-                break
+                # arecord exited. Reap it so it does not linger as a zombie,
+                # then let the top of the loop restart it.
+                self._reap(self._tx_proc)
+                self._tx_proc = None
+                continue
+
             if not (self.enabled and self.mic_enabled):
                 continue
             try:
@@ -200,6 +244,36 @@ class AudioBridgeCore:
             except OSError:
                 pass
         sock.close()
+
+    def _restart_capture(self):
+        """(Re)spawn arecord. Returns True if a live process is now attached."""
+        self._reap(self._tx_proc)
+        proc = self._spawn(self._arecord_cmd(), 'capture')
+        self._tx_proc = proc
+        with self.lock:
+            self.capture_restarts += 1
+            self.capture_ok = proc is not None
+        if proc is not None:
+            print(f'[audio] capture (re)started: {self.device_in}')
+        return proc is not None
+
+    @staticmethod
+    def _reap(proc):
+        """Collect a dead child so it does not stay a zombie."""
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=0.5)
+            else:
+                proc.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     # -------------------------------------------------------------- downlink
     def _rx_loop(self):
@@ -224,6 +298,12 @@ class AudioBridgeCore:
                 data = None
             except OSError:
                 break
+
+            # Notice a dead aplay even when nothing is arriving - otherwise
+            # the downlink stays broken until the next packet happens to
+            # arrive, which may be never if the other side is also down.
+            if self._rx_proc is not None and self._rx_proc.poll() is not None:
+                self._restart_playback()
 
             if data:
                 with self.lock:
@@ -253,12 +333,27 @@ class AudioBridgeCore:
                     self._rx_proc.stdin.write(chunk)
                     self._rx_proc.stdin.flush()
                 except (BrokenPipeError, OSError):
-                    break
+                    # aplay died (device unplugged, ALSA error). Restart it
+                    # rather than abandoning the downlink - see _tx_loop.
+                    self._restart_playback()
+                    playing = False
             elif playing and not buffer:
                 # Underrun: wait for the buffer to refill before resuming.
                 playing = False
 
         sock.close()
+
+    def _restart_playback(self):
+        """(Re)spawn aplay. Returns True if a live process is now attached."""
+        self._reap(self._rx_proc)
+        proc = self._spawn(self._aplay_cmd(), 'playback')
+        self._rx_proc = proc
+        with self.lock:
+            self.playback_restarts += 1
+            self.playback_ok = proc is not None
+        if proc is not None:
+            print(f'[audio] playback (re)started: {self.device_out}')
+        return proc is not None
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +402,9 @@ def run_ros(args, core):
             self.pub_status.publish(String(data=(
                 f"enabled={s['enabled']} mic={s['mic']} spk={s['speaker']} "
                 f"sent={s['sent']} recv={s['recv']} drop={s['dropped']} "
-                f"live={s['live']}")))
+                f"live={s['live']} cap_ok={s['cap_ok']} play_ok={s['play_ok']}"
+                f" cap_restarts={s['cap_restarts']}"
+                f" play_restarts={s['play_restarts']}")))
 
     rclpy.init()
     node = AudioBridge()
@@ -381,9 +478,10 @@ def main(argv=None):
         try:
             while True:
                 s = core.status()
+                dev = 'ok' if (s['cap_ok'] and s['play_ok']) else 'DEVICE DOWN'
                 print(f"\r[audio] sent={s['sent']} recv={s['recv']} "
-                      f"drop={s['dropped']} live={s['live']}   ", end='',
-                      flush=True)
+                      f"drop={s['dropped']} live={s['live']} {dev}   ",
+                      end='', flush=True)
                 time.sleep(1.0)
         except KeyboardInterrupt:
             print()

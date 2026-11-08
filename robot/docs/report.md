@@ -35,7 +35,7 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Seventeen defects were found and fixed during validation**, and one more is
+**Eighteen defects were found and fixed during validation**, and one more is
 recorded as a documented failure (§7.17) because the fix looked correct and made
 things worse. All are in §7 because each one would have been a silent failure in
 operation. Seven of them (§7.12 – §7.18) were found only by testing on the real
@@ -837,6 +837,61 @@ references — the same code path RViz uses — all 2–4 MB each, all resolving
 > **Lesson:** "Errors loading geometries" is a resource-resolution error, not a
 > model error. When TF is fine but geometry is not, check
 > `AMENT_PREFIX_PATH` before you touch the URDF.
+
+### 7.19 The audio bridge died silently and kept reporting success
+
+The voice link stopped working after a few hours. The console showed a climbing
+packet counter and no error, so it looked like nobody was speaking.
+
+Two zombie children and no bound sockets:
+
+```
+bridge 163496   (running 2h59m)
+  163511 Z  [arecord] <defunct>
+  163512 Z  [aplay]  <defunct>
+
+$ cat /proc/net/udp  ->  neither 9200 nor 9201 bound
+```
+
+The device was fine. `arecord` alone produced 92 000 bytes on demand.
+
+**Cause.** Both transport loops treated end-of-file as a reason to stop:
+
+```python
+chunk = self._tx_proc.stdout.read(CHUNK_BYTES)
+if not chunk:
+    break          # <- uplink dead for the rest of the session
+```
+
+An audio device that disappears — USB re-enumeration, a suspend, an ALSA
+underrun — is a normal event, not a reason to give up. When `arecord` exited,
+the thread `break`ed, closed its socket, and the process stayed alive with a
+registered ROS node and a frozen packet counter. Nothing anywhere said so.
+
+**Fix.** Both loops now restart their subprocess, reap the dead child so it does
+not linger as a zombie, and back off 2 s if the device is genuinely gone.
+
+**Second cause: the health was never reported.** `/audio/status` carried only
+packet counts, so "nobody is talking" and "this end cannot hear anything" were
+indistinguishable. It now also reports `cap_ok`, `play_ok`, `cap_restarts` and
+`play_restarts`, and the console shows a red **DEVICE DOWN: mic** rather than a
+grey "no audio".
+
+**Third cause: `kill_all.sh` did not list `audio_bridge`.** Every restart left
+the old bridge running, so two of them accumulated and both published
+`/audio/status` — which made the topic return nothing at all, because two nodes
+of the same name fight over it. The script listed node names one by one, so
+every executable added after it was written leaked by default. It now has a
+catch-all on `m1_control/lib/m1_control` so a new node cannot leak silently.
+
+> **Lesson:** a `break` on EOF turns a recoverable event into a permanent
+> outage. Any loop supervising a subprocess needs a restart path, not an exit.
+
+> **Lesson:** a counter that only goes up is not a health check. Report whether
+> the thing producing the counter is alive.
+
+> **Lesson:** a cleanup script that lists names is a cleanup script that will be
+> out of date. Match the thing's identity, not a list of its members.
 
 ---
 

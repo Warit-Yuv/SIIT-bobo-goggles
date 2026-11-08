@@ -2083,16 +2083,30 @@ def main(args=None):
                 # "live" on the robot means inbound audio has arrived recently,
                 # i.e. the operator is being heard. Spell the direction out:
                 # the bare word "live" was easy to misread as "audio works".
+                cap_ok = d.get('cap_ok') == 'True'
+                play_ok = d.get('play_ok') == 'True'
                 if not enabled:
                     self.lbl_audio.setText('muted')
                     self._style(self.lbl_audio, 'dim')
+                elif not (cap_ok and play_ok):
+                    # The device died. Say which one: "no audio" and "this end
+                    # cannot capture at all" look identical from the counters,
+                    # and only one of them is the operator's fault.
+                    bad = []
+                    if not cap_ok:
+                        bad.append('mic')
+                    if not play_ok:
+                        bad.append('speaker')
+                    self.lbl_audio.setText(
+                        f'DEVICE DOWN: {" + ".join(bad)}')
+                    self._style(self.lbl_audio, 'bad')
                 elif live:
                     self.lbl_audio.setText(
                         f'2-way · out {sent} · in {recv}')
                     self._style(self.lbl_audio, 'good')
                 else:
                     self.lbl_audio.setText(
-                        f'out {sent} · no audio from me yet')
+                        f'out {sent} · robot hears nothing from me')
                     self._style(self.lbl_audio, 'warn')
             elif self.audio_on:
                 self.lbl_audio.setText('no bridge on robot')

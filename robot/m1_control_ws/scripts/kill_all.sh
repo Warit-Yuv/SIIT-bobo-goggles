@@ -23,7 +23,13 @@ PATTERNS=(
     "control_arbiter_node"
     "wasd_teleop_node"
     "gaze_hud_node"
+    "gaze_control_node"
+    "gaze_udp_bridge"
     "eeg_udp_bridge"
+    "audio_bridge"
+    "sensor_sync_node"
+    "m1_panel"
+    "m1_console"
     "ekf_node"
     "imu_filter_madgwick_node"
     "robot_state_publisher"
@@ -31,6 +37,11 @@ PATTERNS=(
     "static_transform_publisher"
     "slam_toolbox"
     "rviz2"
+    # Catch-all for anything else started from this package. A node that is
+    # left behind keeps publishing on its topic, so the next stack ends up with
+    # two publishers - which is how "two maps are fighting" happened. Listing
+    # names one by one meant every new executable leaked until someone noticed.
+    "m1_control/lib/m1_control"
 )
 
 SELF=$$
