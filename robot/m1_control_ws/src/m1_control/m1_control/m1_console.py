@@ -1077,11 +1077,19 @@ class CalibDialog:
             fit is not extrapolated from the edges alone and one bad dot can be
             detected and dropped.
 
+      super 20 dots - weighted towards the middle and the vertical axis.
+            About a minute. The fit has two unknowns per axis, so more dots do
+            not add parameters - they add CONFIDENCE, and they let the outlier
+            rejection actually work. Vertical is where this tracker is weakest
+            (the iris barely moves up and down inside the eye, so most of the
+            signal is head pitch), so the grid deliberately samples the centre
+            column and the centre band far more densely than the corners.
+
     The model, per axis:   corrected = (raw - offset) * gain + 0.5
     Fitting a line  target = gain * raw + b  across the dots, then
         gain = slope        offset = (0.5 - b) / gain
     recovers both numbers by least squares for any number of dots, which is
-    why one fitter serves both profiles.
+    why one fitter serves all three profiles.
     """
 
     PROFILES = {
@@ -1111,11 +1119,46 @@ class CalibDialog:
                 ('bottom-right', 0.90, 0.90, 'Look at the BOTTOM-RIGHT dot'),
             ],
         },
+        # Weighted for the vertical axis. Read the v column: eight of the
+        # twenty dots sit on the centre column, and five more are within one
+        # band of it. The corners get one dot each. If up/down is where the
+        # tracker struggles - and it is - this is where the samples should be.
+        'super': {
+            'label': 'Super · 20 dots · ~1 min',
+            'settle': 1.4, 'sample': 1.4,
+            'dots': [
+                ('top',          0.50, 0.06, 'Look at the TOP dot'),
+                ('upper-left',   0.20, 0.16, 'Look at the UPPER-LEFT dot'),
+                ('upper-right',  0.80, 0.16, 'Look at the UPPER-RIGHT dot'),
+                ('upper-mid',    0.50, 0.26, 'Look at the dot ABOVE centre'),
+                ('left-high',    0.15, 0.38, 'Look at the LEFT dot'),
+                ('mid-high',     0.50, 0.38, 'Look at the dot above centre'),
+                ('right-high',   0.85, 0.38, 'Look at the RIGHT dot'),
+                ('far-right',    0.92, 0.50, 'Look at the FAR RIGHT dot'),
+                ('right',        0.71, 0.50, 'Look right, just past centre'),
+                ('centre',       0.50, 0.50, 'Look at the CENTRE dot'),
+                ('centre-above', 0.50, 0.44, 'Look just above the CENTRE dot'),
+                ('left',         0.29, 0.50, 'Look left, just past centre'),
+                ('far-left',     0.08, 0.50, 'Look at the FAR LEFT dot'),
+                ('left-low',     0.15, 0.62, 'Look at the LEFT dot'),
+                ('mid-low',      0.50, 0.62, 'Look at the dot below centre'),
+                ('right-low',    0.85, 0.62, 'Look at the RIGHT dot'),
+                ('lower-mid',    0.50, 0.74, 'Look at the dot BELOW centre'),
+                ('lower-left',   0.20, 0.84, 'Look at the LOWER-LEFT dot'),
+                ('lower-right',  0.80, 0.84, 'Look at the LOWER-RIGHT dot'),
+                ('bottom',       0.50, 0.94, 'Look at the BOTTOM dot'),
+            ],
+        },
     }
 
     # A dot with fewer usable samples than this is treated as lost, and the
     # whole run is refused rather than fitted from noise.
     MIN_SAMPLES = 5
+
+    # The dot shrinks from PULSE_MAX to PULSE_MIN over the settle phase, so it
+    # is smallest exactly when sampling begins. See _pulse_radius().
+    PULSE_MAX = 34.0
+    PULSE_MIN = 9.0
 
     @classmethod
     def build(cls, QtCore, QtGui, QtWidgets):
@@ -1154,9 +1197,15 @@ class CalibDialog:
                 self.captured = []
                 self.u = None
                 self.v = None
+                self.pulse_t0 = None
                 self.timer = QtCore.QTimer(self)
                 self.timer.timeout.connect(self._tick)
                 self.phase_end = 0.0
+                # Separate from the state-machine timer: this one exists only
+                # to repaint, so the shrink looks continuous rather than
+                # stepping at the sample rate.
+                self.anim = QtCore.QTimer(self)
+                self.anim.timeout.connect(self.update)
 
                 # Frameless and translucent. A QDialog with a parent is still
                 # a top-level window, so its geometry is in global screen
@@ -1210,7 +1259,7 @@ class CalibDialog:
                 # and _Dialog is a nested class, so self.PROFILES would only
                 # work if it were re-declared here - which is exactly the bug
                 # this line had.
-                for key in ('fast', 'long'):
+                for key in ('fast', 'long', 'super'):
                     self.cmb_profile.addItem(cls.PROFILES[key]['label'], key)
                 self.cmb_profile.currentIndexChanged.connect(self._on_profile)
                 prow.addWidget(self.cmb_profile, 1)
@@ -1300,13 +1349,48 @@ class CalibDialog:
 
                 c = QtCore.QPointF(area.left() + area.width() * self.u,
                                    area.top() + area.height() * self.v)
+                self._draw_dot(p, c)
+
+            def _pulse_radius(self):
+                """How big the dot is right now.
+
+                The dot shrinks from PULSE_MAX to PULSE_MIN across the settle
+                phase, so it is smallest at the exact moment sampling starts.
+
+                This is the instruction, not decoration. A static dot gives no
+                cue about when to start looking at it, and people arrive late -
+                which puts the first samples of every dot on the PREVIOUS
+                dot's position. That is a small, systematic, one-directional
+                error repeated twenty times, and it is exactly the kind of
+                thing that makes a calibration feel like it did nothing.
+                """
+                if self.pulse_t0 is None:
+                    return cls.PULSE_MIN
+                settle = cls.PROFILES[self.profile]['settle']
+                frac = (time.monotonic() - self.pulse_t0) / max(1e-3, settle)
+                frac = min(1.0, max(0.0, frac))
+                return cls.PULSE_MAX - (cls.PULSE_MAX - cls.PULSE_MIN) * frac
+
+            def _draw_dot(self, p, c):
+                """Red, shrinking, with a soft halo.
+
+                Red rather than blue because the rest of this screen is blue
+                and the one thing the operator must find instantly is the dot.
+                The halo is drawn at a fraction of the core so it shrinks with
+                it instead of staying a fixed ring around nothing.
+                """
+                r = self._pulse_radius()
                 p.setPen(QtCore.Qt.NoPen)
-                p.setBrush(QtGui.QColor(37, 99, 235, 70))
-                p.drawEllipse(c, 26, 26)
-                p.setBrush(QtGui.QColor('#2563eb'))
-                p.drawEllipse(c, 13, 13)
-                p.setBrush(QtGui.QColor('#dbeafe'))
-                p.drawEllipse(c, 5, 5)
+                p.setBrush(QtGui.QColor(239, 68, 68, 40))
+                p.drawEllipse(c, r * 2.2, r * 2.2)
+                p.setBrush(QtGui.QColor(239, 68, 68, 100))
+                p.drawEllipse(c, r * 1.45, r * 1.45)
+                p.setBrush(QtGui.QColor('#ef4444'))
+                p.drawEllipse(c, r, r)
+                # A small white core so the exact centre is unambiguous even
+                # when the dot is at its largest.
+                p.setBrush(QtGui.QColor('#fee2e2'))
+                p.drawEllipse(c, max(2.0, r * 0.28), max(2.0, r * 0.28))
 
             # -------------------------------------------------------- control
             def _dots(self):
@@ -1326,11 +1410,15 @@ class CalibDialog:
                 self.cmb_profile.setEnabled(False)
                 self.idx = 0
                 self.captured = []
+                self.anim.start(33)
                 self._begin_point()
 
             def _begin_point(self):
                 name, u, v, text = self._dots()[self.idx]
                 self.u, self.v = u, v
+                # Restart the shrink for every dot: the dot appearing large
+                # and contracting is the cue to look at it NOW.
+                self.pulse_t0 = time.monotonic()
                 self.lbl.setText(
                     f'{name}  ·  {self.idx + 1} of {len(self._dots())}')
                 self.hint.setText(text)
@@ -1378,6 +1466,7 @@ class CalibDialog:
                     self.phase = 'idle'
                     self.u = self.v = None
                     self.timer.stop()
+                    self.anim.stop()
                     self.update()
                     return
                 n = len(self.samples)
@@ -1406,6 +1495,7 @@ class CalibDialog:
                 self.result_calib = (ox, oy, gx, gy)
                 self.phase = 'done'
                 self.timer.stop()
+                self.anim.stop()
                 self.u = self.v = None
                 self.lbl.setText('Calibration complete')
                 self.hint.setText(
@@ -1425,6 +1515,7 @@ class CalibDialog:
 
             def reject(self):
                 self.timer.stop()
+                self.anim.stop()
                 super().reject()
 
         return _Dialog

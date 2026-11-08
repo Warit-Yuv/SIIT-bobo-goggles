@@ -155,13 +155,35 @@ moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
 
 **5 · Gaze → Calibrate…**
 
-Two profiles. Both fit the same two numbers per axis; they differ only in how
-many dots are used to fit them.
+Three profiles. All fit the same two numbers per axis; they differ only in
+how many dots are used to fit them.
 
 | Profile | Dots | Time | Use it when |
 |---|---|---|---|
 | **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
 | **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
+| **Super** | 20 — weighted to the centre and the vertical axis | ~1 min | up/down still not working |
+
+More dots do not add parameters — the model has two unknowns per axis either
+way. They add **confidence**, and they give the outlier rejection enough spare
+dots to work with.
+
+**Super** is deliberately not an even grid. Read its `v` column: eight of the
+twenty dots sit on the centre column, twelve are within 0.20 of the centre
+band, and the four corners get one dot each. Vertical is where this tracker is
+weakest — the iris barely moves up and down inside the eye, so most of that
+signal is head pitch — so that is where the samples go.
+
+### The dot shrinks
+
+The calibration dot is **red** and contracts from 34 px to 9 px across the
+settle phase, reaching its smallest exactly when sampling starts.
+
+That is the instruction, not decoration. A static dot gives no cue about when
+to start looking at it, and people arrive late — which puts the first samples
+of every dot on the **previous** dot's position. That is a small, systematic,
+one-directional error repeated twenty times, and it is exactly the kind of
+thing that makes a calibration feel like it did nothing.
 
 The dots spread across the **whole screen**, at 10% and 90% in each direction.
 
@@ -336,7 +358,8 @@ wrong, because it looks right.
 | Nothing moves but gaze is live | wrong control mode | Select mode **2 Gaze** (or **4** for fusion) |
 | Robot jitters | deadzone too small | Raise `deadzone_ratio` |
 | Turning is easy, forward is not | vertical deadzone too wide | Lower `deadzone_radius_ratio_y` |
-| **Up and down does nothing at all** | `head_weight` too low — iris-only vertical is noise | Raise the **Head** slider |
+| Up and down does nothing at all | `head_weight` too low — iris-only vertical is noise | Raise the **Head** slider |
+| Up and down still poor after that | not enough vertical samples | Run the **Super** profile |
 | Have to strain your eyes to reach a zone | not enough head contribution | Raise the **Head** slider |
 | Everything moves when you shift in your seat | too much head contribution | Lower the **Head** slider, then recalibrate |
 | Head sweeps to a limit and stops | servo running in rate mode | Check `servo_pan_span` / `servo_smoothing` |
