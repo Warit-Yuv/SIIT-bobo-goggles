@@ -371,11 +371,27 @@ def run_ros(args, core):
             super().__init__('audio_bridge')
             self.pub_status = self.create_publisher(String, '/audio/status', 10)
 
-            # /audio/enable is the master switch; the per-direction topics let
-            # the operator mute just one side.
+            # The mute topics are named for the ROBOT's hardware, not for
+            # whoever is listening.
+            #
+            # They used to be /audio/mic and /audio/speaker, which is ambiguous:
+            # "mic" means "the mic at my end" to both bridges, so the operator's
+            # "My mic -> robot speaker" toggle also muted the ROBOT's
+            # microphone - the exact opposite of what it said. Both ends
+            # subscribed to both topics, so every toggle did two things.
+            #
+            # Naming them after the robot's hardware removes the ambiguity:
+            #
+            #   /audio/robot_mic      the robot's microphone  (robot -> operator)
+            #   /audio/robot_speaker  the robot's speaker     (operator -> robot)
+            #
+            # Both bridges subscribe to the same names and agree on what they
+            # mean, which is the point.
             self.create_subscription(Bool, '/audio/enable', self._en_cb, 10)
-            self.create_subscription(Bool, '/audio/mic', self._mic_cb, 10)
-            self.create_subscription(Bool, '/audio/speaker', self._spk_cb, 10)
+            self.create_subscription(Bool, '/audio/robot_mic',
+                                     self._mic_cb, 10)
+            self.create_subscription(Bool, '/audio/robot_speaker',
+                                     self._spk_cb, 10)
 
             self.create_timer(1.0, self._report)
             self.get_logger().info(
@@ -389,13 +405,41 @@ def run_ros(args, core):
             self.get_logger().info(f"Audio {'ON' if msg.data else 'OFF'}")
 
         def _mic_cb(self, msg):
-            core.set_mic(msg.data)
-            self.get_logger().info(f"Mic {'on' if msg.data else 'muted'}")
+            """The ROBOT's microphone was switched on or off.
+
+            What that means for THIS core depends on which end we are:
+
+              robot end     our microphone. Controls whether we capture.
+              operator end  the audio we HEAR. Controls whether we play it.
+
+            The same topic has to drive different local flags, and getting this
+            mapping wrong is what made the checkboxes appear swapped.
+            """
+            on = bool(msg.data)
+            if core.role == 'robot':
+                core.set_mic(on)
+                self.get_logger().info(
+                    f"Robot mic {'on' if on else 'muted'}")
+            else:
+                core.set_speaker(on)
+                self.get_logger().info(
+                    f"Robot mic {'audible' if on else 'muted'} here")
 
         def _spk_cb(self, msg):
-            core.set_speaker(msg.data)
-            self.get_logger().info(
-                f"Speaker {'on' if msg.data else 'muted'}")
+            """The ROBOT's speaker was switched on or off.
+
+              robot end     our speaker. Controls whether we play.
+              operator end  where our voice GOES. Controls whether we capture.
+            """
+            on = bool(msg.data)
+            if core.role == 'robot':
+                core.set_speaker(on)
+                self.get_logger().info(
+                    f"Robot speaker {'on' if on else 'muted'}")
+            else:
+                core.set_mic(on)
+                self.get_logger().info(
+                    f"Speaking to the robot {'enabled' if on else 'disabled'}")
 
         def _report(self):
             s = core.status()

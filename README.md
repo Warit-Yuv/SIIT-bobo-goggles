@@ -93,7 +93,7 @@ watchdog `0.35 s`.
 | Operator console (PyQt5) | Working — 6 panels, live SLAM map, in-window teleop |
 | Gaze calibration | Working — 8/8 checks, 5-point offset + gain |
 
-Eighteen defects were found and fixed during hardware validation. Most of them
+Nineteen defects were found and fixed during hardware validation. Most of them
 were **silent** — no error, no warning, just a feature that did not work:
 a duplicated limit in the GUI, a DDS environment that never got set, and
 Wi-Fi multicast quietly dropping 7 of every 8 video frames. All are written up

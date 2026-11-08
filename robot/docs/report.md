@@ -35,7 +35,7 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Eighteen defects were found and fixed during validation**, and one more is
+**Nineteen defects were found and fixed during validation**, and one more is
 recorded as a documented failure (§7.17) because the fix looked correct and made
 things worse. All are in §7 because each one would have been a silent failure in
 operation. Seven of them (§7.12 – §7.18) were found only by testing on the real
@@ -892,6 +892,59 @@ catch-all on `m1_control/lib/m1_control` so a new node cannot leak silently.
 
 > **Lesson:** a cleanup script that lists names is a cleanup script that will be
 > out of date. Match the thing's identity, not a list of its members.
+
+### 7.20 "My mic" meant two different devices
+
+The two voice checkboxes appeared swapped: ticking **My mic → robot speaker**
+muted the *robot's* microphone.
+
+Both bridges subscribed to the same two topics, and both read them from their
+own point of view:
+
+```python
+# on the robot
+self.create_subscription(Bool, '/audio/mic', self._mic_cb, 10)
+# on the operator - same topic, opposite meaning
+self.create_subscription(Bool, '/audio/mic', self._mic_cb, 10)
+```
+
+`/audio/mic` means "the mic at my end" to each of them, so one checkbox changed
+two devices, in opposite directions, and neither end could tell.
+
+**Fix:** name the topics after the **robot's** hardware, not the speaker's
+perspective.
+
+| Topic | Means | Robot end | Operator end |
+|---|---|---|---|
+| `/audio/robot_mic` | the robot's microphone | capture on/off | playback on/off |
+| `/audio/robot_speaker` | the robot's speaker | playback on/off | capture on/off |
+
+The same topic still drives opposite local flags depending on role, but now that
+is *stated* in one place instead of being an accident of naming:
+
+```python
+if core.role == 'robot':
+    core.set_mic(on)        # our microphone
+else:
+    core.set_speaker(on)    # what we hear
+```
+
+**And the controls were redesigned.** Two checkboxes gave no hint about which
+state was healthy. They are now Discord-style toggle buttons whose colour
+describes the *result*, not the click:
+
+| Button | Green | Red / grey | Drives |
+|---|---|---|---|
+| **Mute** | `Mic on` | `Muted` (red) | `/audio/robot_speaker` |
+| **Deafen** | `Hearing` | `Deafened` (grey) | `/audio/robot_mic` |
+
+Colour follows state rather than check state, because a *checked* Mute button
+turning green would be exactly backwards.
+
+> **Lesson:** a topic name is an interface. `mic` describes the speaker's
+> hardware, which is different on every machine in the system. Name shared
+> control topics after the device they operate, never after the viewer's
+> perspective.
 
 ---
 

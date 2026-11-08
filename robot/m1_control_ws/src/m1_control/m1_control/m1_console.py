@@ -124,6 +124,21 @@ QPushButton#estop {
 QPushButton#estop:hover { background: #991b1b; border-color: #dc2626; }
 QPushButton#estop:pressed { background: #641414; }
 QPushButton#primary { background: #1d4ed8; border-color: #2563eb; text-align: center; }
+QPushButton#toggle {
+    text-align: center; font-weight: bold; padding: 7px 4px; font-size: 12px;
+}
+QPushButton#toggle[state="on"] {
+    background: #14532d; border: 1px solid #16a34a; color: #bbf7d0;
+}
+QPushButton#toggle[state="on"]:hover { background: #166534; }
+QPushButton#toggle[state="bad"] {
+    background: #4c1d1d; border: 1px solid #991b1b; color: #fecaca;
+}
+QPushButton#toggle[state="bad"]:hover { background: #5f2626; }
+QPushButton#toggle[state="grey"] {
+    background: #262b33; border: 1px solid #3f4954; color: #7b838c;
+}
+QPushButton#toggle[state="grey"]:hover { background: #2f353e; }
 QPushButton#primary:hover { background: #2563eb; }
 QCheckBox { padding: 2px; }
 QCheckBox::indicator {
@@ -210,8 +225,14 @@ class ConsoleNode(Node):
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel/keyboard', 10)
         self.servo_pub = self.create_publisher(Vector3, '/servo/keyboard', 10)
         self.audio_en_pub = self.create_publisher(Bool, '/audio/enable', 10)
-        self.audio_mic_pub = self.create_publisher(Bool, '/audio/mic', 10)
-        self.audio_spk_pub = self.create_publisher(Bool, '/audio/speaker', 10)
+        # Named for the ROBOT's hardware. The old /audio/mic and
+        # /audio/speaker were ambiguous: both bridges subscribed to both, and
+        # "mic" meant "the mic at my end" to each of them, so one checkbox
+        # muted two different things - see audio_bridge.py.
+        self.audio_rmic_pub = self.create_publisher(
+            Bool, '/audio/robot_mic', 10)
+        self.audio_rspk_pub = self.create_publisher(
+            Bool, '/audio/robot_speaker', 10)
         self.calib_pub = self.create_publisher(
             Float32MultiArray, '/gaze/calib', 10)
 
@@ -377,13 +398,22 @@ class ConsoleNode(Node):
         self.teleop = Twist()
         self.vel_pub.publish(Twist())
 
-    def audio(self, enable=None, mic=None, speaker=None):
+    def audio(self, enable=None, robot_mic=None, robot_speaker=None):
+        """Control the robot's audio hardware.
+
+        robot_mic      the robot's microphone  -> audio travels robot -> me
+        robot_speaker  the robot's speaker     -> audio travels me -> robot
+
+        Named for the far end deliberately. "my mic" is a different thing on
+        each machine, and that ambiguity is what made the two checkboxes
+        appear swapped.
+        """
         if enable is not None:
             self.audio_en_pub.publish(Bool(data=bool(enable)))
-        if mic is not None:
-            self.audio_mic_pub.publish(Bool(data=bool(mic)))
-        if speaker is not None:
-            self.audio_spk_pub.publish(Bool(data=bool(speaker)))
+        if robot_mic is not None:
+            self.audio_rmic_pub.publish(Bool(data=bool(robot_mic)))
+        if robot_speaker is not None:
+            self.audio_rspk_pub.publish(Bool(data=bool(robot_speaker)))
 
     def set_calibration(self, ox, oy, gx, gy):
         self.calib_pub.publish(
@@ -673,7 +703,7 @@ def make_map_view(QtCore, QtGui, QtWidgets):
             self.map_age = 99.0
             self._img = None          # cached occupancy QImage
             self._img_src = None      # identity of the map tuple it came from
-            self.setMinimumHeight(190)
+            self.setMinimumHeight(168)
             self.setToolTip('SLAM map — occupancy grid, live laser, robot pose')
 
         def update_view(self, map_tuple, scan_tuple, pose, scan_age, map_age):
@@ -1337,15 +1367,40 @@ def main(args=None):
             self.btn_audio.clicked.connect(self._toggle_audio)
             gv.addWidget(self.btn_audio)
 
-            self.chk_mic = QtWidgets.QCheckBox('My mic → robot speaker')
-            self.chk_mic.setChecked(True)
-            self.chk_mic.toggled.connect(lambda v: node.audio(mic=v))
-            gv.addWidget(self.chk_mic)
+            # Two toggle buttons, Discord-style, because a checkbox gives no
+            # hint about which state is "good". A button that reads "Mic on" in
+            # green and flips to "Muted" in red is unambiguous at a glance,
+            # which is what matters when someone else's mobility depends on it.
+            #
+            #   Mute    my voice -> the robot.  Drives /audio/robot_speaker.
+            #   Deafen  the robot -> my ears.   Drives /audio/robot_mic.
+            #
+            # The topic names are the ROBOT's hardware on purpose: "my mic" is
+            # a different device on each machine, and that ambiguity is what
+            # made the old checkboxes look swapped.
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(6)
+            self.btn_mute = QtWidgets.QPushButton()
+            self.btn_mute.setObjectName('toggle')
+            self.btn_mute.setCheckable(True)
+            self.btn_mute.setToolTip(
+                'Mute: stop sending my voice to the robot speaker.\n'
+                'Unmuted (green) = the robot can hear me.')
+            self.btn_mute.toggled.connect(self._on_mute)
+            row.addWidget(self.btn_mute, 1)
 
-            self.chk_spk = QtWidgets.QCheckBox('Robot mic → my speakers')
-            self.chk_spk.setChecked(True)
-            self.chk_spk.toggled.connect(lambda v: node.audio(speaker=v))
-            gv.addWidget(self.chk_spk)
+            self.btn_deaf = QtWidgets.QPushButton()
+            self.btn_deaf.setObjectName('toggle')
+            self.btn_deaf.setCheckable(True)
+            self.btn_deaf.setToolTip(
+                'Deafen: stop hearing the robot microphone.\n'
+                'Hearing (green) = I can hear the room.')
+            self.btn_deaf.toggled.connect(self._on_deafen)
+            row.addWidget(self.btn_deaf, 1)
+            gv.addLayout(row)
+
+            self._on_mute(False)
+            self._on_deafen(False)
 
             # Both meters on one row. Stacked, they cost two text rows in a
             # column that has four panels in it - and a 6px-tall bar does not
@@ -1640,6 +1695,37 @@ def main(args=None):
             self.logline('E-STOP')
             self.lbl_drive.setText('STOPPED')
 
+        def _on_mute(self, muted):
+            """My voice -> robot speaker. Muted is the checked state."""
+            node.audio(robot_speaker=not muted)
+            self._style_toggle(self.btn_mute, on=not muted,
+                               on_text='Mic on', off_text='Muted')
+            if self.audio_on:
+                self.logline('microphone muted' if muted
+                             else 'microphone live')
+
+        def _on_deafen(self, deafened):
+            """Robot microphone -> my ears. Deafened is the checked state."""
+            node.audio(robot_mic=not deafened)
+            self._style_toggle(self.btn_deaf, on=not deafened,
+                               on_text='Hearing', off_text='Deafened',
+                               off_kind='grey')
+            if self.audio_on:
+                self.logline('deafened - cannot hear the robot' if deafened
+                             else 'hearing the robot')
+
+        def _style_toggle(self, btn, on, on_text, off_text, off_kind='bad'):
+            """Colour a toggle by what it currently does, not by what it toggles.
+
+            A checked button that turns green would be backwards for Mute -
+            "checked" there means silent. The colour always describes the
+            resulting state: green = audio flowing, red or grey = blocked.
+            """
+            btn.setText(on_text if on else off_text)
+            btn.setProperty('state', 'on' if on else off_kind)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
         def _toggle_audio(self):
             """Enable audio and start/stop the operator-side relay.
 
@@ -1651,8 +1737,8 @@ def main(args=None):
             """
             self.audio_on = not self.audio_on
             node.audio(enable=self.audio_on,
-                       mic=self.chk_mic.isChecked(),
-                       speaker=self.chk_spk.isChecked())
+                       robot_mic=not self.btn_deaf.isChecked(),
+                       robot_speaker=not self.btn_mute.isChecked())
             self.btn_audio.setText('Disable audio' if self.audio_on
                                    else 'Enable audio')
 
