@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent
 from PyQt5 import QtCore, QtGui, QtWidgets                     # noqa: E402
 
 from m1_console import (CalibDialog, VALIDATION_DOTS,          # noqa: E402
-                        _order_nearest, _ultra_dots)
+                        _ultra_dots)
 
 failures = []
 
@@ -95,32 +95,44 @@ def main():
     # the rest of the test shortens them to run quickly.
     real_min_sample = CalibDialog.MIN_SAMPLE_SEC
 
-    # ---------------- 1. the visit order is not a raster sweep -----------
+    # ---------------- 1. the visit order follows the stated pattern ------
+    # Centre first, then the four cardinal directions, then the corners.
+    # This is the sequence that was asked for, and it is worth asserting:
+    # starting at a corner takes the first samples while the operator is still
+    # settling, which biases the offset.
     dots = _ultra_dots()
     us = [d[1] for d in dots]
     vs = [d[2] for d in dots]
 
-    # A raster visits all of one row, then all of the next. Count how often the
-    # row changes: a raster changes it exactly (rows-1) times, a scattered
-    # order changes it far more often.
-    rows_visited = [round(d[2], 2) for d in dots]
-    row_changes = sum(1 for a, b in zip(rows_visited, rows_visited[1:]) if a != b)
-    check('visit order is scattered, not row-by-row',
-          row_changes > 12,
-          '%d row changes across %d dots' % (row_changes, len(dots)))
+    check('ultra starts at the centre',
+          dots[0][1] == 0.50 and dots[0][2] == 0.50, dots[0][0])
 
-    # It must still never jump far, or every jump is a saccade the operator is
-    # still finishing when sampling starts.
-    import math
-    jumps = [math.hypot(dots[i + 1][1] - dots[i][1], dots[i + 1][2] - dots[i][2])
-             for i in range(len(dots) - 1)]
-    check('consecutive dots are still neighbours',
-          max(jumps) < 0.30, 'max move %.2f of the screen' % max(jumps))
+    first_cardinals = [d for d in dots[:6]
+                       if (abs(d[1] - 0.50) < 1e-6 or abs(d[2] - 0.50) < 1e-6)
+                       and not (abs(d[1] - 0.50) < 1e-6 and abs(d[2] - 0.50) < 1e-6)]
+    check('the four cardinal directions come next',
+          len(first_cardinals) == 4, '%d in the first six' % len(first_cardinals))
 
-    check('the set still covers the screen',
+    # It must come back and re-check the directions that matter.
+    rechecks = [d for d in dots if d[0].startswith('RECHECK')]
+    check('ultra ends by re-checking the cardinals', len(rechecks) >= 4,
+          '%d recheck dots' % len(rechecks))
+    check('the last dot returns to the centre',
+          abs(dots[-1][1] - 0.50) < 1e-6 and abs(dots[-1][2] - 0.50) < 1e-6,
+          dots[-1][0])
+
+    check('the set covers the screen',
           min(us) <= 0.10 and max(us) >= 0.90
           and min(vs) <= 0.10 and max(vs) >= 0.90,
           'u %.2f..%.2f  v %.2f..%.2f' % (min(us), max(us), min(vs), max(vs)))
+
+    # Every distinct measurement must be a distinct place, or it is not an
+    # independent sample - except the deliberate rechecks.
+    core = [d for d in dots if not d[0].startswith('RECHECK')]
+    check('training dots are all distinct positions',
+          len(set((round(d[1], 3), round(d[2], 3)) for d in core)) == len(core),
+          '%d dots, %d positions'
+          % (len(core), len(set((round(d[1], 3), round(d[2], 3)) for d in core))))
 
     # ---------------- 2. the timing ramps down ---------------------------
     probe = dialog_cls(Tracker(0.62, 0.55, 2.0, 1.2),

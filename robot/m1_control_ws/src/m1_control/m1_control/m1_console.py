@@ -653,11 +653,15 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
             self.corrected = None
             self.valid = False
             self.stale = True
-            self.setMinimumSize(140, 140)
-            # Let it grow: on a maximised window there is space, and a 170px
-            # gaze plot in a 400px panel looks unfinished.
-            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
-                               QtWidgets.QSizePolicy.Expanding)
+            # Deliberately small. This plot answers "is the tracker alive and
+            # roughly where", which needs a couple of centimetres of screen,
+            # not a third of the panel. The space is better spent on the face
+            # thumbnail, which answers a question this cannot: whether the
+            # camera can see the operator at all.
+            self.setMinimumSize(96, 96)
+            self.setMaximumSize(150, 150)
+            self.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                               QtWidgets.QSizePolicy.Preferred)
 
         def set_points(self, raw, corrected, valid, stale):
             self.raw, self.corrected = raw, corrected
@@ -700,7 +704,12 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
             if self.raw is not None and not self.stale:
                 p.setPen(QtGui.QPen(QtGui.QColor('#f59e0b'), 2))
                 p.setBrush(QtCore.Qt.NoBrush)
-                p.drawEllipse(to_px(*self.raw), 6, 6)
+                # The raw value is not clamped to 0..1 - a biased tracker
+                # legitimately reads outside it - so clamp it for DRAWING or
+                # the marker leaves the box and looks like a bug.
+                ru = min(1.0, max(0.0, self.raw[0]))
+                rv = min(1.0, max(0.0, self.raw[1]))
+                p.drawEllipse(to_px(ru, rv), 6, 6)
 
             if self.corrected is not None and not self.stale:
                 col = '#34d399' if self.valid else '#6b7280'
@@ -711,6 +720,28 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
             if self.stale:
                 p.setPen(QtGui.QColor('#6b7280'))
                 p.drawText(box, QtCore.Qt.AlignCenter, 'no gaze source')
+
+            # Legend. Without it the two markers are unexplained: the amber
+            # ring is the RAW tracker output and the filled dot is where the
+            # calibration puts it. When they sit far apart, the calibration is
+            # pulling hard - which is exactly what the operator needs to see,
+            # but only if they know what they are looking at.
+            f = p.font()
+            f.setPointSizeF(7.0)
+            p.setFont(f)
+            y = self.height() - 3
+            p.setPen(QtGui.QPen(QtGui.QColor('#f59e0b'), 1.4))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawEllipse(QtCore.QPointF(8.0, y - 4.0), 3.5, 3.5)
+            p.setPen(QtGui.QColor('#8b939c'))
+            p.drawText(QtCore.QRectF(15.0, y - 11.0, 34.0, 14.0),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, 'raw')
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor('#34d399'))
+            p.drawEllipse(QtCore.QPointF(52.0, y - 4.0), 3.5, 3.5)
+            p.setPen(QtGui.QColor('#8b939c'))
+            p.drawText(QtCore.QRectF(59.0, y - 11.0, 34.0, 14.0),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, 'aim')
 
     return GazeMap
 
@@ -796,7 +827,9 @@ def make_gaze_overlay(QtCore, QtGui):
             # and shows whether the raw signal even reaches the edges.
             p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11, 190), 1))
             p.setBrush(QtCore.Qt.NoBrush)
-            p.drawEllipse(QtCore.QPointF(u * w, v * h), 8.0, 8.0)
+            ru = min(1.0, max(0.0, u))
+            rv = min(1.0, max(0.0, v))
+            p.drawEllipse(QtCore.QPointF(ru * w, rv * h), 8.0, 8.0)
 
             driving = (zone or 'CENTER') != 'CENTER'
             col = QtGui.QColor('#ef4444' if driving else '#22c55e')
@@ -1049,95 +1082,113 @@ def make_map_view(QtCore, QtGui, QtWidgets):
 # Five-point gaze calibration
 # ---------------------------------------------------------------------------
 
-def _order_nearest(points, start=(0.50, 0.50)):
-    """Order points by nearest-neighbour, then shorten the long edges.
+def _ring(u0, v0, radius, shape, start_angle=0.0):
+    """Points on a circle around (u0, v0), in the order given.
 
-    Deliberately NOT a raster sweep. A sweep walks each row left-to-right,
-    which means the eyes traverse the same horizontal path eight times and the
-    samples are strongly correlated with each other - the fit sees almost the
-    same measurement repeated, not independent evidence. A nearest-neighbour
-    walk over the same set scatters the order, so consecutive samples are not
-    systematically biased in one direction.
-
-    Nearest-neighbour alone is not enough, though: it paints itself into a
-    corner and the last few points can be a long way from where it ended up.
-    Measured on this grid, the longest single move was 0.63 of the screen - a
-    jump the operator's eyes are still finishing when sampling starts. A 2-opt
-    pass then reverses segments while that shortens the path, which removes
-    the stragglers.
-
-    `points` is a list of (name, u, v, text). The returned list starts from the
-    point nearest `start` and is a permutation of the input.
+    `shape` is 'diamond' for the four cardinal directions, 'corners' for the
+    four diagonals, or 'edge' for eight points between them. Everything is
+    derived from a radius and an angle so the rings stay concentric and evenly
+    spaced instead of drifting into each other as they are edited.
     """
-    remaining = list(points)
-    ordered = []
-    cu, cv = start
-    while remaining:
-        i = min(range(len(remaining)),
-                key=lambda k: (remaining[k][1] - cu) ** 2
-                              + (remaining[k][2] - cv) ** 2)
-        nxt = remaining.pop(i)
-        ordered.append(nxt)
-        cu, cv = nxt[1], nxt[2]
-
-    def gap(a, b):
-        return ((a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
-
-    # 2-opt: reverse a segment whenever doing so shortens the path. Cheap at
-    # this size and it turns a greedy walk into one with no long hops.
-    n = len(ordered)
-    for _ in range(8):
-        improved = False
-        for i in range(n - 1):
-            for j in range(i + 2, n):
-                a, b, c = ordered[i], ordered[i + 1], ordered[j]
-                if j + 1 < n:
-                    d = ordered[j + 1]
-                    before = gap(a, b) + gap(c, d)
-                    after = gap(a, c) + gap(b, d)
-                else:
-                    before = gap(a, b)
-                    after = gap(a, c)
-                if after < before - 1e-9:
-                    ordered[i + 1:j + 1] = reversed(ordered[i + 1:j + 1])
-                    improved = True
-        if not improved:
-            break
-    return ordered
+    if shape == 'diamond':
+        angles = (270.0, 0.0, 90.0, 180.0)          # up, right, down, left
+    elif shape == 'corners':
+        angles = (225.0, 315.0, 45.0, 135.0)        # TL, TR, BR, BL
+    else:
+        angles = tuple(22.5 + 45.0 * i for i in range(8))
+    out = []
+    for a in angles:
+        rad = math.radians(a + start_angle)
+        u = round(min(0.98, max(0.02, u0 + radius * math.sin(rad))), 3)
+        v = round(min(0.98, max(0.02, v0 - radius * math.cos(rad))), 3)
+        out.append((u, v))
+    return out
 
 
 def _ultra_dots():
-    """47 dots, weighted to the vertical, visited in a scattered order.
+    """47 dots, built out from the centre, and ending where it started.
 
-    Built rather than written out because the pattern matters more than the
-    individual positions, and 47 hand-typed tuples is 47 chances to make a typo
-    that silently skews one axis.
+    The ORDER is the part that matters, and it is deliberate:
 
-    The point set is a 5-column grid plus seven extra dots on the centre
-    column, halfway between the rows. Vertical is where this tracker is
-    weakest - the iris barely moves up and down inside the eye, so most of that
-    signal is head pitch - and the centre column is where vertical is measured
-    with the least horizontal interference.
+        1. centre                 - establishes the neutral point before
+                                    anything moves, so the operator is settled
+                                    when the first measurement is taken
+        2. outer diamond          - the four cardinal directions, which are the
+                                    zones the robot actually uses
+        3. outer corners          - the extremes of the range
+        4. outer edge midpoints   - fills between the cardinals and corners
+        5. inner diamond          - half the radius, where people look most
+        6. inner corners
+        7. vertical column        - extra samples straight up and down
+        8. horizontal row         - extra samples straight left and right
+        9. re-check the cardinals - back to the four directions that decide
+                                    whether this works, at the END, when the
+                                    operator is tired and has drifted
 
-    The VISIT ORDER is a nearest-neighbour walk from the centre, not a raster.
-    See _order_nearest() for why that matters.
+    Step 9 is the "come back and check" step, and it is what makes the measured
+    accuracy figure mean something: the same directions are sampled late rather
+    than trusting the first few seconds.
 
-    Timing is handled by the dialog, which ramps it down across the run.
+    Vertical gets the extra column because the iris barely moves up and down
+    inside the eye - most of that signal is head pitch - and the centre column
+    is where vertical is measured with the least horizontal interference.
     """
-    cols = (0.08, 0.29, 0.50, 0.71, 0.92)
-    rows = (0.07, 0.19, 0.31, 0.43, 0.55, 0.67, 0.79, 0.93)
-    points = []
-    for ri, v in enumerate(rows):
-        for ci, u in enumerate(cols):
-            points.append(('r%dc%d' % (ri + 1, ci + 1), u, v,
-                           'Look at the dot, and move the way you naturally '
-                           'would'))
-        if ri + 1 < len(rows):
-            vm = round((v + rows[ri + 1]) / 2.0, 3)
-            points.append(('mid%d' % (ri + 1), 0.50, vm,
-                           'Look at the CENTRE dot, head and eyes together'))
-    return _order_nearest(points)
+    R_OUT = 0.42
+    R_IN = 0.21
+    dots = [('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot')]
 
+    def add(prefix, uv_list):
+        for i, (u, v) in enumerate(uv_list):
+            dots.append(('%s%d' % (prefix, i + 1), u, v,
+                         'Look at the dot, and move the way you naturally '
+                         'would'))
+
+    add('OD', _ring(0.50, 0.50, R_OUT, 'diamond'))
+    add('OC', _ring(0.50, 0.50, R_OUT, 'corners'))
+    add('OE', _ring(0.50, 0.50, R_OUT, 'edge'))
+    add('ID', _ring(0.50, 0.50, R_IN, 'diamond'))
+    add('IC', _ring(0.50, 0.50, R_IN, 'corners'))
+
+    # Vertical column: heights the rings do not already cover.
+    for i, v in enumerate((0.15, 0.25, 0.37, 0.63, 0.75, 0.85)):
+        dots.append(('VC%d' % (i + 1), 0.50, v,
+                     'Look at the CENTRE dot, head and eyes together'))
+    # Horizontal row, for the other axis.
+    for i, u in enumerate((0.15, 0.25, 0.75, 0.85)):
+        dots.append(('HR%d' % (i + 1), u, 0.50, 'Look at the dot'))
+
+    # Drop any point that lands on one already visited. The rings are generated
+    # from angles and then rounded to 3 decimals, so a couple of them can
+    # collide; keeping both would mean sampling the same place twice and
+    # counting it as two independent measurements, which it is not.
+    #
+    # The rechecks below are exempt: repeating those positions is the entire
+    # point of them.
+    seen = set()
+    core = []
+    for d in dots:
+        key = (round(d[1], 3), round(d[2], 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        core.append(d)
+
+    # Back to the four directions that decide whether this works, at the END,
+    # when the operator is tired and has drifted. If accuracy is going to fall
+    # away, this is where it shows - and repeating a position on purpose is
+    # what makes it a check rather than just more training data.
+    for i, (u, v) in enumerate(((0.50, 0.08), (0.92, 0.50),
+                                (0.50, 0.92), (0.08, 0.50))):
+        core.append(('RECHECK%d' % (i + 1), u, v,
+                     'Back to the edge - look at this dot'))
+    core.append(('RECHECK5', 0.50, 0.50, 'Back to the CENTRE dot'))
+    return core
+
+
+#: Built once, so the label below can state the real count. A hard-coded "47"
+#: in a label is a number that will eventually be wrong, and a profile whose
+#: label lies about how long it takes is worse than one with no label.
+_ULTRA_DOTS = _ultra_dots()
 
 #: Re-visited AFTER the fit to measure how accurate it actually is. These are
 #: the five directions the operator complains about, so the report speaks in
@@ -1199,72 +1250,77 @@ class CalibDialog:
     """
 
     PROFILES = {
+        # Centre first in every profile: it establishes the neutral point
+        # before anything moves, so the operator is settled when the first
+        # measurement is taken. Starting at a corner means the very first
+        # samples are taken while they are still finding a comfortable
+        # position, which biases the offset.
         'fast': {
-            'label': 'Fast · 5 dots · ~10 s',
+            'label': 'Fast \u00b7 5 dots \u00b7 ~10 s',
             'settle': 0.9, 'sample': 1.0,
             'dots': [
-                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot, move naturally'),
-                ('TOP', 0.50, 0.10, 'Look at the TOP dot, move naturally'),
-                ('RIGHT', 0.90, 0.50, 'Look at the RIGHT dot, move naturally'),
-                ('BOTTOM', 0.50, 0.90, 'Look at the BOTTOM dot, move naturally'),
-                ('LEFT', 0.10, 0.50, 'Look at the LEFT dot, move naturally'),
+                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot'),
+                ('TOP', 0.50, 0.10, 'Look at the TOP dot'),
+                ('RIGHT', 0.90, 0.50, 'Look at the RIGHT dot'),
+                ('BOTTOM', 0.50, 0.90, 'Look at the BOTTOM dot'),
+                ('LEFT', 0.10, 0.50, 'Look at the LEFT dot'),
             ],
         },
+        # Same five, then the four corners. The diamond first means the four
+        # zone directions are measured early, while attention is best; the
+        # corners only refine the gain.
         'long': {
-            'label': 'Long · 9 dots · ~30 s',
-            'settle': 1.0, 'sample': 1.3,
+            'label': 'Long \u00b7 9 dots \u00b7 ~30 s',
+            'settle': 1.0, 'sample': 1.2,
             'dots': [
-                ('top-left', 0.10, 0.10, 'Look at the TOP-LEFT dot'),
-                ('top', 0.50, 0.10, 'Look at the TOP dot'),
-                ('top-right', 0.90, 0.10, 'Look at the TOP-RIGHT dot'),
-                ('left', 0.10, 0.50, 'Look at the LEFT dot'),
-                ('centre', 0.50, 0.50, 'Look at the CENTRE dot'),
-                ('right', 0.90, 0.50, 'Look at the RIGHT dot'),
-                ('bottom-left', 0.10, 0.90, 'Look at the BOTTOM-LEFT dot'),
-                ('bottom', 0.50, 0.90, 'Look at the BOTTOM dot'),
-                ('bottom-right', 0.90, 0.90, 'Look at the BOTTOM-RIGHT dot'),
+                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot'),
+                ('TOP', 0.50, 0.08, 'Look at the TOP dot'),
+                ('RIGHT', 0.92, 0.50, 'Look at the RIGHT dot'),
+                ('BOTTOM', 0.50, 0.92, 'Look at the BOTTOM dot'),
+                ('LEFT', 0.08, 0.50, 'Look at the LEFT dot'),
+                ('TOP-LEFT', 0.08, 0.08, 'Look at the TOP-LEFT corner'),
+                ('TOP-RIGHT', 0.92, 0.08, 'Look at the TOP-RIGHT corner'),
+                ('BOTTOM-RIGHT', 0.92, 0.92, 'Look at the BOTTOM-RIGHT corner'),
+                ('BOTTOM-LEFT', 0.08, 0.92, 'Look at the BOTTOM-LEFT corner'),
             ],
         },
-        # Weighted for the vertical axis. Read the v column: eight of the
-        # twenty dots sit on the centre column, and five more are within one
-        # band of it. The corners get one dot each. If up/down is where the
-        # tracker struggles - and it is - this is where the samples should be.
+        # Centre, diamond, corners, then the inner ring, then the vertical
+        # column. The last three revisit the centre and the two vertical
+        # extremes, because vertical is the axis that keeps failing and the
+        # end of a run is when the operator has drifted.
         'super': {
-            'label': 'Super · 20 dots · ~1 min',
-            'settle': 1.4, 'sample': 1.4,
+            'label': 'Super \u00b7 20 dots \u00b7 ~1 min',
+            'settle': 1.2, 'sample': 1.2,
             'dots': [
-                ('top',          0.50, 0.06, 'Look at the TOP dot'),
-                ('upper-left',   0.20, 0.16, 'Look at the UPPER-LEFT dot'),
-                ('upper-right',  0.80, 0.16, 'Look at the UPPER-RIGHT dot'),
-                ('upper-mid',    0.50, 0.26, 'Look at the dot ABOVE centre'),
-                ('left-high',    0.15, 0.38, 'Look at the LEFT dot'),
-                ('mid-high',     0.50, 0.38, 'Look at the dot above centre'),
-                ('right-high',   0.85, 0.38, 'Look at the RIGHT dot'),
-                ('far-right',    0.92, 0.50, 'Look at the FAR RIGHT dot'),
-                ('right',        0.71, 0.50, 'Look right, just past centre'),
-                ('centre',       0.50, 0.50, 'Look at the CENTRE dot'),
-                ('centre-above', 0.50, 0.44, 'Look just above the CENTRE dot'),
-                ('left',         0.29, 0.50, 'Look left, just past centre'),
-                ('far-left',     0.08, 0.50, 'Look at the FAR LEFT dot'),
-                ('left-low',     0.15, 0.62, 'Look at the LEFT dot'),
-                ('mid-low',      0.50, 0.62, 'Look at the dot below centre'),
-                ('right-low',    0.85, 0.62, 'Look at the RIGHT dot'),
-                ('lower-mid',    0.50, 0.74, 'Look at the dot BELOW centre'),
-                ('lower-left',   0.20, 0.84, 'Look at the LOWER-LEFT dot'),
-                ('lower-right',  0.80, 0.84, 'Look at the LOWER-RIGHT dot'),
-                ('bottom',       0.50, 0.94, 'Look at the BOTTOM dot'),
+                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot'),
+                ('TOP', 0.50, 0.08, 'Look at the TOP dot'),
+                ('RIGHT', 0.92, 0.50, 'Look at the RIGHT dot'),
+                ('BOTTOM', 0.50, 0.92, 'Look at the BOTTOM dot'),
+                ('LEFT', 0.08, 0.50, 'Look at the LEFT dot'),
+                ('TOP-LEFT', 0.08, 0.08, 'Look at the TOP-LEFT corner'),
+                ('TOP-RIGHT', 0.92, 0.08, 'Look at the TOP-RIGHT corner'),
+                ('BOTTOM-RIGHT', 0.92, 0.92, 'Look at the BOTTOM-RIGHT corner'),
+                ('BOTTOM-LEFT', 0.08, 0.92, 'Look at the BOTTOM-LEFT corner'),
+                # Inner ring, half the radius: fills the middle, which is where
+                # the operator actually looks most of the time.
+                ('IN-TOP', 0.50, 0.28, 'Look just above the CENTRE dot'),
+                ('IN-RIGHT', 0.72, 0.50, 'Look just right of centre'),
+                ('IN-BOTTOM', 0.50, 0.72, 'Look just below the CENTRE dot'),
+                ('IN-LEFT', 0.28, 0.50, 'Look just left of centre'),
+                ('IN-TOP-LEFT', 0.28, 0.28, 'Look at the inner corner'),
+                ('IN-TOP-RIGHT', 0.72, 0.28, 'Look at the inner corner'),
+                ('IN-BOTTOM-RIGHT', 0.72, 0.72, 'Look at the inner corner'),
+                ('IN-BOTTOM-LEFT', 0.28, 0.72, 'Look at the inner corner'),
+                # Back to the axis that matters, at the end.
+                ('RECHECK TOP', 0.50, 0.08, 'Back to the TOP dot'),
+                ('RECHECK CENTRE', 0.50, 0.50, 'Back to the CENTRE dot'),
+                ('RECHECK BOTTOM', 0.50, 0.92, 'Back to the BOTTOM dot'),
             ],
         },
-        # The one to run when nothing else has worked. Long enough that the
-        # operator can settle into a posture and stay in it, with enough
-        # samples per dot that the mean is not just averaging one bad frame.
-        #
-        # 48 dots x (2.0 s settle + 2.2 s sample) is about 3.4 minutes. At the
-        # HUD's 30 Hz that is roughly 66 samples per dot.
         'ultra': {
-            'label': 'Ultra · 47 dots · ~2 min',
+            'label': 'Ultra \u00b7 %d dots \u00b7 ~2 min' % len(_ULTRA_DOTS),
             'settle': 1.6, 'sample': 1.4,
-            'dots': _ultra_dots(),
+            'dots': _ULTRA_DOTS,
         },
     }
 
@@ -1380,8 +1436,15 @@ class CalibDialog:
                 bar.setStyleSheet(
                     '#calibbar { background: rgba(14,17,22,0.97);'
                     ' border:1px solid #2b3138; border-radius:8px; }')
-                bar.setMaximumWidth(760)
+                # A MINIMUM as well as a maximum. With only a maximum the bar
+                # shrank to its sizeHint, which put a 300 px box in the middle
+                # of a 1920 px screen with the hint text wrapped into it - the
+                # cramped, clipped layout that was reported.
+                bar.setMinimumWidth(620)
+                bar.setMaximumWidth(820)
                 bv = QtWidgets.QVBoxLayout(bar)
+                bv.setContentsMargins(18, 14, 18, 14)
+                bv.setSpacing(10)
 
                 self.lbl = QtWidgets.QLabel('Ready')
                 self.lbl.setObjectName('h1')
@@ -1397,6 +1460,7 @@ class CalibDialog:
                 self.hint.setObjectName('dim')
                 self.hint.setAlignment(QtCore.Qt.AlignCenter)
                 self.hint.setWordWrap(True)
+                self.hint.setMinimumHeight(38)
                 bv.addWidget(self.hint)
 
                 # The result gets its OWN label, in its own colour, with a
@@ -2337,15 +2401,21 @@ def main(args=None):
             # two failures look identical on a bare dot.
             top = QtWidgets.QHBoxLayout()
             top.setSpacing(8)
+            # The face gets most of the row. It answers a question the plot
+            # cannot - can the camera see me at all - and a 72 px thumbnail is
+            # too small to tell whether the face is lit, centred, or half out
+            # of frame, which are the things that actually go wrong.
             self.lbl_face = QtWidgets.QLabel('no\nface')
             self.lbl_face.setAlignment(QtCore.Qt.AlignCenter)
-            self.lbl_face.setFixedSize(72, 72)
+            self.lbl_face.setMinimumSize(120, 120)
+            self.lbl_face.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                        QtWidgets.QSizePolicy.Expanding)
             self.lbl_face.setStyleSheet(
                 'background:#0d1014; border:1px solid #2b3138;'
-                'border-radius:5px; color:#6b7280; font-size:9px;')
-            top.addWidget(self.lbl_face, 0, QtCore.Qt.AlignTop)
+                'border-radius:5px; color:#6b7280; font-size:10px;')
+            top.addWidget(self.lbl_face, 1)
             self.gaze_map = GazeMap()
-            top.addWidget(self.gaze_map, 1)
+            top.addWidget(self.gaze_map, 0, QtCore.Qt.AlignTop)
             gv.addLayout(top)
 
             self.lbl_gaze = QtWidgets.QLabel('no source')

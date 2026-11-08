@@ -47,37 +47,37 @@ def main():
     dialog_cls = CalibDialog.build(QtCore, QtGui, QtWidgets)
 
     # ---------------- the super profile's shape -------------------------
+    # The order is the contract: centre first, then the four cardinal
+    # directions, then the corners, then an inner ring, then a recheck.
     super_dots = CalibDialog.PROFILES['super']['dots']
     check('super profile has 20 dots', len(super_dots) == 20,
           '%d dots' % len(super_dots))
+    check('super starts at the centre',
+          super_dots[0][1] == 0.50 and super_dots[0][2] == 0.50, super_dots[0][0])
+
+    cardinals = [d for d in super_dots[1:5]
+                 if abs(d[1] - 0.50) < 1e-6 or abs(d[2] - 0.50) < 1e-6]
+    check('the four cardinal directions come next', len(cardinals) == 4,
+          '%d of the next four' % len(cardinals))
+
+    corners = [d for d in super_dots[5:9]
+               if abs(d[1] - 0.50) > 0.30 and abs(d[2] - 0.50) > 0.30]
+    check('then the four corners', len(corners) == 4, '%d corners' % len(corners))
+
+    rechecks = [d for d in super_dots if d[0].startswith('RECHECK')]
+    check('super ends by re-checking', len(rechecks) >= 2,
+          '%d recheck dots' % len(rechecks))
 
     us = [d[1] for d in super_dots]
     vs = [d[2] for d in super_dots]
-    check('super profile still reaches the screen edges',
+    check('super still reaches the screen edges',
           min(us) <= 0.10 and max(us) >= 0.90
           and min(vs) <= 0.10 and max(vs) >= 0.90,
           'u %.2f..%.2f  v %.2f..%.2f' % (min(us), max(us), min(vs), max(vs)))
-
-    # The centre COLUMN: this is what carries vertical.
-    centre_column = sum(1 for d in super_dots if abs(d[1] - 0.50) < 0.02)
-    check('centre column is heavily sampled', centre_column >= 7,
-          '%d of 20 dots at u=0.50' % centre_column)
-
-    # The centre BAND: reinforces the middle, where people actually look.
-    centre_band = sum(1 for d in super_dots if abs(d[2] - 0.50) < 0.20)
-    check('middle band is heavily sampled', centre_band >= 8,
-          '%d of 20 dots within 0.20 of centre' % centre_band)
-
-    # Corners should be sparse: they cost time and teach the fit little.
-    corners = sum(1 for d in super_dots
-                  if (d[1] < 0.25 or d[1] > 0.75) and (d[2] < 0.25 or d[2] > 0.75))
-    check('corners are not over-sampled', corners <= 4,
-          '%d corner dots' % corners)
-
-    # Vertical must be sampled more densely than a plain 3x3 grid would.
-    distinct_v = len(set(round(d[2], 2) for d in super_dots))
-    check('vertical axis has many distinct levels', distinct_v >= 8,
-          '%d distinct v levels' % distinct_v)
+    check('super samples the middle too',
+          sum(1 for d in super_dots if 0.25 < d[1] < 0.75
+              and 0.25 < d[2] < 0.75) >= 8,
+          'inner dots')
 
     # ---------------- the shrinking dot ---------------------------------
     dlg = dialog_cls(FakeNode(), QtCore.QRect(0, 0, 1920, 1080), None)

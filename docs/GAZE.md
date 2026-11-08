@@ -129,6 +129,28 @@ only ever touches the term that genuinely needs stretching.
 `scripts/test_gaze_noclip.py` asserts that distinct head poses produce distinct
 values and that nothing sits pinned at a rail.
 
+### Nothing in the acquisition path is clamped
+
+There was a **second** clamp, and after the first was fixed it produced the same
+symptom: `raw 0.55, 0.01`, `gain 1.00, 1.00`, and 900 px of error with the
+**Head slider already at maximum**.
+
+`solvePnP` reports an **absolute** head angle. That angle carries a constant
+bias from things the operator cannot change: the camera sits above or below eye
+level, and the generic face model is not their face. Clipping the head term to
+±1 against a 16° pitch span put a 20° bias permanently on the rail — so the
+head term was a *constant*, and the vertical axis reported one number forever.
+
+A constant bias is the **normal** case, not an edge case. So neither the head
+term nor the raw output is clamped any more: a bias simply shifts the value, and
+the calibration's `offset` absorbs it. The clamp lives only on the **corrected**
+value, where `gaze_calib.apply()` already does it.
+
+Measured across ±30° of pitch bias, the usable vertical span is constant at
+**0.703 of the range** — it does not shrink as the bias grows, which is the
+property that matters. `scripts/test_gaze_bias.py` sweeps the bias and asserts
+it.
+
 **Head position (near / far) is not used.** solvePnP recovers translation too,
 but only rotation is blended in, which is why leaning closer or further does
 not shift the aim. The reference implementation's multi-posture calibration

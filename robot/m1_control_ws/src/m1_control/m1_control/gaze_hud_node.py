@@ -473,9 +473,17 @@ class GazeHUDNode(Node):
         self._fps_n += 1
 
     def _on_mouse(self, event, x, y, flags, param):
-        """Mouse gaze: any click or drag inside the HUD aims the reticle."""
-        if event in (cv2.EVENT_LBUTTONDOWN, cv2.EVENT_MOUSEMOVE) and flags & cv2.EVENT_FLAG_LBUTTON \
-                or event == cv2.EVENT_LBUTTONDOWN:
+        """Mouse gaze: the pointer position IS the gaze, not just a click.
+
+        Tracking hover rather than only clicks matters more than it looks.
+        A click-only handler leaves `gaze_valid` False until the operator
+        happens to press a button, so /gaze/raw reports invalid and the
+        calibration collects ZERO samples on its very first dot and aborts
+        with "tracker lost your eyes" - which is not what happened, and sends
+        the operator looking at the camera for a fault that is not there.
+        """
+        if event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN,
+                     cv2.EVENT_LBUTTONUP, cv2.EVENT_LBUTTONDBLCLK):
             self.mouse_click = (int(x), int(y))
 
     def _publish_face_crop(self, cam, lm):
@@ -596,11 +604,10 @@ class GazeHUDNode(Node):
         # Stretch the EYE component BEFORE blending, never after.
         #
         # This was the bug that made every outer calibration dot unusable.
-        # _blend_head returns a value that already spans the full 0..1 range
-        # (22 deg of head yaw is worth the whole range), and the code then did
-        # (value - 0.5) * iris_gain + 0.5 with iris_gain = 3.0 and clipped.
-        # Anything more than 0.167 away from centre therefore reported EXACTLY
-        # 0.0 or 1.0:
+        # _blend_head returns a value that already spans the full range, and
+        # the code then did (value - 0.5) * iris_gain + 0.5 with iris_gain =
+        # 3.0 and clipped. Anything more than 0.167 away from centre therefore
+        # reported EXACTLY 0.0 or 1.0:
         #
         #     UP 15 deg    0.15 -> 0.00
         #     LEFT 20 deg  0.16 -> 0.00
@@ -612,20 +619,47 @@ class GazeHUDNode(Node):
         # value, which is why the centre worked and the edges did not.
         #
         # The eye term is the one that genuinely needs stretching - the iris
-        # moves a few percent of the eye's width - so it is stretched here and
-        # clamped, and the head term is left alone.
-        eh = float(np.clip((h - 0.5) * self.iris_gain_h + 0.5, 0.0, 1.0))
-        ev = float(np.clip((v - 0.5) * self.iris_gain_v + 0.5, 0.0, 1.0))
+        # moves a few percent of the eye's width - so it is stretched here.
+        # It is NOT clamped, for the same reason the head term is not: a
+        # constant bias must shift the value, not pin it to a rail where all
+        # information is lost.
+        eh = (h - 0.5) * self.iris_gain_h + 0.5
+        ev = (v - 0.5) * self.iris_gain_v + 0.5
 
         # Head rotation, which is the part that actually carries the signal.
         h, v = self._blend_head(eh, ev, lm, rgb.shape[1], rgb.shape[0])
 
-        self.gaze_u = float(np.clip(h, 0.0, 1.0))
-        self.gaze_v = float(np.clip(v, 0.0, 1.0))
+        # Deliberately NOT clipped here either.
+        #
+        # The calibration model is  corrected = (raw - offset) * gain + 0.5,
+        # which works on any input range. Clipping the raw value at 0..1 throws
+        # away exactly the information the fit needs when the tracker has a
+        # constant bias, and a biased tracker is the normal case: the camera is
+        # never exactly at eye level. The clamp belongs on the CORRECTED value,
+        # where gaze_calib.apply() already does it.
+        self.gaze_u = float(h)
+        self.gaze_v = float(v)
         self.gaze_valid = True
 
         if self.publish_face:
             self._publish_face_crop(cam, lm)
+
+    def _update_gaze_from_mouse(self):
+        """Pointer position -> normalized gaze.
+
+        Valid from the moment the HUD opens, defaulting to centre. The
+        alternative - waiting for a click - is a source that silently reports
+        "no gaze" until the operator happens to press a button, which makes
+        every calibration abort on its first dot and looks exactly like a
+        broken tracker.
+        """
+        w = self.frame.shape[1] if self.frame is not None else 640
+        h = self.frame.shape[0] if self.frame is not None else 480
+        if self.mouse_click is not None:
+            mx, my = self.mouse_click
+            self.gaze_u = float(np.clip(mx / max(1, w), 0.0, 1.0))
+            self.gaze_v = float(np.clip(my / max(1, h), 0.0, 1.0))
+        self.gaze_valid = True
 
     def _head_rotation(self, lm, w, h):
         """Head yaw and pitch in radians, from a solvePnP on six landmarks.
@@ -684,16 +718,29 @@ class GazeHUDNode(Node):
         yaw, pitch = pose
         self.head_yaw, self.head_pitch = yaw, pitch
 
-        # Normalised to -1..+1 over the span, then back to the 0..1 the rest of
-        # the node uses.
-        ny = float(np.clip(yaw / HEAD_YAW_SPAN, -1.0, 1.0))
-        np_ = float(np.clip(pitch / HEAD_PITCH_SPAN, -1.0, 1.0))
+        # NOT clipped to +/-1.
+        #
+        # This was the second saturation, and it is why the head slider at
+        # maximum still gave a constant vertical reading (raw v = 0.01).
+        # solvePnP reports an absolute angle, and that angle carries a
+        # constant bias from things the operator cannot change: the camera
+        # sitting above or below eye level, and the generic face model not
+        # matching this particular face. A bias of 20 deg against a 16 deg
+        # span sits permanently on the rail, so the head term is a constant
+        # and the vertical axis reports the same number whatever the operator
+        # does.
+        #
+        # Leaving it unclipped means a bias simply shifts the value, which the
+        # calibration's offset absorbs. The range is then spent on MOVEMENT,
+        # which is the part that carries information.
+        norm_yaw = yaw / HEAD_YAW_SPAN
+        norm_pitch = pitch / HEAD_PITCH_SPAN
 
         k = self.head_weight
         # Head yaw positive = turned to the image's right = larger u.
         # Head pitch positive = tilted up = smaller v.
-        u = (1.0 - k) * eye_u + k * (0.5 + 0.5 * ny)
-        v = (1.0 - k) * eye_v + k * (0.5 - 0.5 * np_)
+        u = (1.0 - k) * eye_u + k * (0.5 + 0.5 * norm_yaw)
+        v = (1.0 - k) * eye_v + k * (0.5 - 0.5 * norm_pitch)
         return u, v
 
     # ------------------------------------------------------------------ logic
@@ -739,9 +786,20 @@ class GazeHUDNode(Node):
             self.mode_pub.publish(UInt8(data=MODE_GAZE))
 
     def _hud_tick(self):
+        # ---- 1. ACQUIRE -------------------------------------------------
+        # Every source updates gaze_u/gaze_v/gaze_valid here, BEFORE anything
+        # is published.
+        #
+        # The mouse update used to live further down, after /gaze/raw had
+        # already been published, so the published value was always one tick
+        # stale - and on the first tick it was the stale INVALID default, which
+        # is what made every calibration abort on its first dot.
         if self.gaze_source == 'mediapipe':
             self._update_gaze_from_webcam()
+        elif self.gaze_source == 'mouse':
+            self._update_gaze_from_mouse()
 
+        # ---- 2. PUBLISH -------------------------------------------------
         # Feed the calibration stream. Published here rather than in the
         # individual source callbacks so every source - mediapipe, mouse or
         # external - produces the same /gaze/raw, and the console never has to
@@ -793,22 +851,17 @@ class GazeHUDNode(Node):
         dz_rx = max(4.0, w * self.deadzone_ratio)
         dz_ry = max(4.0, h * self.deadzone_ratio_y)
 
-        # Mouse gaze: convert the last click into normalized coordinates.
-        if self.gaze_source == 'mouse' and self.mouse_click is not None:
-            mx, my = self.mouse_click
-            self.gaze_u = float(np.clip(mx / max(1, w), 0.0, 1.0))
-            self.gaze_v = float(np.clip(my / max(1, h), 0.0, 1.0))
-            self.gaze_valid = True
-            cu, cv = self.gaze_u, self.gaze_v
-
         # Everything downstream works on the CORRECTED point: that is where
         # the operator meant to look. The raw point is still drawn, hollow,
         # so it is obvious when the calibration is pulling hard in one
         # direction.
         gx = int(cu * w)
         gy = int(cv * h)
-        rx = int(self.gaze_u * w)
-        ry = int(self.gaze_v * h)
+        # The RAW point is no longer clamped to 0..1 (a biased tracker legitimately
+        # reads outside it), so clamp it here purely for drawing - an off-screen
+        # coordinate would put the marker outside the image and look like a bug.
+        rx = int(min(1.0, max(0.0, self.gaze_u)) * w)
+        ry = int(min(1.0, max(0.0, self.gaze_v)) * h)
         dx, dy = gx - cx, gy - cy
 
         zone, dist = self._classify(dx, dy, dz_rx, dz_ry)
