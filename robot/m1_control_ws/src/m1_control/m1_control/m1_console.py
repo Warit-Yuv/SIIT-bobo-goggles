@@ -543,6 +543,10 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
             self.valid = False
             self.stale = True
             self.setMinimumSize(170, 170)
+            # Let it grow: on a maximised window there is space, and a 170px
+            # gaze plot in a 400px panel looks unfinished.
+            self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                               QtWidgets.QSizePolicy.Expanding)
 
         def set_points(self, raw, corrected, valid, stale):
             self.raw, self.corrected = raw, corrected
@@ -1487,13 +1491,13 @@ def main(args=None):
             # no obvious way to fix a wrong pose.
             mrow = QtWidgets.QHBoxLayout()
             mrow.setSpacing(4)
-            self.btn_findme = QtWidgets.QPushButton('Find me')
-            self.btn_findme.setObjectName('primary')
-            self.btn_findme.setToolTip(
-                'Match the laser scan against the map and publish the best '
-                'pose. Use this after the robot has been moved.')
-            self.btn_findme.clicked.connect(lambda: self._map_cmd('autolocalize'))
-            mrow.addWidget(self.btn_findme)
+            self.btn_newmap = QtWidgets.QPushButton('New map')
+            self.btn_newmap.setObjectName('primary')
+            self.btn_newmap.setToolTip(
+                'Start mapping from scratch. Starts slam_toolbox if it is not '
+                'running, or clears its pose graph if it is.')
+            self.btn_newmap.clicked.connect(self._new_map)
+            mrow.addWidget(self.btn_newmap)
             self.btn_savemap = QtWidgets.QPushButton('Save')
             self.btn_savemap.setToolTip('Save the current map to ~/maps/')
             self.btn_savemap.clicked.connect(self._save_map_dialog)
@@ -1502,16 +1506,26 @@ def main(args=None):
 
             mrow2 = QtWidgets.QHBoxLayout()
             mrow2.setSpacing(4)
+            self.btn_findme = QtWidgets.QPushButton('Find me')
+            self.btn_findme.setToolTip(
+                'Match the laser scan against the map and publish the best '
+                'pose. Use this after the robot has been moved.')
+            self.btn_findme.clicked.connect(lambda: self._map_cmd('autolocalize'))
+            mrow2.addWidget(self.btn_findme)
             self.btn_localize = QtWidgets.QPushButton('Localise…')
             self.btn_localize.setToolTip(
                 'Stop mapping and localise against a saved map (AMCL)')
             self.btn_localize.clicked.connect(self._localize_dialog)
             mrow2.addWidget(self.btn_localize)
+            gm.addLayout(mrow2)
+
+            mrow3 = QtWidgets.QHBoxLayout()
+            mrow3.setSpacing(4)
             self.btn_mapstop = QtWidgets.QPushButton('Stop map')
             self.btn_mapstop.setToolTip('Stop mapping or localisation')
             self.btn_mapstop.clicked.connect(lambda: self._map_cmd('stop'))
-            mrow2.addWidget(self.btn_mapstop)
-            gm.addLayout(mrow2)
+            mrow3.addWidget(self.btn_mapstop)
+            gm.addLayout(mrow3)
 
             v.addWidget(g, 1)
             return panel
@@ -1627,13 +1641,66 @@ def main(args=None):
             self.lbl_drive.setText('STOPPED')
 
         def _toggle_audio(self):
+            """Enable audio and start/stop the operator-side relay.
+
+            Toggling /audio/enable alone is not enough. That topic tells the
+            ROBOT whether to transmit; the operator still needs a bridge of its
+            own to capture the microphone and play what arrives. Without one the
+            Voice panel looks live while nothing is actually connected - the
+            robot sends into the void and the operator hears nothing.
+            """
             self.audio_on = not self.audio_on
             node.audio(enable=self.audio_on,
                        mic=self.chk_mic.isChecked(),
                        speaker=self.chk_spk.isChecked())
             self.btn_audio.setText('Disable audio' if self.audio_on
                                    else 'Enable audio')
+
+            if self.audio_on:
+                self._start_operator_audio()
+            else:
+                self._stop_operator_audio()
             self.logline(f"audio {'on' if self.audio_on else 'off'}")
+
+        def _audio_bridge_pids(self):
+            try:
+                r = subprocess.run(
+                    ['pgrep', '-f', 'audio_bridge --no-ros'],
+                    capture_output=True, text=True, timeout=3)
+                return [int(p) for p in r.stdout.split()]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _start_operator_audio(self):
+            if self._audio_bridge_pids():
+                return
+            cmd = ['ros2', 'run', 'm1_control', 'audio_bridge', '--no-ros',
+                   '--role', 'operator',
+                   '--peer-ip', node.robot_ip,
+                   # 'default' routes through PulseAudio. A VMware guest
+                   # forwards the host microphone to PulseAudio, not to the raw
+                   # ALSA card - reading plughw:0,0 there yields a valid stream
+                   # of pure silence, which looks exactly like a dead mic.
+                   '--device-in', 'default',
+                   '--device-out', 'default']
+            try:
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                self.logline('audio relay started (operator side)')
+            except Exception as exc:  # noqa: BLE001
+                self.logline(f'audio relay failed: {exc}')
+
+        def _stop_operator_audio(self):
+            pids = self._audio_bridge_pids()
+            if not pids:
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.logline('audio relay stopped')
 
         def _calibrate(self):
             dlg = CalibDialogCls(node, self)
@@ -1761,6 +1828,38 @@ def main(args=None):
 
             threading.Thread(target=work, daemon=True).start()
 
+        def _new_map(self):
+            """Start mapping, or clear the pose graph if already mapping.
+
+            Both cases are one button because they are the same intention from
+            the operator's point of view - "I want a fresh map". Which one is
+            correct depends on what is already running, and asking the user to
+            know that difference is a design failure.
+            """
+            if self._map_mode() == 'mapping':
+                self.logline('map: restarting the mapper with an empty graph')
+                self._map_cmd('reset')
+            else:
+                self.logline('map: starting a new map')
+                self._map_cmd('start')
+
+        def _map_mode(self):
+            """'mapping', 'localising', or 'off' - decided locally.
+
+            pgrep is a few milliseconds, unlike the SSH probe, so this is safe
+            on the GUI thread.
+            """
+            try:
+                if subprocess.run(['pgrep', '-f', 'async_slam_toolbox'],
+                                  capture_output=True).returncode == 0:
+                    return 'mapping'
+                if subprocess.run(['pgrep', '-f', 'nav2_amcl/lib/nav2_amcl/amcl'],
+                                  capture_output=True).returncode == 0:
+                    return 'localising'
+            except Exception:  # noqa: BLE001
+                pass
+            return 'off'
+
         def _save_map_dialog(self):
             name, ok = QtWidgets.QInputDialog.getText(
                 self, 'Save map', 'Map name:',
@@ -1815,6 +1914,17 @@ def main(args=None):
                 # cleaned up. Calling app.quit() directly would skip it and
                 # leave SLAM running.
                 self.close()
+                return
+            if key == QtCore.Qt.Key_F11:
+                # Fullscreen hides the title bar and window decorations.
+                # Escape or F11 returns to the maximised window.
+                if self.isFullScreen():
+                    self.showMaximized()
+                else:
+                    self.showFullScreen()
+                return
+            if key == QtCore.Qt.Key_Escape and self.isFullScreen():
+                self.showMaximized()
                 return
 
             mapping = {
@@ -2002,6 +2112,7 @@ def main(args=None):
             that long would look like the window had hung.
             """
             node.estop()
+            self._stop_operator_audio()
 
             if self.chk_stopview.isChecked() and self._view_running():
                 script = os.path.expanduser(
@@ -2021,7 +2132,11 @@ def main(args=None):
 
     app = QtWidgets.QApplication(sys.argv)
     win = Console()
-    win.show()
+    # Maximised by default. The console is the only thing on screen while the
+    # robot is being driven, and starting at 1340x900 on a 1080p desktop wastes
+    # a third of the display. F11 toggles true fullscreen for when even the
+    # title bar is in the way.
+    win.showMaximized()
     try:
         app.exec_()
     finally:

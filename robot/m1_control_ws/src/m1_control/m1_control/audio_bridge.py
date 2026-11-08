@@ -31,8 +31,19 @@ Design notes
   packet does not stutter, but drops the oldest audio if it falls too far
   behind. Latency must not grow without bound.
 * **Capture and playback are subprocesses.** `arecord`/`aplay` are managed, not
-  reimplemented, so device selection is the same `plughw:X,Y` string the user
-  already sees in `arecord -l`.
+  reimplemented, so device selection is the same string the user already sees in
+  `arecord -l`.
+* **On a VMware guest, use `--device-in default`, not `plughw:0,0`.** VMware
+  forwards the host microphone to the PulseAudio sound server, not to the raw
+  ALSA card. Reading the card directly returns a valid stream of pure silence -
+  it opens fine and produces nothing, which looks exactly like a broken
+  microphone. Measured on this VM:
+
+      arecord -d 2 -f cd /tmp/a.wav          # -> "default", via PulseAudio
+      arecord -D plughw:0,0 -d 2 /tmp/b.wav # -> opens, delivers zeros
+
+  On the robot the opposite is true: there is no PulseAudio in the container, so
+  `plughw:2,0` (the C-Media USB headset) is correct.
 
 Usage
 -----
@@ -43,7 +54,7 @@ On the robot (inside the container):
 
 On the operator PC:
     ros2 run m1_control audio_bridge --ros-args -p role:=operator \\
-        -p device_in:=plughw:0,0 -p device_out:=plughw:0,0 \\
+        -p device_in:=default -p device_out:=default \\
         -p peer_ip:=10.0.0.54
 
 Standalone check, no ROS (proves the audio path works):
@@ -318,9 +329,12 @@ def main(argv=None):
     ap.add_argument('--role', choices=['robot', 'operator'], default='robot')
     ap.add_argument('--peer-ip', default='127.0.0.1')
     ap.add_argument('--device-in', default=None,
-                    help='ALSA capture device, e.g. plughw:2,0')
+                    help='ALSA capture device. "default" routes through '
+                         'PulseAudio, which is what a VMware guest needs - see '
+                         'the note below. Use plughw:N,0 only on real hardware.')
     ap.add_argument('--device-out', default=None,
-                    help='ALSA playback device, e.g. plughw:2,0')
+                    help='ALSA playback device. "default" routes through '
+                         'PulseAudio.')
     ap.add_argument('--jitter-ms', type=int, default=60)
     ap.add_argument('--enable', action='store_true',
                     help='start unmuted (default: wait for /audio/enable)')

@@ -117,6 +117,31 @@ lsusb | grep -i audio
 arecord -l | grep ^card
 ```
 
+### IMPORTANT — use `default`, not `plughw:N,0`
+
+VMware forwards the host microphone to **PulseAudio**, not to the raw ALSA
+card. Reading the card directly opens successfully and returns a stream of pure
+zeros, which looks exactly like a broken microphone.
+
+```bash
+# Correct on a VMware guest - routes through PulseAudio
+arecord -d 3 -f cd -t wav /tmp/mic.wav && aplay /tmp/mic.wav
+
+# Wrong on a VMware guest - opens fine, delivers silence
+arecord -D plughw:0,0 -d 3 -f cd -t wav /tmp/mic2.wav
+```
+
+So pass `--device-in default --device-out default` to `audio_bridge` on the
+operator machine. The robot is the opposite: no PulseAudio in the container, so
+`plughw:2,0` (the C-Media USB headset) is correct there.
+
+Measured on this VM while music played:
+
+```
+arecord -d 3 -f cd   ->  peak=14374 (43.9%)  rms=2646   AUDIO PRESENT
+arecord -D plughw:0,0 ->  opens, then silence
+```
+
 ### Step — prove the microphone is not silent
 
 **This is the step that matters.** A microphone can be present, openable, and
@@ -182,7 +207,8 @@ passthrough keeps fighting you, this is the shorter path.
 | Device never appears in **Removable Devices** | No USB controller, or wrong USB version | Settings → USB Controller → set 2.0 or 3.1 to match the port |
 | Device appears greyed out | Host driver holds it exclusively | Unplug, replug, then connect to VM *before* Windows grabs it |
 | `/dev/video0` exists but no frames | Camera in use by the host | Close the host camera app, reconnect |
-| `arecord` works but `peak=1` | Sound card on *Auto*, or a virtual device | Set the host device explicitly in Sound Card settings |
+| `arecord` works but `peak=1` | Reading `plughw:N,0` directly - VMware only forwards to PulseAudio | Use `-D default` |
+| Mic silent but `aplay` works | Playback and capture are different paths | Check `pactl get-source-mute @DEFAULT_SOURCE@` |
 | Audio works in the VM but not in ROS | Wrong device index | Check `arecord -l` again — the number changes when devices are added |
 | Everything vanishes after a reboot | **Connect at power on** not ticked | Tick it for both the USB controller and the sound card |
 
