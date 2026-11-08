@@ -35,11 +35,10 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Fifteen defects were found and fixed during validation.** They are documented
-in §7 because each one would have been a silent failure in operation. Four of
-them (§7.12 – §7.15) were found only by testing on the real operator station;
-three produced no error message at all when they failed, and the fourth killed
-the process.
+**Sixteen defects were found and fixed during validation.** They are documented
+in §7 because each one would have been a silent failure in operation. Five of
+them (§7.12 – §7.16) were found only by testing on the real operator station;
+most produced no error message at all when they failed.
 
 ---
 
@@ -666,6 +665,61 @@ contains no widget method calls. It reports `CLEAN` for all three.
 > frozen — which users report as "it hung" and developers dismiss as "it was
 > busy".
 
+### 7.16 Three small bugs in one new panel
+
+Adding a live SLAM map to the console produced three failures that are worth
+recording because each one is a shape that recurs.
+
+**A guard that never fires the first time.** The refresh loop only pushed data
+into the map widget when it had *changed*:
+
+```python
+if m is not node._map or sc is not node._scan or pose != self._last_pose:
+    self.map_view.update_view(...)
+```
+
+On the first refresh `m` and `node._map` are both `None`, `pose` and
+`self._last_pose` are both `None`, so every clause is false — and the widget was
+never initialised. It sat blank while the data was arriving perfectly, which
+looks exactly like a broken subscription. Fixed by comparing a signature tuple
+against a sentinel that cannot match:
+
+```python
+sig = (id(m), id(sc), pose)
+if sig != self._map_sig:      # _map_sig starts as None
+```
+
+**A timeout with the wrong type.** `tf2`'s `lookup_transform` wants a
+`Duration`, not a number:
+
+```python
+buffer.lookup_transform('map', 'base_link', Time(), timeout=0.02)
+# TypeError: Can't compare duration with object of type: <class 'float'>
+```
+
+The call was inside a `try/except`, so the pose silently stayed `None` and the
+map drew with no robot marker. The exception was caught correctly — it was just
+being caught for the wrong reason.
+
+**A flattened index used as a coordinate.** `QImage.setPixel` takes `(x, y)`:
+
+```python
+img.setPixel(i, (h - 1 - j) * w, colour)   # wrong: y is a row index
+img.setPixel(i, h - 1 - j, colour)         # right
+```
+
+Qt printed `QImage::setPixel: coordinate (206,218) out of range` hundreds of
+times and drew a garbled map.
+
+> **Lesson:** a "did it change?" guard must be tested from its initial state.
+> The bug is invisible in review because the logic is correct for every call
+> except the first one.
+
+> **Lesson:** a broad `except` around a call you have not yet seen succeed hides
+> programming errors, not just runtime ones. When the pose stayed `None` the
+> code looked like it was waiting for TF, not like it was throwing a
+> `TypeError`.
+
 ---
 
 ## 8. Validation Results
@@ -842,6 +896,18 @@ watch the camera, calibrate gaze, and control the voice link. Details in
 > the DDS environment, and a missing domain does not produce an error, only an
 > empty GUI (§7.13).
 
+### Operator map panel
+
+The console draws `/map` itself rather than embedding RViz: librviz has no usable
+Python widget bindings in Humble, and a second ROS process is one more thing to
+keep alive. The panel shows the occupancy grid, live laser returns transformed
+into the map frame, and the robot pose from TF `map`→`base_link`, auto-fitted to
+whatever has been mapped so far.
+
+The grid is rasterised into a `QImage` once per `/map` message and then scaled.
+Painting individual cells on every repaint would be acceptable for a small map
+and hopeless for a large one.
+
 ### Two-way voice
 
 Started automatically by the launch file in the `robot` role and muted until
@@ -859,6 +925,13 @@ ros2 topic echo /audio/status
 
 Raw PCM 16 kHz mono, 640-byte chunks every 20 ms, 60 ms jitter buffer. Ports are
 derived from `--role`: the robot listens on 9201 and sends to 9200.
+
+`--no-ros` runs the relay with no ROS at all and starts unmuted. That exists
+because the operator's physical microphone is on the Windows host, and VMware's
+virtual sound card captures digital silence unless the host forwards its mic —
+measured as `peak=1` out of 32768 over a 2 s recording, which is an empty stream
+rather than a quiet room. Being able to run the operator end where the hardware
+actually is removes the passthrough problem entirely.
 
 `/audio/status` reports `enabled`, `mic`, `spk`, `sent`, `recv`, `drop` and
 `live`. Note that **`live` means audio arrived** — i.e. the *other* side is

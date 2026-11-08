@@ -326,6 +326,11 @@ def main(argv=None):
                     help='start unmuted (default: wait for /audio/enable)')
     ap.add_argument('--dry-run', action='store_true',
                     help='no ROS; print transport status')
+    ap.add_argument('--no-ros', action='store_true',
+                    help='run the relay without ROS at all (needs --enable). '
+                         'For machines with a real microphone but no ROS - '
+                         'e.g. the Windows host, where the physical mic lives '
+                         'and VMware does not forward it.')
     args, _ = ap.parse_known_args(argv)
 
     core = AudioBridgeCore(
@@ -339,6 +344,37 @@ def main(argv=None):
         print(f'[audio] listen=UDP {core.listen_port} send=UDP {core.send_port}')
         print(f'[audio] chunk={CHUNK_BYTES}B every {CHUNK_MS}ms '
               f'({SAMPLE_RATE} Hz mono)')
+        return 0
+
+    if args.no_ros:
+        # Escape hatch for the operator side.
+        #
+        # VMware's virtual sound card captures digital silence unless the host
+        # explicitly forwards its microphone, and getting a USB headset into
+        # the VM is a click-through in the VMware menus. Neither is a problem
+        # with the relay - the physical microphone is on the host. This mode
+        # runs the same transport with no ROS so it can live where the
+        # hardware actually is.
+        #
+        # There is no /audio/enable to wait for here, so it starts unmuted.
+        if not core.enabled:
+            print('[audio] --no-ros implies --enable; starting unmuted')
+            core.set_enabled(True)
+        print(f'[audio] no-ROS mode: role={args.role} peer={args.peer_ip}')
+        print(f'[audio] capture={args.device_in} playback={args.device_out}')
+        print(f'[audio] listen=UDP {core.listen_port} send=UDP {core.send_port}')
+        core.start()
+        try:
+            while True:
+                s = core.status()
+                print(f"\r[audio] sent={s['sent']} recv={s['recv']} "
+                      f"drop={s['dropped']} live={s['live']}   ", end='',
+                      flush=True)
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            print()
+        finally:
+            core.stop()
         return 0
 
     core.start()

@@ -87,10 +87,10 @@ watchdog `0.35 s`.
 | Servo travel limits | Working — measured with the camera as a sensor |
 | Gaze + EEG fusion (mode 4) | Working — 5/5 priority tests |
 | Two-way voice | Working — per-direction mute, raw PCM over UDP |
-| Operator console (PyQt5) | Working — 6 panels, in-window teleop |
+| Operator console (PyQt5) | Working — 6 panels, live SLAM map, in-window teleop |
 | Gaze calibration | Working — 8/8 checks, 5-point offset + gain |
 
-Fifteen defects were found and fixed during hardware validation. Three of them
+Sixteen defects were found and fixed during hardware validation. Three of them
 were **silent** — no error, no warning, just a feature that did not work:
 a duplicated limit in the GUI, a DDS environment that never got set, and
 Wi-Fi multicast quietly dropping 7 of every 8 video frames. All are written up

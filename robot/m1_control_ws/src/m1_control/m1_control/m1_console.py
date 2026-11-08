@@ -58,6 +58,7 @@ callback touches a widget - they only update a plain dict that a QTimer reads.
 That keeps the UI responsive and avoids Qt's cross-thread rules.
 """
 
+import math
 import os
 import re
 import subprocess
@@ -67,10 +68,11 @@ import time
 
 import rclpy
 from geometry_msgs.msg import Point, Twist, Vector3
+from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CompressedImage, LaserScan
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String, UInt8
 
 MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
@@ -80,6 +82,14 @@ MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 # never discovers the robot, which is far more confusing than a hard failure.
 EXPECTED_DOMAIN = '30'
 EXPECTED_RMW = 'rmw_cyclonedds_cpp'
+
+# TF lookups must not block the GUI. The transform is only used to draw a
+# robot marker, so "the previous frame's pose" is a perfectly good answer -
+# waiting even 100 ms for a fresh one would stutter the window.
+#
+# This is a Duration, not a float: tf2's can_transform() compares the timeout
+# against Duration() and raises TypeError on a bare number.
+_TF_TIMEOUT_S = 0.02
 
 STYLE = """
 QWidget {
@@ -221,6 +231,38 @@ class ConsoleNode(Node):
         self.create_subscription(CompressedImage, '/image_throttled/compressed',
                                  self._image_cb, sensor_qos)
 
+        # ---- SLAM map ------------------------------------------------------
+        # slam_toolbox publishes /map with TRANSIENT_LOCAL durability, which is
+        # what lets a late-joining subscriber get the map that already exists.
+        # Subscribing with the default VOLATILE would connect and then wait
+        # forever for an update that may never come - the same class of bug as
+        # a Reliable subscriber on a Best Effort topic.
+        map_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                             history=HistoryPolicy.KEEP_LAST,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             depth=1)
+        self.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
+        self.create_subscription(LaserScan, '/scan', self._scan_cb, sensor_qos)
+
+        self._map = None          # (width, height, res, ox, oy, bytes)
+        self._scan = None         # (angles, ranges, range_max)
+        self._map_stamp = 0.0
+        self._scan_stamp = 0.0
+
+        # TF, for the robot's pose in the map frame. Without it the map would
+        # be drawn with no indication of where the robot actually is, which is
+        # the one thing an operator needs from a map.
+        try:
+            import tf2_ros
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(
+                self.tf_buffer, self, spin_thread=False)
+            self._tf_ok = True
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f'tf2 unavailable, map has no robot pose: {exc}')
+            self.tf_buffer = None
+            self._tf_ok = False
+
         # Teleop state: written by the GUI thread, read by the publish timer.
         self.teleop = Twist()
         self.servo = {'s1': self.s1_center, 's2': self.s2_center}
@@ -251,6 +293,61 @@ class ConsoleNode(Node):
         self._image_times = [t for t in self._image_times if now - t < 2.0]
         self._latest_jpeg = bytes(msg.data)
         self._set('connected', True)
+
+    def _map_cb(self, msg):
+        """Store the map as flat bytes so the GUI never touches ROS objects."""
+        try:
+            info = msg.info
+            w, h = int(info.width), int(info.height)
+            if w <= 0 or h <= 0 or len(msg.data) < w * h:
+                return
+            # -1 unknown, 0 free, 100 occupied. Pack into one byte each:
+            # 0 = unknown, 1 = free, 2 = occupied.
+            raw = bytes(msg.data)
+            packed = bytearray(w * h)
+            for i in range(w * h):
+                v = raw[i]
+                if v < 0:
+                    packed[i] = 0
+                elif v >= 50:
+                    packed[i] = 2
+                else:
+                    packed[i] = 1
+            self._map = (w, h, float(info.resolution),
+                         float(info.origin.position.x),
+                         float(info.origin.position.y),
+                         bytes(packed))
+            self._map_stamp = time.monotonic()
+        except Exception:  # noqa: BLE001 - a malformed map must not kill the GUI
+            pass
+
+    def _scan_cb(self, msg):
+        try:
+            self._scan = (float(msg.angle_min), float(msg.angle_increment),
+                          float(msg.range_max),
+                          tuple(float(r) for r in msg.ranges))
+            self._scan_stamp = time.monotonic()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def map_snapshot(self):
+        """(map_tuple, scan_tuple, pose_or_None) for the GUI thread."""
+        pose = None
+        if self.tf_buffer is not None:
+            try:
+                from rclpy.duration import Duration
+                from rclpy.time import Time
+                tf = self.tf_buffer.lookup_transform(
+                    'map', 'base_link', Time(),
+                    timeout=Duration(seconds=_TF_TIMEOUT_S))
+                t = tf.transform.translation
+                q = tf.transform.rotation
+                # yaw only; the robot is planar
+                yaw = 2.0 * math.atan2(q.z, q.w)
+                pose = (t.x, t.y, yaw)
+            except Exception:  # noqa: BLE001 - no map->base_link yet
+                pose = None
+        return self._map, self._scan, pose
 
     # ------------------------------------------------------------- accessors
     def snapshot(self):
@@ -548,6 +645,184 @@ def make_drive_pad(QtCore, QtGui, QtWidgets):
     return DrivePad
 
 
+def make_map_view(QtCore, QtGui, QtWidgets):
+    """A compact SLAM map: occupancy grid, live laser returns, robot pose.
+
+    Deliberately not an embedded RViz. librviz has no usable Python widget
+    bindings in Humble, and pulling RViz into the console would mean either a
+    second ROS process or a C++ shim. Drawing the grid and the scan directly
+    costs about 150 lines and gives exactly what an operator needs from a small
+    map: where am I, where is the map, and is the scan still arriving.
+
+    The view auto-fits to whatever has been mapped so far, so it stays useful
+    from the first few scans to a full room without any manual zooming.
+    """
+
+    class MapView(QtWidgets.QWidget):
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.map = None
+            self.scan = None
+            self.pose = None
+            self.scan_age = 99.0
+            self.map_age = 99.0
+            self._img = None          # cached occupancy QImage
+            self._img_src = None      # identity of the map tuple it came from
+            self.setMinimumHeight(190)
+            self.setToolTip('SLAM map — occupancy grid, live laser, robot pose')
+
+        def update_view(self, map_tuple, scan_tuple, pose, scan_age, map_age):
+            self.map = map_tuple
+            self.scan = scan_tuple
+            self.pose = pose
+            self.scan_age = scan_age
+            self.map_age = map_age
+            self.update()
+
+        def _build_image(self):
+            """Render the occupancy grid into a QImage, once per map update.
+
+            Painting tens of thousands of individual cells on every repaint is
+            fine for a 200x200 map and hopeless for a 2000x2000 one. Building
+            the image once and letting Qt scale it keeps the widget cheap no
+            matter how large the map grows.
+            """
+            w, h, res, ox, oy, cells = self.map
+            img = QtGui.QImage(w, h, QtGui.QImage.Format_ARGB32)
+            img.fill(QtCore.Qt.transparent)
+            free = QtGui.QColor('#1f3a2e').rgb()
+            occ = QtGui.QColor('#e5e7eb').rgb()
+            for j in range(h):
+                row = j * w
+                # QImage row 0 is the top, ROS y increases upwards, so the
+                # grid is written upside down to draw the right way up.
+                # setPixel takes (x, y) - the row index is the y coordinate,
+                # NOT the flattened offset j*w.
+                dst_y = h - 1 - j
+                for i in range(w):
+                    v = cells[row + i]
+                    if v == 2:
+                        img.setPixel(i, dst_y, occ)
+                    elif v == 1:
+                        img.setPixel(i, dst_y, free)
+            self._img = img
+            self._img_src = self.map
+
+        # -------------------------------------------------------------- paint
+        def paintEvent(self, _e):
+            p = QtGui.QPainter(self)
+            r = self.rect().adjusted(0, 0, -1, -1)
+
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor('#0d1014'))
+            p.drawRoundedRect(QtCore.QRectF(r), 5, 5)
+            p.setPen(QtGui.QPen(QtGui.QColor('#2b3138'), 1))
+            p.drawRoundedRect(QtCore.QRectF(r), 5, 5)
+
+            if self.map is None:
+                p.setPen(QtGui.QColor('#6b7280'))
+                f = p.font()
+                f.setPointSizeF(8.5)
+                p.setFont(f)
+                p.drawText(r, QtCore.Qt.AlignCenter,
+                           'no map yet\nlaunch SLAM + RViz')
+                return
+
+            w, h, res, ox, oy, cells = self.map
+
+            # World-space bounds of the mapped area, plus the robot, so the
+            # view never puts the robot off-screen.
+            x0, y0 = ox, oy
+            x1, y1 = ox + w * res, oy + h * res
+            if self.pose is not None:
+                px, py = self.pose[0], self.pose[1]
+                x0, x1 = min(x0, px - 0.5), max(x1, px + 0.5)
+                y0, y1 = min(y0, py - 0.5), max(y1, py + 0.5)
+
+            span_x = max(0.5, x1 - x0)
+            span_y = max(0.5, y1 - y0)
+            inner = r.adjusted(4, 4, -4, -4)
+            scale = min(inner.width() / span_x, inner.height() / span_y)
+
+            cx_world = (x0 + x1) / 2.0
+            cy_world = (y0 + y1) / 2.0
+            cx_px = inner.center().x()
+            cy_px = inner.center().y()
+
+            def to_px(wx, wy):
+                # ROS +y is up, screen +y is down, hence the sign flip.
+                return QtCore.QPointF(cx_px + (wx - cx_world) * scale,
+                                      cy_px - (wy - cy_world) * scale)
+
+            # ---- occupancy grid -------------------------------------------
+            if self._img_src is not self.map:
+                self._build_image()
+            if self._img is not None:
+                top_left = to_px(ox, oy + h * res)
+                p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, False)
+                p.drawImage(QtCore.QRectF(
+                    top_left.x(), top_left.y(), w * res * scale, h * res * scale),
+                    self._img)
+                p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
+
+            # ---- laser returns --------------------------------------------
+            # Drawn in the robot's frame, rotated into the map by the pose.
+            if self.scan is not None and self.pose is not None \
+                    and self.scan_age < 1.5:
+                a0, da, rmax, ranges = self.scan
+                px, py, yaw = self.pose
+                p.setPen(QtGui.QPen(QtGui.QColor('#f59e0b'), 1))
+                step = max(1, len(ranges) // 400)
+                cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+                for k in range(0, len(ranges), step):
+                    rr = ranges[k]
+                    if not (0.05 < rr < rmax):
+                        continue
+                    a = a0 + k * da
+                    # Point in the robot frame...
+                    bx, by = rr * math.cos(a), rr * math.sin(a)
+                    # ...rotated and translated into the map frame.
+                    wx = px + bx * cos_y - by * sin_y
+                    wy = py + bx * sin_y + by * cos_y
+                    p.drawPoint(to_px(wx, wy))
+
+            # ---- robot pose -----------------------------------------------
+            if self.pose is not None:
+                px, py, yaw = self.pose
+                c = to_px(px, py)
+                size = 9.0
+                tri = QtGui.QPolygonF([
+                    QtCore.QPointF(size, 0.0),
+                    QtCore.QPointF(-size * 0.7, size * 0.62),
+                    QtCore.QPointF(-size * 0.7, -size * 0.62),
+                ])
+                p.save()
+                p.translate(c)
+                # Screen y is flipped, so a positive yaw becomes -yaw here.
+                p.rotate(-math.degrees(yaw))
+                p.setPen(QtGui.QPen(QtGui.QColor('#93c5fd'), 1))
+                p.setBrush(QtGui.QColor('#2563eb'))
+                p.drawPolygon(tri)
+                p.restore()
+
+            # ---- footer ---------------------------------------------------
+            p.setPen(QtGui.QColor('#6b7280'))
+            f = p.font()
+            f.setPointSizeF(7.5)
+            p.setFont(f)
+            if self.scan_age > 1.5:
+                note = 'scan stale'
+            elif self.pose is None:
+                note = 'no map→base_link'
+            else:
+                note = f'{w}×{h} @ {res * 100:.0f} cm'
+            p.drawText(r.adjusted(6, 0, -6, -3),
+                       QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom, note)
+
+    return MapView
+
+
 # ---------------------------------------------------------------------------
 # Five-point gaze calibration
 # ---------------------------------------------------------------------------
@@ -826,6 +1101,7 @@ def main(args=None):
     MeterGreen = make_meter(QtCore, QtGui, QtWidgets, '#34d399')
     ServoBar = make_servo_bar(QtCore, QtGui, QtWidgets)
     GazeMap = make_gaze_map(QtCore, QtGui, QtWidgets)
+    MapView = make_map_view(QtCore, QtGui, QtWidgets)
     DrivePad = make_drive_pad(QtCore, QtGui, QtWidgets)
     # Bind to a NEW name: assigning back to CalibDialog would make it a
     # local of main() and the right-hand reference would raise
@@ -852,6 +1128,7 @@ def main(args=None):
             self.held = set()
             self.audio_on = False
             self._last_jpeg = None
+            self._map_sig = None
             self._link_busy = False
 
             # Connections must exist before anything can emit.
@@ -1151,7 +1428,15 @@ def main(args=None):
             gv.addWidget(self.lbl_audio)
             v.addWidget(g)
 
-            v.addStretch(1)
+            # -- map ------------------------------------------------------
+            g = QtWidgets.QGroupBox('6 · Map')
+            gm = QtWidgets.QVBoxLayout(g)
+            gm.setContentsMargins(6, 6, 6, 6)
+            self.map_view = MapView()
+            gm.addWidget(self.map_view)
+            v.addWidget(g, 1)
+
+            v.addStretch(0)
             return panel
 
         def _build_log(self):
@@ -1433,6 +1718,23 @@ def main(args=None):
             self.lbl_zone.setText(s['zone'] or '—')
             self.lbl_calib.setText(
                 f'offset {ox:+.2f},{oy:+.2f}   gain {gx:.2f},{gy:.2f}')
+
+            # Map. Repainting the occupancy grid is the expensive part of a
+            # refresh, so only touch it when the data actually changed: the map
+            # updates on scan matching, not on a timer.
+            #
+            # The signature starts as None rather than as the current values.
+            # Comparing "None is not None" on the first refresh is False, so an
+            # equality-only guard would never run the first update and the map
+            # would stay blank forever.
+            m, sc, pose = node.map_snapshot()
+            sig = (id(m), id(sc), pose)
+            if sig != self._map_sig:
+                self._map_sig = sig
+                self.map_view.update_view(
+                    m, sc, pose,
+                    time.monotonic() - node._scan_stamp if sc else 99.0,
+                    time.monotonic() - node._map_stamp if m else 99.0)
 
             # audio
             txt = s['audio']

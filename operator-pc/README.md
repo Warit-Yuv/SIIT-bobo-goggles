@@ -93,9 +93,32 @@ startup and shows a red banner naming the mismatch if it is wrong.
 | **3 · Camera head** | Pan and tilt with the allowed range drawn on the bar |
 | **4 · Gaze** | Live gaze plot (raw vs corrected) and 5-point calibration |
 | **5 · Voice** | Enable audio, mute either direction, packet meters |
+| **6 · Map** | Live SLAM map: occupancy grid, laser returns, robot pose |
 | **Camera** | Live feed at the throttled rate |
 | **Drive** | Keyboard teleop — the window captures keys, no terminal needed |
 | **Log** | Timestamped actions and remote command output |
+
+### The map panel
+
+A compact view of `/map`, drawn by the console itself rather than by embedding
+RViz — librviz has no usable Python widget bindings in Humble, and a second ROS
+process would be one more thing to keep alive.
+
+| Element | Meaning |
+|---|---|
+| Light grey cells | Occupied — walls and obstacles |
+| Dark green cells | Known free space |
+| Amber dots | Live laser returns, transformed into the map frame |
+| Blue arrow | Robot pose and heading, from TF `map`→`base_link` |
+
+The view **auto-fits** to whatever has been mapped so far, so it is usable from
+the first scan to a whole room with no zooming. It shows `no map yet` until
+SLAM is running, and the footer reports the grid size or warns that the scan has
+stopped.
+
+The occupancy grid is rasterised into a `QImage` once per `/map` message and
+then scaled. Painting tens of thousands of individual cells on every repaint
+would be fine for a small map and hopeless for a large one.
 
 ### Keyboard
 
@@ -133,6 +156,65 @@ buffer. Raw PCM means no encoder dependency on either side.
 **It is muted until `/audio/enable` says otherwise**, so the microphone in
 someone's home is never live by accident. The console's Voice panel drives it,
 and either direction can be muted independently.
+
+### The operator microphone problem (VMware)
+
+VMware's virtual sound card captures **digital silence** unless the host
+explicitly forwards its microphone. Measured on this VM:
+
+```
+$ arecord -D plughw:0,0 -f S16_LE -r 16000 -c 1 -d 2 /tmp/m.wav
+$ # peak amplitude of the recording:
+  frames=32000 peak=1 (0.0% of full scale)      <- silence, not quiet audio
+```
+
+A peak of `1` out of 32768 is not a quiet room, it is an empty data stream. So
+the Voice panel will show `out N · no audio from me yet` forever: the robot is
+sending, but the operator has nothing to send.
+
+There are two ways to fix it, and the second is usually less painful.
+
+**Option A — pass the hardware through to the VM.**
+
+1. Shut the VM down (or suspend it).
+2. *VM → Settings → USB Controllers* → enable **USB 3.1** (or 3.0).
+3. *VM → Settings → Sound Card* → **Connect at power on**, and specify the
+   host device rather than "auto".
+4. Boot the VM, then plug in the headset and use
+   *VM → Removable Devices → \<your headset\> → Connect (Disconnect from host)*.
+   The same menu is how a webcam is passed through.
+5. Verify inside the VM:
+
+   ```bash
+   lsusb                  # the device should appear
+   arecord -l             # a new capture card
+   ls /dev/video*         # only if you passed a camera
+   ```
+
+A USB headset passed through this way appears as a real card (usually card 2 or
+3) and works with `--device-in plughw:N,0`.
+
+**Option B — run the operator side on Windows.**
+
+The physical microphone is on the host. The relay does not actually need ROS on
+this side, so it can run where the hardware is:
+
+```bat
+pip install pyserial
+python audio_bridge.py --no-ros --role operator ^
+    --peer-ip 10.0.0.54 --device-in "" --device-out ""
+```
+
+`--no-ros` runs the same transport with no ROS at all and starts unmuted. On
+Windows, `arecord`/`aplay` are not present, so this path expects an
+ALSA-compatible setup; in practice the simplest working arrangement is Option A
+with a USB headset, or running the relay inside the VM with a passthrough
+device.
+
+> **The webcam is a separate question.** The gaze model normally runs on the
+> Windows host (see [`SETUP.md`](SETUP.md) §7.1) and sends UDP to the robot, so
+> the VM does not need a camera at all. Only pass the webcam through if you
+> intend to run the gaze model inside the VM.
 
 The vendor `largemodel` package also ships audio (ASR + TTS + a hardware
 wake-word microphone on `/dev/ttyUSB2`). That is a voice-*assistant* pipeline,
@@ -208,6 +290,9 @@ ros2 topic hz /image_throttled/compressed      # expect ~20 Hz, not ~2 Hz
 | Camera ~2 Hz, other topics fine | Multicast over Wi-Fi | Unicast peer in `cyclonedds.xml` (§7.14) |
 | `AMENT_TRACE_SETUP_FILES: unbound variable` | `set -u` around ROS setup | Bracket the `source` with `set +u` |
 | Console segfaults when a button is pressed | Worker thread touched a widget | Fixed in `m1_console` via Qt signals (§7.15) |
+| Map panel says `no map yet` | SLAM not running | Launch SLAM + RViz, or Start with autoview |
+| Map shows but no arrow | TF `map`→`base_link` missing | `ros2 run tf2_ros tf2_echo map base_link` |
+| Voice shows `no audio from me yet` | VM mic captures silence | See *operator microphone problem* |
 | Window freezes for ~10 s at a time | Blocking SSH probe on the GUI thread | Fixed — probe runs on a worker |
 
 > `/scan` and the image are published **Best Effort**. A *Reliable* subscriber
