@@ -204,6 +204,8 @@ class ConsoleNode(Node):
         # the worst kind of wrong, because it looks right.
         self.declare_parameter('deadzone_radius_ratio', 0.30)
         self.declare_parameter('deadzone_radius_ratio_y', 0.16)
+        # Must match the HUD's head_weight, same reason as the deadzone.
+        self.declare_parameter('head_weight', 0.75)
 
         gp = self.get_parameter
         self.robot_ip = gp('robot_ip').value
@@ -216,6 +218,7 @@ class ConsoleNode(Node):
         self.servo_step = float(gp('servo_step').value)
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
+        self.head_weight = float(gp('head_weight').value)
 
         self.state = {
             'mode': None, 'voltage': float('nan'), 'zone': '',
@@ -250,8 +253,8 @@ class ConsoleNode(Node):
             Bool, '/audio/robot_speaker', 10)
         self.calib_pub = self.create_publisher(
             Float32MultiArray, '/gaze/calib', 10)
-        self.deadzone_pub = self.create_publisher(
-            Float32MultiArray, '/gaze/deadzone', 10)
+        self.tuning_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/tuning', 10)
 
         self.create_subscription(UInt8, '/control_mode_state',
                                  lambda m: self._set('mode', int(m.data)),
@@ -265,8 +268,8 @@ class ConsoleNode(Node):
                                  lambda m: self._set('audio', m.data), 10)
         self.create_subscription(Float32MultiArray, '/gaze/calib_state',
                                  self._calib_state_cb, 10)
-        self.create_subscription(Float32MultiArray, '/gaze/deadzone_state',
-                                 self._deadzone_state_cb, 10)
+        self.create_subscription(Float32MultiArray, '/gaze/tuning_state',
+                                 self._tuning_state_cb, 10)
         self.create_subscription(Point, '/gaze/raw', self._raw_cb, 10)
         self.create_subscription(CompressedImage, '/image_throttled/compressed',
                                  self._image_cb, sensor_qos)
@@ -327,16 +330,19 @@ class ConsoleNode(Node):
         if len(msg.data) >= 4:
             self._set('calib', [float(v) for v in msg.data[:4]])
 
-    def _deadzone_state_cb(self, msg):
+    def _tuning_state_cb(self, msg):
         """Adopt whatever the HUD is actually using.
 
         The sliders publish a request; this is the confirmation. Adopting it
         keeps the overlay honest even if the HUD clamps a value or the request
         never arrived.
         """
-        if len(msg.data) >= 2:
-            self.deadzone_ratio = float(msg.data[0])
-            self.deadzone_ratio_y = float(msg.data[1])
+        data = list(msg.data)
+        if len(data) >= 2:
+            self.deadzone_ratio = float(data[0])
+            self.deadzone_ratio_y = float(data[1])
+        if len(data) >= 3:
+            self.head_weight = float(data[2])
 
     def _raw_cb(self, msg):
         self._raw = (float(msg.x), float(msg.y), float(msg.z) > 0.5,
@@ -471,12 +477,25 @@ class ConsoleNode(Node):
 
         Adopting immediately rather than waiting for the echo keeps the
         overlay responsive while the slider is being dragged; the echo on
-        /gaze/deadzone_state then corrects it if the HUD clamped the value.
+        /gaze/tuning_state then corrects it if the HUD clamped the value.
         """
         rx = min(0.48, max(0.02, float(rx)))
         ry = min(0.48, max(0.02, float(ry)))
         self.deadzone_ratio, self.deadzone_ratio_y = rx, ry
-        self.deadzone_pub.publish(Float32MultiArray(data=[rx, ry]))
+        self.tuning_pub.publish(
+            Float32MultiArray(data=[rx, ry, float(self.head_weight)]))
+
+    def set_head_weight(self, k):
+        """How much of the gaze signal comes from the head, 0..1.
+
+        Not a preference: at 0 the vertical axis stops working, because the
+        iris barely moves up and down inside the eye. See gaze_hud_node.
+        """
+        k = min(1.0, max(0.0, float(k)))
+        self.head_weight = k
+        self.tuning_pub.publish(
+            Float32MultiArray(data=[float(self.deadzone_ratio),
+                                    float(self.deadzone_ratio_y), k]))
 
     def nudge_servo(self, d_tilt=0.0, d_pan=0.0):
         self.servo['s1'] = min(self.s1_max,
@@ -1070,11 +1089,11 @@ class CalibDialog:
             'label': 'Fast · 5 dots · ~10 s',
             'settle': 0.9, 'sample': 1.0,
             'dots': [
-                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot, keep your head still'),
-                ('TOP', 0.50, 0.10, 'Look at the TOP dot, keep your head still'),
-                ('RIGHT', 0.90, 0.50, 'Look at the RIGHT dot, keep your head still'),
-                ('BOTTOM', 0.50, 0.90, 'Look at the BOTTOM dot, keep your head still'),
-                ('LEFT', 0.10, 0.50, 'Look at the LEFT dot, keep your head still'),
+                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot, move naturally'),
+                ('TOP', 0.50, 0.10, 'Look at the TOP dot, move naturally'),
+                ('RIGHT', 0.90, 0.50, 'Look at the RIGHT dot, move naturally'),
+                ('BOTTOM', 0.50, 0.90, 'Look at the BOTTOM dot, move naturally'),
+                ('LEFT', 0.10, 0.50, 'Look at the LEFT dot, move naturally'),
             ],
         },
         'long': {
@@ -1105,7 +1124,7 @@ class CalibDialog:
             def __init__(self, node, area_rect, parent=None):
                 super().__init__(parent)
                 self.node = node
-                # GLOBAL screen rect of the calibration area - the WHOLE
+                # GLOBAL screen rect this dialog should cover - the whole
                 # console window, which is maximised, so in practice the whole
                 # screen.
                 #
@@ -1120,7 +1139,10 @@ class CalibDialog:
                 # Spread across the full screen, the same eye movement produces
                 # a far larger signal, which is what makes the gain - and so the
                 # reach of the zones - meaningful.
-                self.area = QtCore.QRect(area_rect)
+                #
+                # The dots themselves are placed by _dot_area(), which trims
+                # this rect to exclude the control bar.
+                self.screen_area = QtCore.QRect(area_rect)
                 self.profile = 'fast'
                 # Deadzone proportions, so the preview oval matches the robot.
                 self.dz_x = float(node.deadzone_ratio)
@@ -1145,9 +1167,13 @@ class CalibDialog:
                 self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
                 self.setModal(True)
                 self.setWindowTitle('Gaze calibration')
-                if parent is not None:
-                    tl = parent.mapToGlobal(QtCore.QPoint(0, 0))
-                    self.setGeometry(QtCore.QRect(tl, parent.size()))
+                # Cover exactly the area we were told to cover. Deriving it
+                # from the parent instead put the dialog at the parent's
+                # top-left with the parent's size, which happens to be the same
+                # thing for a maximised console but silently disagrees with
+                # `screen_area` - and the dots are placed from screen_area, so
+                # the two must not be allowed to drift apart.
+                self.setGeometry(QtCore.QRect(self.screen_area))
 
                 v = QtWidgets.QVBoxLayout(self)
                 v.setContentsMargins(0, 0, 0, 22)
@@ -1167,10 +1193,11 @@ class CalibDialog:
                 bv.addWidget(self.lbl)
 
                 self.hint = QtWidgets.QLabel(
-                    'The dots spread across the WHOLE screen. Follow each one '
-                    'with your eyes and hold your head still.\n'
-                    'A wide calibration is what makes the outer zones '
-                    'reachable later.')
+                    'The dots spread across the WHOLE screen. Look at each one '
+                    'the way you naturally would — eyes and head together.\n'
+                    'Do not strain your eyes to keep your head still: the '
+                    'tracker uses your head movement, and calibrating how you '
+                    'actually move is what makes it work.')
                 self.hint.setObjectName('dim')
                 self.hint.setAlignment(QtCore.Qt.AlignCenter)
                 self.hint.setWordWrap(True)
@@ -1205,6 +1232,7 @@ class CalibDialog:
                 bv.addLayout(row)
 
                 v.addWidget(bar, 0, QtCore.Qt.AlignHCenter)
+                self.bar = bar
 
             # ------------------------------------------------------- painting
             def _on_profile(self, _i):
@@ -1216,13 +1244,36 @@ class CalibDialog:
                     return
                 super().keyPressEvent(e)
 
+            def _dot_area(self):
+                """Where the dots may be drawn, in this dialog's coordinates.
+
+                The whole window MINUS the control bar at the bottom.
+
+                The bottom dots used to be drawn behind that bar and simply
+                disappeared, which is fatal for a calibration: the operator
+                has no idea whether to keep holding their gaze there, and the
+                samples taken while the dot is invisible are taken looking at
+                whatever they happened to be looking at.
+
+                Shrinking the area slightly costs nothing. What matters for
+                the fit is how far apart the dots are in EYE movement, and the
+                area is still most of a maximised window.
+                """
+                full = QtCore.QRect(0, 0, self.width(), self.height())
+                bar = getattr(self, 'bar', None)
+                if bar is None:
+                    return full
+                top = bar.mapTo(self, QtCore.QPoint(0, 0)).y()
+                if top <= 0:
+                    return full
+                return QtCore.QRect(0, 0, full.width(), top - 8)
+
             def paintEvent(self, _e):
                 p = QtGui.QPainter(self)
                 p.setRenderHint(QtGui.QPainter.Antialiasing)
 
                 full = QtCore.QRect(0, 0, self.width(), self.height())
-                area = QtCore.QRect(self.area)
-                area.moveTopLeft(self.mapFromGlobal(area.topLeft()))
+                area = self._dot_area()
 
                 # Dim the whole window, then lift the calibration area back to
                 # full brightness. The operator keeps seeing the view they
@@ -1890,13 +1941,29 @@ def main(args=None):
                 'backward almost unreachable.')
             gv.addWidget(self._labelled('Deadzone  ↕', self.sld_dzy))
 
+            # The head/eye balance. This is the knob that decides whether
+            # up-and-down works at all: at 0 the signal is iris-only, and the
+            # iris barely moves vertically inside the eye, so the vertical axis
+            # becomes noise. At 1 the eyes are ignored entirely.
+            self.sld_head = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_head.setRange(0, 100)
+            self.sld_head.setToolTip(
+                'How much of the gaze comes from your HEAD rather than your '
+                'eyes.\n'
+                'Raise it if you have to strain your eyes to reach a zone.\n'
+                'At 0 the vertical axis stops working.')
+            gv.addWidget(self._labelled('Head  ↔↕', self.sld_head))
+
             # Set the starting positions BEFORE connecting: setValue() emits
-            # valueChanged, and the handler reads BOTH sliders, so connecting
-            # first would fire it while the second one does not exist yet.
+            # valueChanged, and the handler reads ALL of these sliders, so
+            # connecting first would fire it while the later ones do not exist
+            # yet. That bug made the console fail to start.
             self.sld_dzx.setValue(int(round(node.deadzone_ratio * 100)))
             self.sld_dzy.setValue(int(round(node.deadzone_ratio_y * 100)))
+            self.sld_head.setValue(int(round(node.head_weight * 100)))
             self.sld_dzx.valueChanged.connect(self._deadzone_changed)
             self.sld_dzy.valueChanged.connect(self._deadzone_changed)
+            self.sld_head.valueChanged.connect(self._deadzone_changed)
 
             v.addWidget(g)
 
@@ -2115,6 +2182,7 @@ def main(args=None):
         def _deadzone_changed(self, _v):
             node.set_deadzone(self.sld_dzx.value() / 100.0,
                               self.sld_dzy.value() / 100.0)
+            node.set_head_weight(self.sld_head.value() / 100.0)
             # Redraw immediately: the overlay is the only feedback that tells
             # the operator what the new deadzone actually looks like.
             self._last_jpeg = None

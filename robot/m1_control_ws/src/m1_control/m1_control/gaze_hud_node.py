@@ -31,6 +31,7 @@ Run on the PC:
     ros2 run m1_control gaze_hud_node --ros-args -p gaze_source:=mouse
 """
 
+import math
 import time
 from collections import deque
 
@@ -50,6 +51,26 @@ except ImportError:  # run as a plain script rather than through ros2 run
     from gaze_calib import apply as apply_calib
 
 MODE_GAZE = 2
+
+#: Canonical 3D face model, in millimetres, for cv2.solvePnP.
+#: Standard FaceMesh correspondences. Only the ROTATION is used, so the scale
+#: of these numbers does not matter - which is fortunate, because it is a
+#: generic face rather than this operator's.
+_PNP_MODEL = np.array([
+    [0.0, 0.0, 0.0],          # 1    nose tip
+    [0.0, -63.6, -12.5],      # 199  chin
+    [-43.3, 32.7, -26.0],     # 33   left eye, outer corner
+    [43.3, 32.7, -26.0],      # 263  right eye, outer corner
+    [-28.9, -28.9, -24.1],    # 61   left mouth corner
+    [28.9, -28.9, -24.1],     # 291  right mouth corner
+], dtype=np.float64)
+_PNP_IDS = (1, 199, 33, 263, 61, 291)
+
+#: Radians of head rotation that map to full deflection. Beyond roughly 20 deg
+#: people stop turning their head and move their eyes instead, so this is about
+#: where the head term should stop contributing.
+HEAD_YAW_SPAN = math.radians(22.0)
+HEAD_PITCH_SPAN = math.radians(16.0)
 
 #: One place for the window title, because it is also the key used to ask
 #: OpenCV whether the window still exists.
@@ -107,6 +128,21 @@ class GazeHUDNode(Node):
         # and for keeping the raw value inside 0..1.
         self.declare_parameter('iris_gain_h', 3.0)
         self.declare_parameter('iris_gain_v', 3.0)
+        # How much of the gaze signal comes from the HEAD rather than the eye.
+        #
+        # This is not a refinement, it is what makes vertical work at all.
+        # The iris barely moves vertically inside the eye - a few percent of
+        # the eye's width - so an iris-only vertical signal is mostly noise.
+        # Measured on the hardware, the fitted vertical gain came back clamped
+        # at its 0.25 minimum, which is the fit saying "there is no usable
+        # relationship here".
+        #
+        # Head pitch, by contrast, is large and clean: to look at the top of a
+        # screen people tilt their head up by 10-20 degrees. Adding it means
+        # the vertical signal is dominated by something that actually moves.
+        # The same is true of yaw horizontally, which is why looking at the far
+        # edges of the screen no longer requires straining the eyes.
+        self.declare_parameter('head_weight', 0.75)
         # Low-pass on the raw gaze, 0..1. Tracker noise is what makes a zone
         # flicker on and off, and a flickering zone reads as "it does not
         # work" even when the logic is correct. Higher = steadier but laggier.
@@ -155,6 +191,9 @@ class GazeHUDNode(Node):
                                              0.01, 1.0))
         self.iris_gain_h = float(gp('iris_gain_h').value)
         self.iris_gain_v = float(gp('iris_gain_v').value)
+        self.head_weight = float(np.clip(gp('head_weight').value, 0.0, 1.0))
+        self.head_yaw = 0.0
+        self.head_pitch = 0.0
         self.gaze_smoothing = float(np.clip(gp('gaze_smoothing').value,
                                             0.0, 0.95))
         self.publish_face = bool(gp('publish_face').value)
@@ -268,15 +307,18 @@ class GazeHUDNode(Node):
         self.zone_pub = self.create_publisher(String, '/gaze/zone', 10)
         self.face_pub = self.create_publisher(
             CompressedImage, '/gaze/face', sensor_qos)
-        # The deadzone is the one number the operator has to tune by feel, so
-        # it is adjustable while driving instead of needing a relaunch. The
-        # console sends it here; the HUD echoes it back on the _state topic so
-        # the console's sliders show what is actually in force.
-        self.deadzone_state_pub = self.create_publisher(
-            Float32MultiArray, '/gaze/deadzone_state', 10)
-        self.create_subscription(Float32MultiArray, '/gaze/deadzone',
-                                 self._deadzone_cb, 10)
-        self.create_timer(1.0, self._report_deadzone)
+        # The deadzone and the head weight are the two numbers the operator has
+        # to tune by feel, so they are adjustable while driving instead of
+        # needing a relaunch. The console sends them here; the HUD echoes them
+        # back on the _state topic so the console's sliders show what is
+        # actually in force after clamping.
+        #
+        # Payload: [deadzone_x, deadzone_y, head_weight]
+        self.tuning_state_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/tuning_state', 10)
+        self.create_subscription(Float32MultiArray, '/gaze/tuning',
+                                 self._tuning_cb, 10)
+        self.create_timer(1.0, self._report_tuning)
 
         self.create_subscription(CompressedImage, self.camera_topic,
                                  self.image_cb, sensor_qos)
@@ -344,22 +386,25 @@ class GazeHUDNode(Node):
         self.calib_state_pub.publish(
             Float32MultiArray(data=[float(v) for v in self._calib]))
 
-    def _deadzone_cb(self, msg: Float32MultiArray):
+    def _tuning_cb(self, msg: Float32MultiArray):
         data = list(msg.data)
         if len(data) < 2:
             self.get_logger().warn(
-                f'/gaze/deadzone needs [rx, ry], got {len(data)}')
+                f'/gaze/tuning needs [dz_x, dz_y, head_weight], got {len(data)}')
             return
         # Clamped: a deadzone at 0 would drive on tracker noise alone, and one
         # at 0.5 would cover the whole space and never drive at all.
         self.deadzone_ratio = float(np.clip(data[0], 0.02, 0.48))
         self.deadzone_ratio_y = float(np.clip(data[1], 0.02, 0.48))
-        self._report_deadzone()
+        if len(data) >= 3:
+            self.head_weight = float(np.clip(data[2], 0.0, 1.0))
+        self._report_tuning()
 
-    def _report_deadzone(self):
-        self.deadzone_state_pub.publish(
+    def _report_tuning(self):
+        self.tuning_state_pub.publish(
             Float32MultiArray(data=[float(self.deadzone_ratio),
-                                    float(self.deadzone_ratio_y)]))
+                                    float(self.deadzone_ratio_y),
+                                    float(self.head_weight)]))
 
     def _smooth(self, target_u, target_v):
         """Median-of-5, then a fixed low-pass.
@@ -548,6 +593,9 @@ class GazeHUDNode(Node):
         # put the neutral point in the same place as the horizontal measure.
         v = 0.5 + 0.5 * (perp(l_iris, l_out, l_in) + perp(r_iris, r_in, r_out))
 
+        # Head rotation, which is the part that actually carries the signal.
+        h, v = self._blend_head(h, v, lm, rgb.shape[1], rgb.shape[0])
+
         # Keep the raw value inside 0..1: the calibration maps targets into
         # that square, and a sample outside it cannot be fitted against.
         self.gaze_u = float(np.clip((h - 0.5) * self.iris_gain_h + 0.5, 0.0, 1.0))
@@ -556,6 +604,75 @@ class GazeHUDNode(Node):
 
         if self.publish_face:
             self._publish_face_crop(cam, lm)
+
+    def _head_rotation(self, lm, w, h):
+        """Head yaw and pitch in radians, from a solvePnP on six landmarks.
+
+        Returns (yaw, pitch) with pitch positive when the head tilts UP and
+        yaw positive when it turns to the image's right.
+
+        A generic face model is enough because only the rotation is used. The
+        camera intrinsics are guessed from the image size - the focal length of
+        a typical webcam is close to its width, and a wrong focal length
+        changes the apparent rotation slightly but not its sign or its order of
+        magnitude, which is all this needs.
+        """
+        try:
+            img = np.array([[lm[i].x * w, lm[i].y * h] for i in _PNP_IDS],
+                           dtype=np.float64)
+            f = float(w)
+            cam_mtx = np.array([[f, 0.0, w / 2.0],
+                                [0.0, f, h / 2.0],
+                                [0.0, 0.0, 1.0]], dtype=np.float64)
+            ok, rvec, _ = cv2.solvePnP(
+                _PNP_MODEL, img, cam_mtx, None,
+                flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                return None
+            rot, _ = cv2.Rodrigues(rvec)
+
+            # The face looks toward the CAMERA, which is -z in camera
+            # coordinates (+z points away from the camera into the scene).
+            #
+            # Using +z here instead reported 180 deg of yaw for a head facing
+            # straight ahead, so the head term was a constant offset plus
+            # noise - which is exactly what "it cannot tell up from down at
+            # all" looked like from the operator's chair.
+            fwd = rot @ np.array([0.0, 0.0, -1.0])
+
+            # +x is image right, +y is image DOWN.
+            #   yaw   positive = head turned to the image's right
+            #   pitch positive = head tilted UP
+            yaw = math.atan2(fwd[0], -fwd[2])
+            pitch = math.atan2(fwd[1], math.hypot(fwd[0], fwd[2]))
+            return yaw, pitch
+        except Exception:  # noqa: BLE001 - a pose failure must not stop tracking
+            return None
+
+    def _blend_head(self, eye_u, eye_v, lm, w, h):
+        """Add head rotation to the eye-in-head angles.
+
+        `eye_u`/`eye_v` are 0..1 with 0.5 neutral. The head term is scaled so
+        that HEAD_YAW_SPAN of rotation is worth full deflection, then the two
+        are mixed by `head_weight`.
+        """
+        pose = self._head_rotation(lm, w, h)
+        if pose is None:
+            return eye_u, eye_v
+        yaw, pitch = pose
+        self.head_yaw, self.head_pitch = yaw, pitch
+
+        # Normalised to -1..+1 over the span, then back to the 0..1 the rest of
+        # the node uses.
+        ny = float(np.clip(yaw / HEAD_YAW_SPAN, -1.0, 1.0))
+        np_ = float(np.clip(pitch / HEAD_PITCH_SPAN, -1.0, 1.0))
+
+        k = self.head_weight
+        # Head yaw positive = turned to the image's right = larger u.
+        # Head pitch positive = tilted up = smaller v.
+        u = (1.0 - k) * eye_u + k * (0.5 + 0.5 * ny)
+        v = (1.0 - k) * eye_v + k * (0.5 - 0.5 * np_)
+        return u, v
 
     # ------------------------------------------------------------------ logic
     def _classify(self, dx, dy, rx, ry):

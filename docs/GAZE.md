@@ -67,31 +67,50 @@ pip3 install --target ~/gaze-libs "mediapipe==0.10.14" "numpy<1.27"
 
 ## What the tracker actually measures
 
-Iris position only — **not** head pose.
+**Iris position and head rotation together.** Head rotation is not a refinement —
+it is what makes vertical work at all.
 
-Mediapipe FaceMesh gives 478 landmarks including an iris ring per eye. From
-those, two numbers are derived per eye:
+| Signal | How | Why |
+|---|---|---|
+| Eye horizontal | iris position **along** the line joining the eye corners | clean, but a small range |
+| Eye vertical | iris distance **off** that same line | tiny range — see below |
+| Head yaw / pitch | `cv2.solvePnP` on six landmarks → 3D rotation | large, clean, dominates |
 
-| Axis | How |
-|---|---|
-| Horizontal | where the iris sits **along** the line joining the eye corners, as a fraction |
-| Vertical | how far the iris sits **off** that same line, in units of eye width |
+### Why the head is needed
 
-Both eyes are averaged. Because both axes are measured against the *same*
-stable reference — the eye-corner line — they have the same noise floor.
+The iris moves about 3 mm inside a 30 mm eye. Horizontally that is still a
+usable fraction of the eye's width; **vertically it is a few percent**, and
+the eyelid is right there adding its own motion. An iris-only vertical signal
+is therefore mostly noise.
 
-> An earlier version measured vertical against the distance between the upper
-> and lower eyelid. That denominator is a few pixels and changes on every
-> blink, so the vertical signal was mostly eyelid motion. The symptom was
-> exactly what an operator would report as "up and down is hard to tell apart":
-> the vertical gain in calibration kept coming back clamped at its minimum.
+Measured on the hardware: the fitted vertical gain came back clamped at its
+**0.25 minimum** every single run. That is the fit reporting "there is no
+usable relationship between this signal and where you are looking". No
+threshold, deadzone or calibration length could have fixed it.
 
-**This means the tracker does not compensate for head movement.** Look at the
-same spot while moving your head and the reading changes. Full head-pose
-compensation (the `geo_iris` model in [GazeModel](https://github.com/lANXEZ/GazeModel))
-adds a solved 3D head rotation to the eye-in-head angle. That is a real
-improvement and it is **not implemented here** — sit still and it does not
-matter; move around and it does.
+People do not look at the top of a screen with their eyes alone — they tilt
+their head up 10–20°. That motion is large, clean, and measurable from the
+same landmark set. So the signal is:
+
+```
+u = (1 - k) * eye_u + k * head_yaw_term
+v = (1 - k) * eye_v + k * head_pitch_term
+```
+
+with `head_weight` (`k`, default 0.75) on a slider in the Gaze panel. Measured
+span at k=0.75: **0.70 vertically, 0.68 horizontally** from comfortable
+movement. At k=0 the vertical axis is flat.
+
+> A sign error in the PnP maths made this worse before it made it better:
+> neutral was reported as **180° of yaw**, so the head term was a constant
+> offset plus noise. `scripts/test_gaze_pose.py` now projects synthetic
+> landmarks from known rotations, so a sign flip fails the test instead of
+> reaching the operator.
+
+**Head position (near / far) is not used.** solvePnP recovers translation too,
+but only rotation is blended in, which is why leaning closer or further does
+not shift the aim. The reference implementation's multi-posture calibration
+exists to learn head-*position* effects; this does not attempt that.
 
 ---
 
@@ -229,9 +248,10 @@ radius makes FORWARD and BACKWARD unreachable while turning stays easy. Each
 axis is normalised by its own radius and the direction test compares those
 normalised offsets, so "up" competes on equal terms with "sideways".
 
-Both are on **sliders in the Gaze panel**, live while driving. This is the one
-number that has to be tuned by feel, so it should not need a config edit and a
-relaunch. The overlay redraws immediately so you can see what you just did.
+Both are on **sliders in the Gaze panel**, live while driving, together with
+`head_weight`. These are the numbers that have to be tuned by feel, so they
+should not need a config edit and a relaunch. The overlay redraws immediately
+so you can see what you just did.
 
 ---
 
@@ -316,8 +336,12 @@ wrong, because it looks right.
 | Nothing moves but gaze is live | wrong control mode | Select mode **2 Gaze** (or **4** for fusion) |
 | Robot jitters | deadzone too small | Raise `deadzone_ratio` |
 | Turning is easy, forward is not | vertical deadzone too wide | Lower `deadzone_radius_ratio_y` |
+| **Up and down does nothing at all** | `head_weight` too low — iris-only vertical is noise | Raise the **Head** slider |
+| Have to strain your eyes to reach a zone | not enough head contribution | Raise the **Head** slider |
+| Everything moves when you shift in your seat | too much head contribution | Lower the **Head** slider, then recalibrate |
 | Head sweeps to a limit and stops | servo running in rate mode | Check `servo_pan_span` / `servo_smoothing` |
 | Head moves the wrong way | axis inverted | `invert_pan` / `invert_tilt` |
+| A calibration dot disappears | bar overlapping the dot area | Fixed — see `scripts/test_gaze_calib_layout.py` |
 
 ### Checking the camera is free
 
