@@ -21,7 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'src'
 
 from gaze_calib import (GAIN_MAX, GAIN_MIN, NEUTRAL, apply, fit)  # noqa: E402
 
-FAST = [(0.50, 0.15), (0.85, 0.50), (0.50, 0.85), (0.15, 0.50)]
+FAST = [(0.50, 0.50), (0.50, 0.15), (0.85, 0.50),
+        (0.50, 0.85), (0.15, 0.50)]
 LONG = [(0.15, 0.15), (0.50, 0.15), (0.85, 0.15),
         (0.15, 0.50), (0.50, 0.50), (0.85, 0.50),
         (0.15, 0.85), (0.50, 0.85), (0.85, 0.85)]
@@ -65,7 +66,7 @@ def main():
               f'got {tuple(round(v, 4) for v in got)}')
 
     # ---- 3. a dead tracker must not explode --------------------------------
-    dead = [(0.50, 0.50)] * 4
+    dead = [(0.50, 0.50)] * len(FAST)
     got = fit(dead, FAST)
     check('dead tracker is refused, not amplified',
           all(abs(a - b) < 1e-9 for a, b in zip(got, NEUTRAL)),

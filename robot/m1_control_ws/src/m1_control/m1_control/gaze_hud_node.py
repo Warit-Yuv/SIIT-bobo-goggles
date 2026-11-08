@@ -32,6 +32,7 @@ Run on the PC:
 """
 
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -72,12 +73,20 @@ class GazeHUDNode(Node):
         self.declare_parameter('gaze_source', 'mediapipe')
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('dwell_time_sec', 0.40)
-        self.declare_parameter('deadzone_radius_ratio', 0.25)
-        # Vertical deadzone, separately. The eye moves much further sideways
-        # than up and down, so a circular deadzone makes FORWARD/BACKWARD the
-        # hardest thing to reach while turning is easy. A smaller vertical
-        # radius makes the two directions equally attainable.
-        self.declare_parameter('deadzone_radius_ratio_y', 0.14)
+        # Deadzone radii, as a FRACTION OF THE CONTROL SPACE, not of a camera
+        # frame. 0.30 means "you may look 30% of the width either side of
+        # centre before the robot moves". Both are radii, so the oval spans
+        # 2x these numbers across the whole space.
+        #
+        # The previous code multiplied by an extra 0.5, which silently halved
+        # both radii: a deadzone that should have covered 50% of the width
+        # covered 25%. That is why it felt far too small to be useful.
+        self.declare_parameter('deadzone_radius_ratio', 0.30)
+        # Vertical is deliberately much smaller than horizontal. The eye
+        # travels roughly 2.5x further sideways than up and down, so an equal
+        # radius makes FORWARD and BACKWARD unreachable while turning stays
+        # easy - which is exactly the complaint that drove this change.
+        self.declare_parameter('deadzone_radius_ratio_y', 0.16)
 
         self.declare_parameter('drive_speed_x', 0.20)
         self.declare_parameter('drive_speed_y', 0.20)
@@ -98,6 +107,10 @@ class GazeHUDNode(Node):
         # and for keeping the raw value inside 0..1.
         self.declare_parameter('iris_gain_h', 3.0)
         self.declare_parameter('iris_gain_v', 3.0)
+        # Low-pass on the raw gaze, 0..1. Tracker noise is what makes a zone
+        # flicker on and off, and a flickering zone reads as "it does not
+        # work" even when the logic is correct. Higher = steadier but laggier.
+        self.declare_parameter('gaze_smoothing', 0.55)
         # Publish the operator's face so the console can show it. Small and
         # slow on purpose: it travels over the same Wi-Fi as the video feed.
         self.declare_parameter('publish_face', True)
@@ -142,6 +155,8 @@ class GazeHUDNode(Node):
                                              0.01, 1.0))
         self.iris_gain_h = float(gp('iris_gain_h').value)
         self.iris_gain_v = float(gp('iris_gain_v').value)
+        self.gaze_smoothing = float(np.clip(gp('gaze_smoothing').value,
+                                            0.0, 0.95))
         self.publish_face = bool(gp('publish_face').value)
         self.face_period = 1.0 / max(0.5, float(gp('face_publish_hz').value))
         self.face_size = int(gp('face_size').value)
@@ -190,6 +205,13 @@ class GazeHUDNode(Node):
         self.gaze_u = 0.5
         self.gaze_v = 0.5
         self.gaze_valid = False
+        # Smoothed copies, which is what the rest of the node uses. Raw is
+        # kept for /gaze/raw so calibration is not biased by the filter.
+        self.smooth_u = 0.5
+        self.smooth_v = 0.5
+        self._hist_u = deque(maxlen=5)
+        self._hist_v = deque(maxlen=5)
+        self._was_valid = False
         self.mouse_click = None
         self._window_ready = False
         self._saw_visible = False
@@ -246,6 +268,15 @@ class GazeHUDNode(Node):
         self.zone_pub = self.create_publisher(String, '/gaze/zone', 10)
         self.face_pub = self.create_publisher(
             CompressedImage, '/gaze/face', sensor_qos)
+        # The deadzone is the one number the operator has to tune by feel, so
+        # it is adjustable while driving instead of needing a relaunch. The
+        # console sends it here; the HUD echoes it back on the _state topic so
+        # the console's sliders show what is actually in force.
+        self.deadzone_state_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/deadzone_state', 10)
+        self.create_subscription(Float32MultiArray, '/gaze/deadzone',
+                                 self._deadzone_cb, 10)
+        self.create_timer(1.0, self._report_deadzone)
 
         self.create_subscription(CompressedImage, self.camera_topic,
                                  self.image_cb, sensor_qos)
@@ -312,6 +343,66 @@ class GazeHUDNode(Node):
     def _report_calib(self):
         self.calib_state_pub.publish(
             Float32MultiArray(data=[float(v) for v in self._calib]))
+
+    def _deadzone_cb(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        if len(data) < 2:
+            self.get_logger().warn(
+                f'/gaze/deadzone needs [rx, ry], got {len(data)}')
+            return
+        # Clamped: a deadzone at 0 would drive on tracker noise alone, and one
+        # at 0.5 would cover the whole space and never drive at all.
+        self.deadzone_ratio = float(np.clip(data[0], 0.02, 0.48))
+        self.deadzone_ratio_y = float(np.clip(data[1], 0.02, 0.48))
+        self._report_deadzone()
+
+    def _report_deadzone(self):
+        self.deadzone_state_pub.publish(
+            Float32MultiArray(data=[float(self.deadzone_ratio),
+                                    float(self.deadzone_ratio_y)]))
+
+    def _smooth(self, target_u, target_v):
+        """Median-of-5, then a fixed low-pass.
+
+        Tracker noise is not symmetric: most frames are close to the truth and
+        the occasional frame is wildly wrong - the iris ring is estimated, and
+        a blink, an eyelash or a specular highlight moves it by a large amount
+        in one frame and back again in the next. A plain low-pass cannot
+        remove that without also making every real eye movement lag, and an
+        adaptive low-pass that opens up for big steps lets exactly the wrong
+        thing through.
+
+        A median rejects up to two bad frames out of five no matter HOW wrong
+        they are, and it costs a couple of frames of latency, which is nothing
+        next to the 0.4 s dwell. The low-pass then takes the remaining
+        frame-to-frame wobble off.
+
+        This matters because a zone that flickers on and off for one frame
+        reads to the operator as "it does not work", even when the dwell logic
+        is correct.
+        """
+        self._hist_u.append(target_u)
+        self._hist_v.append(target_v)
+        mu = float(np.median(self._hist_u))
+        mv = float(np.median(self._hist_v))
+        a = 1.0 - self.gaze_smoothing
+        self.smooth_u += a * (mu - self.smooth_u)
+        self.smooth_v += a * (mv - self.smooth_v)
+        return self.smooth_u, self.smooth_v
+
+    def _reset_smooth(self, u, v):
+        """Start the filters from a known point.
+
+        Without this, resuming after a lost face would drag the median through
+        five frames of wherever the eyes were when tracking stopped, which
+        looks like the aim sliding across the screen on its own.
+        """
+        self._hist_u.clear()
+        self._hist_v.clear()
+        for _ in range(5):
+            self._hist_u.append(u)
+            self._hist_v.append(v)
+        self.smooth_u, self.smooth_v = float(u), float(v)
 
     def _correct(self, u, v):
         """Raw tracker output -> the point the operator actually meant.
@@ -516,24 +607,40 @@ class GazeHUDNode(Node):
         # individual source callbacks so every source - mediapipe, mouse or
         # external - produces the same /gaze/raw, and the console never has to
         # know which one is running.
+        #
+        # RAW, not smoothed: the calibration fits a line through these samples,
+        # and filtering first would bias the fit toward wherever the eyes had
+        # been resting.
         raw = Point()
         raw.x = float(self.gaze_u)
         raw.y = float(self.gaze_v)
         raw.z = 1.0 if self.gaze_valid else 0.0
         self.raw_pub.publish(raw)
 
+        # Everything that decides whether to drive uses the SMOOTHED point.
+        if not self.gaze_valid:
+            self._was_valid = False
+            su, sv = self.smooth_u, self.smooth_v
+        else:
+            if not self._was_valid:
+                # First good frame after a gap: start from here rather than
+                # sliding in from wherever the eyes were when tracking stopped.
+                self._reset_smooth(self.gaze_u, self.gaze_v)
+                self._was_valid = True
+            su, sv = self._smooth(self.gaze_u, self.gaze_v)
+
         # Apply the calibration for the mediapipe source only. Mouse gaze is
         # already in the frame the operator is pointing at, and the external
         # source has been corrected upstream by gaze_udp_bridge - correcting
         # either of those again would shift them for no reason.
         if self.gaze_source == 'mediapipe':
-            cu, cv = self._correct(self.gaze_u, self.gaze_v)
+            cu, cv = self._correct(su, sv)
             pt = Point()
             pt.x, pt.y = float(cu), float(cv)
             pt.z = 0.0
             self.point_pub.publish(pt)
         else:
-            cu, cv = self.gaze_u, self.gaze_v
+            cu, cv = su, sv
 
         frame = self.frame
         if frame is None:
@@ -541,9 +648,11 @@ class GazeHUDNode(Node):
 
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
-        # Oval deadzone, in pixels, for drawing and for the pixel offsets below.
-        dz_rx = int(w * self.deadzone_ratio * 0.5)
-        dz_ry = int(h * self.deadzone_ratio_y * 0.5)
+        # Oval deadzone in pixels. The ratios are already radii as a fraction
+        # of the control space, so there is no further halving: multiplying by
+        # 0.5 here is what made the deadzone half the size it claimed to be.
+        dz_rx = max(4.0, w * self.deadzone_ratio)
+        dz_ry = max(4.0, h * self.deadzone_ratio_y)
 
         # Mouse gaze: convert the last click into normalized coordinates.
         if self.gaze_source == 'mouse' and self.mouse_click is not None:
@@ -624,7 +733,7 @@ class GazeHUDNode(Node):
 
         # ---- HUD ----
         overlay = frame.copy()
-        cv2.ellipse(overlay, (cx, cy), (dz_rx, dz_ry), 0, 0, 360,
+        cv2.ellipse(overlay, (cx, cy), (int(dz_rx), int(dz_ry)), 0, 0, 360,
                     (0, 200, 0), 2)
         cv2.line(overlay, (cx - 12, cy), (cx + 12, cy), (0, 200, 0), 1)
         cv2.line(overlay, (cx, cy - 12), (cx, cy + 12), (0, 200, 0), 1)
@@ -659,7 +768,7 @@ class GazeHUDNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
         if not self.gaze_valid:
-            cv2.putText(overlay, 'NO GAZE', (cx - 60, cy - dz_ry - 14),
+            cv2.putText(overlay, 'NO GAZE', (cx - 60, int(cy - dz_ry - 14)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
         if now - self._fps_t >= 1.0:

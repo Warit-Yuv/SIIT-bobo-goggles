@@ -198,11 +198,12 @@ class ConsoleNode(Node):
         self.declare_parameter('servo_s2_min', 80.0)
         self.declare_parameter('servo_s2_max', 100.0)
         self.declare_parameter('servo_step', 4.0)
-        # Gaze overlay geometry. These MUST match the HUD's own deadzone, or
-        # the picture the operator sees would disagree with the zones the robot
-        # actually uses - the worst kind of wrong, because it looks right.
-        self.declare_parameter('deadzone_radius_ratio', 0.25)
-        self.declare_parameter('deadzone_radius_ratio_y', 0.14)
+        # Gaze overlay geometry, as a FRACTION OF THE CONTROL SPACE (a radius,
+        # not a diameter). These MUST match the HUD's, or the picture the
+        # operator sees would disagree with the zones the robot actually uses -
+        # the worst kind of wrong, because it looks right.
+        self.declare_parameter('deadzone_radius_ratio', 0.30)
+        self.declare_parameter('deadzone_radius_ratio_y', 0.16)
 
         gp = self.get_parameter
         self.robot_ip = gp('robot_ip').value
@@ -249,6 +250,8 @@ class ConsoleNode(Node):
             Bool, '/audio/robot_speaker', 10)
         self.calib_pub = self.create_publisher(
             Float32MultiArray, '/gaze/calib', 10)
+        self.deadzone_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/deadzone', 10)
 
         self.create_subscription(UInt8, '/control_mode_state',
                                  lambda m: self._set('mode', int(m.data)),
@@ -262,6 +265,8 @@ class ConsoleNode(Node):
                                  lambda m: self._set('audio', m.data), 10)
         self.create_subscription(Float32MultiArray, '/gaze/calib_state',
                                  self._calib_state_cb, 10)
+        self.create_subscription(Float32MultiArray, '/gaze/deadzone_state',
+                                 self._deadzone_state_cb, 10)
         self.create_subscription(Point, '/gaze/raw', self._raw_cb, 10)
         self.create_subscription(CompressedImage, '/image_throttled/compressed',
                                  self._image_cb, sensor_qos)
@@ -321,6 +326,17 @@ class ConsoleNode(Node):
     def _calib_state_cb(self, msg):
         if len(msg.data) >= 4:
             self._set('calib', [float(v) for v in msg.data[:4]])
+
+    def _deadzone_state_cb(self, msg):
+        """Adopt whatever the HUD is actually using.
+
+        The sliders publish a request; this is the confirmation. Adopting it
+        keeps the overlay honest even if the HUD clamps a value or the request
+        never arrived.
+        """
+        if len(msg.data) >= 2:
+            self.deadzone_ratio = float(msg.data[0])
+            self.deadzone_ratio_y = float(msg.data[1])
 
     def _raw_cb(self, msg):
         self._raw = (float(msg.x), float(msg.y), float(msg.z) > 0.5,
@@ -449,6 +465,18 @@ class ConsoleNode(Node):
         self.calib_pub.publish(
             Float32MultiArray(data=[float(ox), float(oy),
                                     float(gx), float(gy)]))
+
+    def set_deadzone(self, rx, ry):
+        """Ask the HUD for a new deadzone and adopt it locally straight away.
+
+        Adopting immediately rather than waiting for the echo keeps the
+        overlay responsive while the slider is being dragged; the echo on
+        /gaze/deadzone_state then corrects it if the HUD clamped the value.
+        """
+        rx = min(0.48, max(0.02, float(rx)))
+        ry = min(0.48, max(0.02, float(ry)))
+        self.deadzone_ratio, self.deadzone_ratio_y = rx, ry
+        self.deadzone_pub.publish(Float32MultiArray(data=[rx, ry]))
 
     def nudge_servo(self, d_tilt=0.0, d_pan=0.0):
         self.servo['s1'] = min(self.s1_max,
@@ -665,14 +693,17 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
 
 
 def make_gaze_overlay(QtCore, QtGui):
-    """Draws the gaze HUD onto the robot camera image.
+    """Draws the gaze control space onto the robot camera image.
 
-    Returns draw(pix, zone, raw, calib, dz_x, dz_y) -> pix.
+    Returns draw(pix, zone, raw, calib, dz_x, dz_y, show_debug) -> pix.
 
-    Same geometry as gaze_hud_node's own window: oval deadzone, raw point
-    hollow, corrected point filled and coloured by whether the chassis is
-    driving. The operator can then drive from this one window instead of
-    watching a second one beside it.
+    The picture is a faithful map of the CONTROL SPACE, not a claim about where
+    on the robot's view the operator is looking. The camera image is simply the
+    largest convenient rectangle to draw it in: the deadzone oval, the four
+    sectors, and the point the tracker thinks the operator is aiming at, all in
+    the same normalized coordinates the zones are actually computed from. So if
+    the dot is inside the oval, the chassis really is still; if it is up in the
+    top sector, the robot really is about to drive forward.
 
     The deadzone radii are passed in rather than read from anywhere, because
     the HUD and this drawing MUST use the same numbers. A picture that
@@ -682,23 +713,45 @@ def make_gaze_overlay(QtCore, QtGui):
     A factory rather than a widget so it can be exercised without a display.
     """
 
-    def draw(pix, zone, raw, calib, dz_x, dz_y):
+    def draw(pix, zone, raw, calib, dz_x, dz_y, show_debug=True):
         p = QtGui.QPainter(pix)
         try:
             p.setRenderHint(QtGui.QPainter.Antialiasing)
             w, h = pix.width(), pix.height()
             cx, cy = w / 2.0, h / 2.0
-            rx = w * dz_x * 0.5
-            ry = h * dz_y * 0.5
+            # The ratios ARE radii, as a fraction of the space. No extra
+            # halving: doing that is what silently made the deadzone half the
+            # size it was supposed to be.
+            rx = w * dz_x
+            ry = h * dz_y
 
+            # Quadrant lines: these are the actual zone boundaries, where the
+            # normalised offsets are compared, so a look straight up lands
+            # squarely in FORWARD rather than on a diagonal edge.
             p.setBrush(QtCore.Qt.NoBrush)
-            p.setPen(QtGui.QPen(QtGui.QColor(120, 120, 120, 110), 1,
+            p.setPen(QtGui.QPen(QtGui.QColor(150, 150, 150, 90), 1,
                                 QtCore.Qt.DashLine))
-            p.drawLine(QtCore.QPointF(0, cy), QtCore.QPointF(w, cy))
             p.drawLine(QtCore.QPointF(cx, 0), QtCore.QPointF(cx, h))
+            p.drawLine(QtCore.QPointF(0, cy), QtCore.QPointF(w, cy))
 
             p.setPen(QtGui.QPen(QtGui.QColor('#22c55e'), 2))
             p.drawEllipse(QtCore.QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry))
+
+            # Zone labels at the middle of each sector, so the operator can see
+            # where to look rather than having to infer it from the oval.
+            f = p.font()
+            f.setPointSizeF(max(7.0, min(11.0, w / 64.0)))
+            f.setBold(True)
+            p.setFont(f)
+            p.setPen(QtGui.QColor(160, 220, 180, 190))
+            mid = 0.5
+            for text, fx, fy in (('FWD', 0.0, -1.0), ('BACK', 0.0, 1.0),
+                                 ('LEFT', -1.0, 0.0), ('RIGHT', 1.0, 0.0)):
+                lx = cx + fx * rx * (1.0 + mid)
+                ly = cy + fy * ry * (1.0 + mid)
+                lx = min(max(lx, 16.0), w - 16.0)
+                ly = min(max(ly, 12.0), h - 6.0)
+                p.drawText(QtCore.QPointF(lx, ly), text)
 
             if raw is None:
                 p.setPen(QtGui.QColor('#f59e0b'))
@@ -716,10 +769,11 @@ def make_gaze_overlay(QtCore, QtGui):
             cu = min(1.0, max(0.0, (u - ox) * gx + 0.5))
             cv = min(1.0, max(0.0, (v - oy) * gy + 0.5))
 
-            # Raw, hollow: makes a calibration pulling hard visible at a glance.
-            p.setPen(QtGui.QPen(QtGui.QColor(150, 150, 150, 170), 1))
+            # Raw, hollow: makes a calibration pulling hard visible at a glance,
+            # and shows whether the raw signal even reaches the edges.
+            p.setPen(QtGui.QPen(QtGui.QColor(245, 158, 11, 190), 1))
             p.setBrush(QtCore.Qt.NoBrush)
-            p.drawEllipse(QtCore.QPointF(u * w, v * h), 9.0, 9.0)
+            p.drawEllipse(QtCore.QPointF(u * w, v * h), 8.0, 8.0)
 
             driving = (zone or 'CENTER') != 'CENTER'
             col = QtGui.QColor('#ef4444' if driving else '#22c55e')
@@ -727,10 +781,14 @@ def make_gaze_overlay(QtCore, QtGui):
             p.setBrush(col)
             p.drawEllipse(QtCore.QPointF(cu * w, cv * h), 5.0, 5.0)
             p.setBrush(QtCore.Qt.NoBrush)
-            p.drawEllipse(QtCore.QPointF(cu * w, cv * h), 12.0, 12.0)
+            p.drawEllipse(QtCore.QPointF(cu * w, cv * h), 13.0, 13.0)
 
-            p.setPen(col)
-            p.drawText(QtCore.QPointF(10, 22), 'ZONE: ' + (zone or '-'))
+            if show_debug:
+                p.setPen(col)
+                p.drawText(QtCore.QPointF(10, 22), 'ZONE: ' + (zone or '-'))
+                p.setPen(QtGui.QColor(150, 160, 170))
+                p.drawText(QtCore.QPointF(10, 38),
+                           'raw %.2f,%.2f  aim %.2f,%.2f' % (u, v, cu, cv))
             return pix
         finally:
             # A QPainter left active on a pixmap keeps painting on it and
@@ -969,32 +1027,36 @@ def make_map_view(QtCore, QtGui, QtWidgets):
 # ---------------------------------------------------------------------------
 
 class CalibDialog:
-    """Gaze calibration whose dots sit ON the camera image.
+    """Gaze calibration spread across the WHOLE screen.
 
-    The old version showed the dots in a 460x400 dialog in the middle of the
-    window. That cannot work. The gaze model is calibrated in the coordinates
-    of the camera picture, so a dot at u=0.15 has to be 15% across the CAMERA
-    IMAGE, not 15% across a small box that happens to be somewhere else on the
-    screen. Calibrating in the wrong rectangle teaches the model an offset and
-    a gain scaled by the ratio between the two rectangles - it does not merely
-    look wrong, it steers wrong.
+    Why the whole screen and not the video panel
+    --------------------------------------------
+    An eye tracker's raw signal is tiny. Iris position changes by a few
+    thousandths of a frame between looking at the middle of a screen and
+    looking at its edge. The fit recovers `gain` by dividing that small change
+    into a large target change, so the smaller the calibration area, the more
+    the gain has to multiply - and the more it multiplies the tracker's noise
+    along with the signal.
 
-    So this is a frameless overlay the size of the main window. It dims
-    everything except the camera image and draws each dot at its exact
-    position inside that image. What you look at is what you drive.
+    Calibrating inside the video panel meant asking for eye movement across a
+    few square centimetres. Every sample landed within a hair of every other,
+    the gain was either clamped or meaningless, and the zones were unreachable.
+    That is what "it does not work, it needs the whole screen" was describing.
 
-    Two profiles, after the reference implementation (GazeModel):
+    Dots now sit at 10% and 90% of the window in each direction, so the eyes
+    travel as far as they comfortably can and the fit has real signal.
 
-      fast  4 dots - top, right, bottom, left. About 8 s.
-            A re-alignment. It recovers offset and gain on both axes, which
-            is exactly the four numbers this robot uses, so it is a complete
-            calibration and not an approximation of one. Use it after you
-            have shifted in your seat.
+    Profiles
+    --------
+      fast  5 dots - centre, top, right, bottom, left. About 10 s.
+            A re-alignment. It recovers offset and gain on both axes, which is
+            exactly the four numbers this robot uses. Use it after shifting in
+            your seat.
 
       long  9 dots - a 3x3 grid. About 30 s.
-            The same four numbers, but sampled across the middle of the range
-            as well, so the fit is not extrapolated from the edges alone and
-            one bad sample cannot swing it.
+            The same four numbers, sampled across the middle as well, so the
+            fit is not extrapolated from the edges alone and one bad dot can be
+            detected and dropped.
 
     The model, per axis:   corrected = (raw - offset) * gain + 0.5
     Fitting a line  target = gain * raw + b  across the dots, then
@@ -1009,25 +1071,25 @@ class CalibDialog:
             'settle': 0.9, 'sample': 1.0,
             'dots': [
                 ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot, keep your head still'),
-                ('TOP', 0.50, 0.15, 'Look at the TOP dot, keep your head still'),
-                ('RIGHT', 0.85, 0.50, 'Look at the RIGHT dot, keep your head still'),
-                ('BOTTOM', 0.50, 0.85, 'Look at the BOTTOM dot, keep your head still'),
-                ('LEFT', 0.15, 0.50, 'Look at the LEFT dot, keep your head still'),
+                ('TOP', 0.50, 0.10, 'Look at the TOP dot, keep your head still'),
+                ('RIGHT', 0.90, 0.50, 'Look at the RIGHT dot, keep your head still'),
+                ('BOTTOM', 0.50, 0.90, 'Look at the BOTTOM dot, keep your head still'),
+                ('LEFT', 0.10, 0.50, 'Look at the LEFT dot, keep your head still'),
             ],
         },
         'long': {
             'label': 'Long · 9 dots · ~30 s',
             'settle': 1.0, 'sample': 1.3,
             'dots': [
-                ('top-left', 0.15, 0.15, 'Look at the TOP-LEFT dot'),
-                ('top', 0.50, 0.15, 'Look at the TOP dot'),
-                ('top-right', 0.85, 0.15, 'Look at the TOP-RIGHT dot'),
-                ('left', 0.15, 0.50, 'Look at the LEFT dot'),
+                ('top-left', 0.10, 0.10, 'Look at the TOP-LEFT dot'),
+                ('top', 0.50, 0.10, 'Look at the TOP dot'),
+                ('top-right', 0.90, 0.10, 'Look at the TOP-RIGHT dot'),
+                ('left', 0.10, 0.50, 'Look at the LEFT dot'),
                 ('centre', 0.50, 0.50, 'Look at the CENTRE dot'),
-                ('right', 0.85, 0.50, 'Look at the RIGHT dot'),
-                ('bottom-left', 0.15, 0.85, 'Look at the BOTTOM-LEFT dot'),
-                ('bottom', 0.50, 0.85, 'Look at the BOTTOM dot'),
-                ('bottom-right', 0.85, 0.85, 'Look at the BOTTOM-RIGHT dot'),
+                ('right', 0.90, 0.50, 'Look at the RIGHT dot'),
+                ('bottom-left', 0.10, 0.90, 'Look at the BOTTOM-LEFT dot'),
+                ('bottom', 0.50, 0.90, 'Look at the BOTTOM dot'),
+                ('bottom-right', 0.90, 0.90, 'Look at the BOTTOM-RIGHT dot'),
             ],
         },
     }
@@ -1040,13 +1102,29 @@ class CalibDialog:
     def build(cls, QtCore, QtGui, QtWidgets):
         class _Dialog(QtWidgets.QDialog):
 
-            def __init__(self, node, cam_rect, parent=None):
+            def __init__(self, node, area_rect, parent=None):
                 super().__init__(parent)
                 self.node = node
-                # GLOBAL screen rect of the camera picture. Everything is
-                # positioned relative to this, which is the whole point.
-                self.cam = QtCore.QRect(cam_rect)
+                # GLOBAL screen rect of the calibration area - the WHOLE
+                # console window, which is maximised, so in practice the whole
+                # screen.
+                #
+                # It used to be the camera picture, which is only a few hundred
+                # pixels wide inside the window. Calibrating in that rectangle
+                # asked the operator to move their eyes across a few square
+                # centimetres, so every raw sample landed within a hair of every
+                # other and the fit had almost no signal to work with. The
+                # resulting gain was near-useless and the whole thing felt like
+                # it "did not work".
+                #
+                # Spread across the full screen, the same eye movement produces
+                # a far larger signal, which is what makes the gain - and so the
+                # reach of the zones - meaningful.
+                self.area = QtCore.QRect(area_rect)
                 self.profile = 'fast'
+                # Deadzone proportions, so the preview oval matches the robot.
+                self.dz_x = float(node.deadzone_ratio)
+                self.dz_y = float(node.deadzone_ratio_y)
                 self.result_calib = None
                 self.idx = -1
                 self.phase = 'idle'
@@ -1089,9 +1167,10 @@ class CalibDialog:
                 bv.addWidget(self.lbl)
 
                 self.hint = QtWidgets.QLabel(
-                    'The dots appear inside the camera picture, so where you '
-                    'look is exactly where the robot thinks you are looking.\n'
-                    'Look at each dot and hold your head still.')
+                    'The dots spread across the WHOLE screen. Follow each one '
+                    'with your eyes and hold your head still.\n'
+                    'A wide calibration is what makes the outer zones '
+                    'reachable later.')
                 self.hint.setObjectName('dim')
                 self.hint.setAlignment(QtCore.Qt.AlignCenter)
                 self.hint.setWordWrap(True)
@@ -1142,26 +1221,34 @@ class CalibDialog:
                 p.setRenderHint(QtGui.QPainter.Antialiasing)
 
                 full = QtCore.QRect(0, 0, self.width(), self.height())
-                cam = QtCore.QRect(self.cam)
-                cam.moveTopLeft(self.mapFromGlobal(cam.topLeft()))
+                area = QtCore.QRect(self.area)
+                area.moveTopLeft(self.mapFromGlobal(area.topLeft()))
 
-                # Dim everything EXCEPT the camera picture. The operator keeps
-                # seeing the view they drive with, at exactly the right place
-                # and size, with no dialog covering it.
-                path = QtGui.QPainterPath()
-                path.addRect(QtCore.QRectF(full))
-                path.addRect(QtCore.QRectF(cam))
-                path.setFillRule(QtCore.Qt.OddEvenFill)
-                p.fillPath(path, QtGui.QColor(6, 8, 11, 208))
+                # Dim the whole window, then lift the calibration area back to
+                # full brightness. The operator keeps seeing the view they
+                # drive with while the dots are on top of it.
+                p.fillRect(full, QtGui.QColor(6, 8, 11, 150))
 
                 p.setPen(QtGui.QPen(QtGui.QColor('#3b82f6'), 2))
-                p.drawRect(cam.adjusted(1, 1, -1, -1))
+                p.drawRect(area.adjusted(1, 1, -1, -1))
+
+                # Where the deadzone will sit, drawn as a dashed oval so the
+                # operator can see before starting how far they will have to
+                # look to drive. Same proportions the robot will use.
+                cx = area.left() + area.width() * 0.5
+                cy = area.top() + area.height() * 0.5
+                rx = area.width() * self.dz_x
+                ry = area.height() * self.dz_y
+                p.setPen(QtGui.QPen(QtGui.QColor(34, 197, 94, 130), 2,
+                                    QtCore.Qt.DashLine))
+                p.setBrush(QtCore.Qt.NoBrush)
+                p.drawEllipse(QtCore.QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry))
 
                 if self.u is None:
                     return
 
-                c = QtCore.QPointF(cam.left() + cam.width() * self.u,
-                                   cam.top() + cam.height() * self.v)
+                c = QtCore.QPointF(area.left() + area.width() * self.u,
+                                   area.top() + area.height() * self.v)
                 p.setPen(QtCore.Qt.NoPen)
                 p.setBrush(QtGui.QColor(37, 99, 235, 70))
                 p.drawEllipse(c, 26, 26)
@@ -1361,7 +1448,6 @@ def main(args=None):
             self.audio_on = False
             self._last_jpeg = None
             self._last_face = None
-            self._cam_px = None
             self._map_sig = None
             self._link_busy = False
 
@@ -1497,7 +1583,7 @@ def main(args=None):
                 b = QtWidgets.QPushButton(label)
                 b.setObjectName('mode')
                 b.setCheckable(True)
-                b.clicked.connect(lambda _c, m=mode: node.set_mode(m))
+                b.clicked.connect(lambda _c, m=mode: self._choose_mode(m))
                 gm.addWidget(b, i // 2, i % 2)
                 self.mode_buttons[mode] = b
             self.btn_estop = QtWidgets.QPushButton('■  EMERGENCY STOP')
@@ -1761,23 +1847,57 @@ def main(args=None):
             self.btn_calib_reset = QtWidgets.QPushButton('Reset')
             self.btn_calib_reset.clicked.connect(self._reset_calibration)
             row.addWidget(self.btn_calib_reset)
-            # Draw the gaze HUD on the robot camera image, so the operator can
-            # drive from one window instead of watching a separate HUD next to
-            # it. Off by default: the raw view is what you want when something
-            # is wrong.
+            gv.addLayout(row)
+
+            # Its own row, full width: this is the control that makes gaze mode
+            # readable at all, so it must not be a small button squeezed in
+            # beside two others. Turns itself on when a gaze mode is selected.
             self.btn_overlay = QtWidgets.QPushButton('Overlay')
             self.btn_overlay.setObjectName('toggle')
             self.btn_overlay.setCheckable(True)
             self.btn_overlay.setToolTip(
-                'Draw the gaze point, deadzone and zone on the camera image.')
+                'Draw the gaze deadzone, zones and aim point on the camera '
+                'image. On by default in gaze mode: without it you cannot '
+                'tell where the computer thinks you are looking.')
             self.btn_overlay.toggled.connect(self._toggle_overlay)
-            row.addWidget(self.btn_overlay)
-            gv.addLayout(row)
+            gv.addWidget(self.btn_overlay)
 
             self.lbl_calib = QtWidgets.QLabel('offset —  gain —')
             self.lbl_calib.setObjectName('mono')
             self.lbl_calib.setAlignment(QtCore.Qt.AlignCenter)
             gv.addWidget(self.lbl_calib)
+
+            # -- deadzone, adjustable while driving ------------------------
+            # This is the one number that has to be tuned by feel, so it is a
+            # slider rather than a config file. A deadzone that is too small
+            # drives on tracker noise; too large and nothing is reachable.
+            # Horizontal and vertical are separate because the eye travels
+            # roughly 2.5x further sideways than up and down.
+            self.sld_dzx = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_dzx.setRange(4, 48)          # percent of width, radius
+            self.sld_dzx.setToolTip(
+                'Horizontal deadzone, as a percentage of the screen width '
+                'either side of centre. Bigger = you must look further before '
+                'it turns.')
+            gv.addWidget(self._labelled('Deadzone  ↔', self.sld_dzx))
+
+            self.sld_dzy = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.sld_dzy.setRange(4, 48)          # percent of height, radius
+            self.sld_dzy.setToolTip(
+                'Vertical deadzone, as a percentage of the screen height. Keep '
+                'this SMALLER than the horizontal one: the eye cannot travel '
+                'as far up and down, so an equal setting makes forward and '
+                'backward almost unreachable.')
+            gv.addWidget(self._labelled('Deadzone  ↕', self.sld_dzy))
+
+            # Set the starting positions BEFORE connecting: setValue() emits
+            # valueChanged, and the handler reads BOTH sliders, so connecting
+            # first would fire it while the second one does not exist yet.
+            self.sld_dzx.setValue(int(round(node.deadzone_ratio * 100)))
+            self.sld_dzy.setValue(int(round(node.deadzone_ratio_y * 100)))
+            self.sld_dzx.valueChanged.connect(self._deadzone_changed)
+            self.sld_dzy.valueChanged.connect(self._deadzone_changed)
+
             v.addWidget(g)
 
             # -- map ------------------------------------------------------
@@ -1978,6 +2098,35 @@ def main(args=None):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
 
+        def _labelled(self, text, widget):
+            """A slider with its name to the left, in one row."""
+            row = QtWidgets.QHBoxLayout()
+            row.setSpacing(6)
+            lbl = QtWidgets.QLabel(text)
+            lbl.setObjectName('dim')
+            lbl.setFixedWidth(84)
+            row.addWidget(lbl)
+            row.addWidget(widget, 1)
+            box = QtWidgets.QWidget()
+            box.setLayout(row)
+            box.setFixedHeight(24)
+            return box
+
+        def _deadzone_changed(self, _v):
+            node.set_deadzone(self.sld_dzx.value() / 100.0,
+                              self.sld_dzy.value() / 100.0)
+            # Redraw immediately: the overlay is the only feedback that tells
+            # the operator what the new deadzone actually looks like.
+            self._last_jpeg = None
+
+        def _choose_mode(self, mode):
+            node.set_mode(mode)
+            # Gaze modes: show the overlay without being asked. The whole point
+            # of gaze control is knowing where the computer thinks you are
+            # looking, and that is unreadable unless it is drawn.
+            if mode in (2, 4) and not self.btn_overlay.isChecked():
+                self.btn_overlay.setChecked(True)
+
         def _toggle_audio(self):
             """Enable audio and start/stop the operator-side relay.
 
@@ -2131,31 +2280,15 @@ def main(args=None):
             return pids
 
         # ---------------------------------------------------------- calibration
-        def camera_image_rect(self):
-            """Where the camera picture is actually drawn, in window coordinates.
-
-            The label is larger than the image: KeepAspectRatio letterboxes,
-            so the picture is centred inside the label with dark bars on two
-            sides. Gaze calibration must use the picture rect, not the label
-            rect - using the label rect stretches the calibration by the ratio
-            between them, and a 4:3 image in a wide label is a big ratio.
-            """
-            lbl = self.lbl_cam
-            r = QtCore.QRect(lbl.mapTo(self, QtCore.QPoint(0, 0)), lbl.size())
-            if self._cam_px:
-                w, h = self._cam_px
-                if 0 < w <= r.width() and 0 < h <= r.height():
-                    return QtCore.QRect(r.x() + (r.width() - w) // 2,
-                                        r.y() + (r.height() - h) // 2, w, h)
-            return r
-
         def _calibrate(self):
-            # Hand the overlay the GLOBAL rect of the picture: a parented
-            # QDialog is still a top-level window, so its geometry is in
-            # screen coordinates and this is what makes the dots line up.
-            cam = self.camera_image_rect()
-            cam.moveTopLeft(self.mapToGlobal(cam.topLeft()))
-            dlg = CalibDialogCls(node, cam, self)
+            # The WHOLE window, not the camera picture. Calibrating inside the
+            # few hundred pixels of the video panel asks for eye movements so
+            # small that the fit has almost no signal; spread across the screen
+            # the same movement is many times larger and the gain means
+            # something. See CalibDialog's docstring.
+            area = QtCore.QRect(self.mapToGlobal(QtCore.QPoint(0, 0)),
+                                self.size())
+            dlg = CalibDialogCls(node, area, self)
             if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_calib:
                 ox, oy, gx, gy = dlg.result_calib
                 node.set_calibration(ox, oy, gx, gy)
@@ -2355,7 +2488,11 @@ def main(args=None):
             text = event.text().lower()
 
             if text in MODE_KEYS:
-                node.set_mode(MODE_KEYS[text])
+                # Through _choose_mode, not node.set_mode: selecting a gaze
+                # mode must also turn the overlay on, or the operator gets a
+                # mode they cannot see. Doing it in two places is how the two
+                # paths drifted apart before.
+                self._choose_mode(MODE_KEYS[text])
                 return
             if key == QtCore.Qt.Key_Space:
                 self._estop()
@@ -2457,11 +2594,6 @@ def main(args=None):
                     if self.btn_overlay.isChecked():
                         scaled = self._overlay_camera(scaled, s)
                     self.lbl_cam.setPixmap(scaled)
-                    # Remember the size the picture was actually drawn at.
-                    # KeepAspectRatio letterboxes inside the label, so the
-                    # label rect and the image rect are not the same thing,
-                    # and gaze calibration has to use the IMAGE rect.
-                    self._cam_px = (scaled.width(), scaled.height())
             elif jpeg is None:
                 self.lbl_cam.setText('waiting for /image_throttled/compressed…')
 

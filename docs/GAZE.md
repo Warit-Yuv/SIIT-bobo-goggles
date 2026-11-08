@@ -144,11 +144,19 @@ many dots are used to fit them.
 | **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
 | **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
 
-The dots are drawn **inside the robot camera image**, not in a separate box.
-The tracker works in camera-image coordinates, so a dot at `u=0.15` has to be
-15% across that image — anywhere else and the fit learns a gain scaled by the
-ratio between the two rectangles. It does not merely look wrong; it steers
-wrong.
+The dots spread across the **whole screen**, at 10% and 90% in each direction.
+
+This matters more than it sounds. An eye tracker's raw signal is tiny: the iris
+moves by a few thousandths of a frame between looking at the middle of a screen
+and looking at its edge. The fit recovers `gain` by dividing that small change
+into a large target change, so the smaller the calibration area, the more the
+gain has to multiply — and it multiplies the tracker's noise along with the
+signal.
+
+> Calibrating inside the video panel asked for eye movement across a few square
+> centimetres. Every sample landed within a hair of every other, the gain came
+> back clamped or meaningless, and the outer zones were unreachable. That is
+> what "it needs the whole screen to be effective" was describing.
 
 The console fits:
 
@@ -203,19 +211,27 @@ The **deadzone** exists so that looking around does not drive the robot. The
 one zone for 0.4 s rejects the natural jitter that would otherwise cause
 constant false commands.
 
-### The deadzone is an oval, not a circle
+### The deadzone is an oval, and it is tunable
 
 ```
-deadzone_radius_ratio    0.25    horizontal
- deadzone_radius_ratio_y  0.14    vertical
+deadzone_radius_ratio    0.30    horizontal, fraction of width
+deadzone_radius_ratio_y  0.16    vertical,   fraction of height
 ```
 
-The eye travels much further sideways than up and down. With a circular
-deadzone sized for comfortable turning, FORWARD and BACKWARD were almost
-unreachable — the operator could turn easily but could not get far enough above
-or below centre to drive. Each axis is now normalised by its own radius, and
-the direction test compares those normalised offsets, so "up" competes on equal
-terms with "sideways" instead of losing because the eye moves less that way.
+Both are **radii**, so 0.30 covers 60% of the width either side of centre.
+
+> These used to be multiplied by an extra 0.5 in the HUD, which silently halved
+> both. A deadzone that should have covered half the width covered a quarter.
+> That is why it felt far too small to be useful.
+
+The eye travels roughly 2.5x further sideways than up and down, so an equal
+radius makes FORWARD and BACKWARD unreachable while turning stays easy. Each
+axis is normalised by its own radius and the direction test compares those
+normalised offsets, so "up" competes on equal terms with "sideways".
+
+Both are on **sliders in the Gaze panel**, live while driving. This is the one
+number that has to be tuned by feel, so it should not need a config edit and a
+relaunch. The overlay redraws immediately so you can see what you just did.
 
 ---
 
@@ -238,6 +254,15 @@ where `fx` is the gaze offset as a fraction of the deadzone radius.
 
 A low-pass (`servo_smoothing`, default 0.25) then removes tracker jitter.
 
+Separately, the **gaze signal itself** is filtered before any of this: a
+median of the last five frames, then a low-pass. Tracker noise is not
+symmetric — most frames are close to the truth and the occasional frame is
+wildly wrong, because the iris ring is estimated and a blink or a specular
+highlight moves it a long way for one frame. A plain low-pass cannot remove
+that without making every real eye movement lag; a median rejects up to two
+bad frames out of five no matter how wrong they are. Measured: a one-frame
+spike to 0.99 from a steady 0.50 moves the aim by 0.000.
+
 **Axis order matters.** The arbiter reads `/servo/gaze` as `s1 = msg.x`
 (TILT, range 5–75) and `s2 = msg.y` (PAN, range 80–100). The HUD used to send
 pan in `.x`, so each axis was clamped to the *other* axis's limits — pan to
@@ -248,11 +273,24 @@ jerking.
 
 ## Driving from one window
 
-**5 · Gaze → Overlay** draws the gaze HUD onto the robot camera image in the
-main window: the oval deadzone, the raw point as a hollow ring, the corrected
-point filled and coloured by whether the chassis is driving, and the zone name.
+**5 · Gaze → Overlay** draws the control space onto the robot camera image in
+the main window:
 
-Off by default — the raw view is what you want when something is wrong.
+- the **oval deadzone**, in the same proportions the robot uses
+- the **four sectors** and their labels — FWD, BACK, LEFT, RIGHT
+- the **raw** point as a hollow amber ring
+- the **aim** point filled, green inside the deadzone and red while driving
+- a diagnostic line: `raw 0.62,0.55  aim 0.50,0.48`
+
+It turns itself on when a gaze mode (2 or 4) is selected, from the button or
+from the keyboard, because a gaze mode you cannot see is a mode you cannot
+drive.
+
+The picture is a map of the **control space**, not a claim about where on the
+robot's view you are looking. The camera image is just the largest convenient
+rectangle to draw it in, and it uses the same normalised coordinates the zones
+are computed from — so if the dot is inside the oval the chassis really is
+still, and if it is up in the top sector the robot really is about to drive.
 
 The face thumbnail beside the gaze plot is fed by `/gaze/face` at 5 Hz. If it
 says `no face`, the camera cannot see you and no amount of calibration will
