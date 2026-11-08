@@ -97,13 +97,58 @@ filter that works out where the robot is from the laser scan).
 
 ### After picking the robot up
 
+**Automatic — just run this:**
+
 ```bash
-./scripts/m1_map.sh relocalize 1.5 -0.5 0.0
-#                             x    y   yaw(rad)
+./scripts/m1_map.sh autolocalize
+```
+
+It takes the current laser scan, slides it over the saved map at every plausible
+position and heading (about 128 000 candidates), scores each by how well the scan
+lands on walls, and publishes the best as the initial pose. Takes about a second.
+
+It also reports **confidence**, which matters more than the answer itself:
+
+```
+  1. x= -1.605  y= +0.085  yaw= +350.0 deg   score 0.731
+  2. x= -1.505  y= +0.185  yaw= +340.0 deg   score 0.668
+  3. x= -1.605  y= +0.185  yaw= +340.0 deg   score 0.660
+
+confidence: best 0.731, runner-up 0.668, margin 0.062
+  GOOD: one placement is clearly better than the rest.
+```
+
+| Margin | Meaning |
+|---|---|
+| `GOOD` | One placement clearly wins — trust it |
+| `AMBIGUOUS` | Two places fit equally well (symmetric room) — add `--hint` |
+| `WEAK` | The scan doesn't fit anywhere — the room changed, or you're outside the map |
+
+Verified: AMCL converged from `(0, 0, 0)` to `(-1.596, 0.065)`, within 1 cm of
+the published pose.
+
+**Manual alternatives**, if you would rather place it yourself:
+
+```bash
+./scripts/m1_map.sh relocalize 1.5 -0.5 0.0     # x, y, yaw(rad)
+./scripts/m1_map.sh autolocalize --hint 1.5 -0.5   # search near a guess
 ```
 
 Or in RViz, click **2D Pose Estimate** (the toolbar arrow) and drag in the
 direction the robot faces.
+
+### Why the scoring normalises by total beams
+
+The first version averaged only over beams that landed *inside* the map, and
+every top candidate pinned itself to a map edge. A pose in the corner has a
+handful of beams inside; if those few graze a wall the average is near 1.0, while
+the correct pose — with every beam accounted for and a few legitimately missing
+due to map noise — scores lower. The confidence margin between first and second
+place was 0.002, which is noise.
+
+Counting out-of-map beams as zero match fixes it: a pose can only score high if
+it explains the whole scan, which is what being in the right place means. The
+margin went from 0.002 to 0.062.
 
 AMCL spreads particles around that guess, compares each particle's predicted
 scan against the real one, and converges on the true pose. The particle cloud

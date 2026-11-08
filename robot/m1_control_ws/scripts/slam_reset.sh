@@ -54,7 +54,7 @@ save_map() {
     echo "[slam_reset] saving map as $dir/$name"
     # The service writes <name>.pgm and <name>.yaml into the given directory.
     if ros2 service call /slam_toolbox/save_map \
-            nav_msgs/srv/SaveMap "{name: {data: '$dir/$name'}}" \
+            slam_toolbox/srv/SaveMap "{name: {data: '$dir/$name'}}" \
             >/tmp/slam_save.log 2>&1; then
         echo "[slam_reset] saved:"
         ls -1 "$dir/$name".* 2>/dev/null | sed 's/^/    /'

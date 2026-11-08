@@ -6,8 +6,8 @@
 #   ./m1_map.sh save NAME              save the current map to ~/maps/NAME
 #   ./m1_map.sh list                   list saved maps
 #   ./m1_map.sh localize NAME          localise against a saved map (AMCL)
+#   ./m1_map.sh autolocalize           FIND the robot automatically (no clicking)
 #   ./m1_map.sh relocalize X Y YAW     tell AMCL where the robot is
-#   ./m1_map.sh relocalize             same, but uses (0,0,0)
 #   ./m1_map.sh reset                  restart the mapper with an empty graph
 #   ./m1_map.sh status                 what is running, and where is the robot
 #   ./m1_map.sh stop                   stop whichever mode is running
@@ -115,7 +115,7 @@ cmd_save() {
     local target="$MAPS_DIR/$name"
 
     echo "[m1_map] saving to $target.{pgm,yaml}"
-    if ! ros2 service call /slam_toolbox/save_map nav_msgs/srv/SaveMap \
+    if ! ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
             "{name: {data: '$target'}}" >/tmp/m1_save.log 2>&1; then
         tail -5 /tmp/m1_save.log >&2
         die "save service call failed"
@@ -177,13 +177,25 @@ cmd_localize() {
     sleep 8
 
     if amcl_running; then
-        echo "[m1_map] AMCL up."
-        echo "  Give it a starting pose:  ./m1_map.sh relocalize X Y YAW"
-        echo "  or use RViz '2D Pose Estimate'."
+        echo "[m1_map] AMCL up, but it does not know where it is yet."
+        echo "  Find it automatically:   ./m1_map.sh autolocalize"
+        echo "  or give a rough pose:    ./m1_map.sh relocalize X Y YAW"
+        echo "  or click RViz '2D Pose Estimate'."
     else
         tail -15 /tmp/m1_amcl.log >&2
         die "AMCL failed to start"
     fi
+}
+
+cmd_autolocalize() {
+    need_ros
+    amcl_running || die "AMCL is not running - './m1_map.sh localize NAME' first"
+    local script
+    script="$(dirname "$0")/relocalize_auto.py"
+    [ -f "$script" ] || die "missing $script"
+    echo "[m1_map] searching the map for the robot's position"
+    echo "          (takes about a second, no clicking required)"
+    "$script" "$@"
 }
 
 cmd_relocalize() {
@@ -257,6 +269,7 @@ case "${1:-status}" in
     list)        cmd_list ;;
     localize)    shift; cmd_localize "${1:-}" ;;
     relocalize)  shift; cmd_relocalize "${1:-0}" "${2:-0}" "${3:-0}" ;;
+    autolocalize|auto) shift; cmd_autolocalize "$@" ;;
     reset)       cmd_reset ;;
     status)      cmd_status ;;
     stop)        cmd_stop ;;
@@ -265,7 +278,7 @@ case "${1:-status}" in
         ;;
     *)
         echo "unknown command: $1" >&2
-        echo "usage: $0 {start|save NAME|list|localize NAME|relocalize X Y YAW|reset|status|stop}" >&2
+        echo "usage: $0 {start|save NAME|list|localize NAME|autolocalize|relocalize X Y YAW|reset|status|stop}" >&2
         exit 2
         ;;
 esac
