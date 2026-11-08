@@ -6,10 +6,11 @@ control_arbiter_node:
     watchdog_timeout_sec: 0.35
     # Cap on what ANY source may command, not just the keyboard. Raised from
     # 0.25 because 0.25 m/s was slower than the operator wanted to drive. The
-    # console asks for 0.32; if this stayed at 0.25 the request would be
-    # clamped on arrival and the speed would not change at all - which is a
-    # silent failure, since the console has no way to see the clamp.
-    max_linear_x: 0.35
+    # console asks for 0.35, so the cap sits above it: setting the cap equal to
+    # the request would leave float rounding to decide whether the command is
+    # clamped. A cap that clamps without reporting is indistinguishable from
+    # the change not working, because the console cannot see the clamp.
+    max_linear_x: 0.40
     max_linear_y: 0.20
     max_angular_z: 0.80
 

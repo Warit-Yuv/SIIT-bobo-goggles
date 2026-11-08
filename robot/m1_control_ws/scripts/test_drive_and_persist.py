@@ -37,7 +37,10 @@ def main():
     # ------------------------------------------------------------------ keys
     print('keyboard drive:')
     keys = m1_console.DRIVE_KEYS
-    check('W drives forward', keys['w'] == ('linear', 'x', 0.32), str(keys['w']))
+    # Check the PROPERTY, not the exact number: the number is a preference the
+    # operator is allowed to change without this test failing.
+    check('W drives forward', keys['w'][:2] == ('linear', 'x')
+          and keys['w'][2] > 0, str(keys['w']))
     check('S drives backward', keys['s'][2] < 0)
     check('A and D turn opposite ways', keys['a'][2] == -keys['d'][2])
     check('forward is faster than 0.25', keys['w'][2] > 0.25,

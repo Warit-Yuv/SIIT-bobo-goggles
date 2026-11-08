@@ -96,8 +96,8 @@ MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 #: runs on the robot, so raising a number here without raising the cap there
 #: changes nothing at all - the command is silently clamped on arrival.
 DRIVE_KEYS = {
-    'w': ('linear', 'x', 0.32),
-    's': ('linear', 'x', -0.32),
+    'w': ('linear', 'x', 0.35),
+    's': ('linear', 'x', -0.35),
     'q': ('linear', 'y', 0.20),
     'e': ('linear', 'y', -0.20),
     'a': ('angular', 'z', 0.60),
