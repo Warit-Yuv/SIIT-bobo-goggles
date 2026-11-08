@@ -76,9 +76,13 @@ from sensor_msgs.msg import CompressedImage, LaserScan
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String, UInt8
 
 try:
+    from m1_control.gaze_calib import apply as apply_calib
     from m1_control.gaze_calib import fit as fit_calib
+    from m1_control.gaze_calib import GAIN_MAX, GAIN_MIN
 except ImportError:  # run as a plain script rather than through ros2 run
+    from gaze_calib import apply as apply_calib  # noqa: F401
     from gaze_calib import fit as fit_calib
+    from gaze_calib import GAIN_MAX, GAIN_MIN
 
 MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
 MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
@@ -1045,6 +1049,45 @@ def make_map_view(QtCore, QtGui, QtWidgets):
 # Five-point gaze calibration
 # ---------------------------------------------------------------------------
 
+def _ultra_dots():
+    """47 dots over about three and a half minutes, weighted to the vertical.
+
+    Built rather than written out because the pattern matters more than the
+    individual positions, and 47 hand-typed tuples is 47 chances to make a typo
+    that silently skews one axis.
+
+    The grid is 5 columns by 8 rows, and each row is walked in the opposite
+    direction to the one before. Snaking matters over this many dots: without
+    it the dot jumps from the right edge back to the left edge eight times, and
+    every one of those is a large saccade that the operator's eyes are still
+    finishing when sampling starts.
+
+    Seven extra dots are woven into the centre column, halfway between rows.
+    Vertical is where this tracker is weakest - the iris barely moves up and
+    down inside the eye, so most of that signal is head pitch - and the centre
+    column is where vertical is measured with the least horizontal
+    interference. They are interleaved rather than appended so no dot is ever
+    far from the one before it: measured, the longest move between consecutive
+    dots is 0.24 of the screen, against 0.93 when they were tacked on the end.
+    """
+    cols = (0.08, 0.29, 0.50, 0.71, 0.92)
+    rows = (0.07, 0.19, 0.31, 0.43, 0.55, 0.67, 0.79, 0.93)
+    dots = []
+    for ri, v in enumerate(rows):
+        # Snake: alternate direction per row so consecutive dots are neighbours.
+        order = cols if ri % 2 == 0 else tuple(reversed(cols))
+        for u in order:
+            dots.append(('r%dc%d' % (ri + 1, len(dots) + 1), u, v,
+                         'Look at the dot, and move the way you naturally would'))
+            if abs(u - 0.50) < 1e-9 and ri + 1 < len(rows):
+                # Halfway to the next row, on the centre column: one more
+                # vertical sample that costs no extra travel.
+                vm = round((v + rows[ri + 1]) / 2.0, 3)
+                dots.append(('mid%d' % (len(dots) + 1), 0.50, vm,
+                             'Look at the CENTRE dot, head and eyes together'))
+    return dots
+
+
 class CalibDialog:
     """Gaze calibration spread across the WHOLE screen.
 
@@ -1148,6 +1191,17 @@ class CalibDialog:
                 ('lower-right',  0.80, 0.84, 'Look at the LOWER-RIGHT dot'),
                 ('bottom',       0.50, 0.94, 'Look at the BOTTOM dot'),
             ],
+        },
+        # The one to run when nothing else has worked. Long enough that the
+        # operator can settle into a posture and stay in it, with enough
+        # samples per dot that the mean is not just averaging one bad frame.
+        #
+        # 48 dots x (2.0 s settle + 2.2 s sample) is about 3.4 minutes. At the
+        # HUD's 30 Hz that is roughly 66 samples per dot.
+        'ultra': {
+            'label': 'Ultra · 48 dots · ~3½ min',
+            'settle': 2.0, 'sample': 2.2,
+            'dots': _ultra_dots(),
         },
     }
 
@@ -1259,7 +1313,7 @@ class CalibDialog:
                 # and _Dialog is a nested class, so self.PROFILES would only
                 # work if it were re-declared here - which is exactly the bug
                 # this line had.
-                for key in ('fast', 'long', 'super'):
+                for key in ('fast', 'long', 'super', 'ultra'):
                     self.cmb_profile.addItem(cls.PROFILES[key]['label'], key)
                 self.cmb_profile.currentIndexChanged.connect(self._on_profile)
                 prow.addWidget(self.cmb_profile, 1)
@@ -1482,6 +1536,53 @@ class CalibDialog:
                 else:
                     self._compute()
 
+            def _quality(self, calib, dots):
+                """How well the fitted model reproduces the dots it was given.
+
+                This is the honest answer to "is this calibration any good?".
+                Without it the only feedback was four numbers that look
+                plausible whatever they are - which is exactly how a broken
+                calibration can run to completion, report success, and still
+                steer wrong.
+
+                Returns (rms_u, rms_v, worst_dot_name, clamped_u, clamped_v)
+                in normalized units, where 0.01 is about 19 px on a 1920-wide
+                screen.
+                """
+                su = sv = 0.0
+                worst = (0.0, '')
+                for (mu, mv), d in zip(self.captured, dots):
+                    cu, cv = apply_calib(mu, mv, calib)
+                    eu = cu - d[1]
+                    ev = cv - d[2]
+                    su += eu * eu
+                    sv += ev * ev
+                    e = abs(eu) + abs(ev)
+                    if e > worst[0]:
+                        worst = (e, d[0])
+                n = max(1, len(self.captured))
+                ox, oy, gx, gy = calib
+
+                # A gain pinned at a limit means the fit could not use the
+                # data, and it matters in BOTH directions:
+                #
+                #   at GAIN_MAX  the raw signal barely moved between dots, so
+                #                the fit is extrapolating from almost nothing.
+                #                That is a weak signal - the vertical axis on
+                #                this hardware, where the iris hardly moves up
+                #                and down inside the eye.
+                #   at GAIN_MIN  the raw signal moved far more than the dots
+                #                did, which is what noise-dominated tracking
+                #                looks like.
+                #
+                # Either way it cannot be fixed by calibrating again, so it
+                # has to be reported rather than averaged away.
+                def at_limit(g):
+                    return (g >= GAIN_MAX - 1e-9 or g <= GAIN_MIN + 1e-9)
+
+                return (math.sqrt(su / n), math.sqrt(sv / n), worst[1],
+                        at_limit(gx), at_limit(gy))
+
             def _compute(self):
                 dots = self._dots()
                 n = len(self.captured)
@@ -1491,19 +1592,36 @@ class CalibDialog:
                 # it: both import the same function.
                 ox, oy, gx, gy = fit_calib(
                     self.captured, [(d[1], d[2]) for d in dots])
+                calib = (ox, oy, gx, gy)
 
-                self.result_calib = (ox, oy, gx, gy)
+                rms_u, rms_v, worst_dot, clamped_u, clamped_v = \
+                    self._quality(calib, dots)
+                self.quality = {
+                    'rms_u': rms_u, 'rms_v': rms_v, 'worst': worst_dot,
+                    'clamped_u': clamped_u, 'clamped_v': clamped_v,
+                    'dots': n,
+                }
+
+                self.result_calib = calib
                 self.phase = 'done'
                 self.timer.stop()
                 self.anim.stop()
                 self.u = self.v = None
+
+                # Report the fit error in a unit the operator can judge.
+                # A maximised window is about 1920 px wide, so 0.01 is ~19 px.
+                px_u = rms_u * 1920
+                px_v = rms_v * 1080
+                verdict = self._verdict(rms_u, rms_v, gx, gy)
+
                 self.lbl.setText('Calibration complete')
                 self.hint.setText(
                     f'offset=({ox:+.3f}, {oy:+.3f})   '
                     f'gain=({gx:.2f}, {gy:.2f})\n'
-                    'Press Apply to send this to the robot.')
+                    f'fit error {px_u:.0f} px across, {px_v:.0f} px down\n'
+                    f'{verdict}')
                 self.status.setText(
-                    f'{n} dots · profile {self.profile}')
+                    f'{n} dots · worst was {worst_dot} · press Apply')
                 self.btn_go.setText('Apply')
                 self.btn_go.setEnabled(True)
                 try:
@@ -1512,6 +1630,34 @@ class CalibDialog:
                     pass
                 self.btn_go.clicked.connect(self.accept)
                 self.update()
+
+            @staticmethod
+            def _verdict(rms_u, rms_v, gx, gy):
+                """One sentence the operator can act on.
+
+                Ordered by what is worth acting on first: a clamped gain means
+                the SIGNAL is wrong and no amount of recalibrating helps, so it
+                outranks a merely loose fit.
+                """
+                if gy >= GAIN_MAX - 1e-9:
+                    return ('Vertical signal is too weak - the tracker barely '
+                            'moved up and down. Raise the Head slider.')
+                if gy <= GAIN_MIN + 1e-9:
+                    return ('Vertical signal is wild - tracking noise is '
+                            'dominating. Check the lighting, then retry.')
+                if gx >= GAIN_MAX - 1e-9:
+                    return ('Horizontal signal is too weak. Check the camera '
+                            'can see your whole face.')
+                if gx <= GAIN_MIN + 1e-9:
+                    return ('Horizontal signal is wild - noise is dominating. '
+                            'Check the lighting, then retry.')
+                if rms_v > 0.06:
+                    return 'Vertical fit is loose. Try again, moving your head.'
+                if rms_u > 0.06:
+                    return 'Horizontal fit is loose. Try again, looking further.'
+                if rms_u < 0.02 and rms_v < 0.02:
+                    return 'Excellent fit. Press Apply.'
+                return 'Good fit. Press Apply.'
 
             def reject(self):
                 self.timer.stop()
@@ -2454,6 +2600,21 @@ def main(args=None):
                 self.logline(
                     f'calibration applied  offset=({ox:+.3f},{oy:+.3f}) '
                     f'gain=({gx:.2f},{gy:.2f})')
+                # Put the fit quality in the log too, not just in the dialog:
+                # the dialog is gone by the time the operator is actually
+                # driving, and "is this calibration any good" is a question
+                # asked later, not at Apply.
+                q = getattr(dlg, 'quality', None)
+                if q:
+                    self.logline(
+                        f'  fit error {q["rms_u"] * 1920:.0f} px across, '
+                        f'{q["rms_v"] * 1080:.0f} px down over {q["dots"]} dots '
+                        f'(worst: {q["worst"]})')
+                    if q['clamped_v'] or q['clamped_u']:
+                        axis = 'vertical' if q['clamped_v'] else 'horizontal'
+                        self.logline(
+                            f'  WARNING: {axis} gain hit a limit - the tracker '
+                            f'and the dots do not agree on that axis')
 
         def _reset_calibration(self):
             # Neutral is offset 0.5 and gain 1.0: (raw - 0.5) + 0.5 == raw.

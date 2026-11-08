@@ -155,24 +155,59 @@ moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
 
 **5 · Gaze → Calibrate…**
 
-Three profiles. All fit the same two numbers per axis; they differ only in
-how many dots are used to fit them.
+Four profiles. All fit the same two numbers per axis; they differ only in how
+many dots are used to fit them.
 
 | Profile | Dots | Time | Use it when |
 |---|---|---|---|
 | **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
 | **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
 | **Super** | 20 — weighted to the centre and the vertical axis | ~1 min | up/down still not working |
+| **Ultra** | 47 — a snaking 5×8 grid plus 7 interleaved centre dots | ~3½ min | nothing else worked |
 
 More dots do not add parameters — the model has two unknowns per axis either
 way. They add **confidence**, and they give the outlier rejection enough spare
 dots to work with.
 
-**Super** is deliberately not an even grid. Read its `v` column: eight of the
-twenty dots sit on the centre column, twelve are within 0.20 of the centre
-band, and the four corners get one dot each. Vertical is where this tracker is
-weakest — the iris barely moves up and down inside the eye, so most of that
-signal is head pitch — so that is where the samples go.
+**Super** and **Ultra** are deliberately not even grids. Read their `v`
+columns: the samples are concentrated on the centre column, because vertical is
+where this tracker is weakest — the iris barely moves up and down inside the
+eye, so most of that signal is head pitch.
+
+**Ultra** also *snakes*: each row is walked in the opposite direction to the
+one before, and its seven centre-column dots are woven in between the rows
+rather than tacked on the end. Measured, the longest move between consecutive
+dots is 0.22 of the screen, against 0.93 when they were appended. That matters
+over 47 dots — every long jump is a saccade the operator's eyes are still
+finishing when sampling starts.
+
+### Is the calibration any good?
+
+At the end of a run the dialog reports the **fit error** in pixels and a
+one-line verdict:
+
+```
+offset=(+0.62, +0.55)   gain=(2.00, 1.20)
+fit error 12 px across, 31 px down
+Excellent fit. Press Apply.
+```
+
+This exists because "is this calibration any good?" previously had no answer.
+Four numbers that look plausible whatever they are is how a broken calibration
+runs to completion, reports success, and still steers wrong.
+
+A gain pinned at a limit is reported explicitly, and it matters in **both**
+directions:
+
+| Gain | Means | What to do |
+|---|---|---|
+| at `GAIN_MAX` (5.0) | the raw signal barely moved between dots — a **weak** signal | raise the **Head** slider |
+| at `GAIN_MIN` (0.25) | the raw signal moved far more than the dots did — **noise** dominating | check lighting, retry |
+
+Either way it cannot be fixed by calibrating again, which is exactly why it has
+to be reported rather than averaged away. The same numbers go to the console
+log after Apply, because the dialog is gone by the time you are actually
+driving.
 
 ### The dot shrinks
 
@@ -360,6 +395,7 @@ wrong, because it looks right.
 | Turning is easy, forward is not | vertical deadzone too wide | Lower `deadzone_radius_ratio_y` |
 | Up and down does nothing at all | `head_weight` too low — iris-only vertical is noise | Raise the **Head** slider |
 | Up and down still poor after that | not enough vertical samples | Run the **Super** profile |
+| Up and down still poor after that | the signal itself is weak | Run **Ultra**, and read the fit verdict |
 | Have to strain your eyes to reach a zone | not enough head contribution | Raise the **Head** slider |
 | Everything moves when you shift in your seat | too much head contribution | Lower the **Head** slider, then recalibrate |
 | Head sweeps to a limit and stops | servo running in rate mode | Check `servo_pan_span` / `servo_smoothing` |
