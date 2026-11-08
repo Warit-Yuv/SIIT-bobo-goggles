@@ -1741,7 +1741,12 @@ class CalibDialog:
                 # and _Dialog is a nested class, so self.PROFILES would only
                 # work if it were re-declared here - which is exactly the bug
                 # this line had.
-                for key in ('fast', 'long', 'super', 'ultra'):
+                # Iterate the DICT, not a hardcoded tuple. The tuple was a
+                # second list of profile names kept in step with PROFILES by
+                # hand, and it drifted the moment a profile was added: the
+                # 'posture' profile existed, was tested, was saved - and never
+                # appeared in the dropdown, because nothing pointed at it.
+                for key in cls.PROFILES:
                     self.cmb_profile.addItem(cls.PROFILES[key]['label'], key)
                 self.cmb_profile.currentIndexChanged.connect(self._on_profile)
                 prow.addWidget(self.cmb_profile, 1)
