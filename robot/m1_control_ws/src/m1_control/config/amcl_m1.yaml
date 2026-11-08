@@ -1,0 +1,111 @@
+# =============================================================================
+# amcl_m1.yaml - localisation against a saved map (Layer 4 override)
+#
+# WHY THIS FILE EXISTS
+# =============================================================================
+# slam_toolbox in mapping mode CANNOT recover from being moved. It accumulates a
+# pose graph and has no concept of "I am somewhere else now". Pick the robot up
+# and put it down across the room, and the next scan gets matched against a pose
+# that no longer means anything: the map smears, then tears.
+#
+# That is not a bug, it is what a mapper does. The answer is a different mode:
+# localise against a map that is already known.
+#
+#   mapping mode        build the map. Run it once, save, done.
+#   localisation mode   AMCL. Given a saved map and a rough starting pose, a
+#                       particle filter converges on the true pose from the
+#                       laser scan alone.
+#
+# The practical workflow, and the one this config supports:
+#
+#   1. Map the space          ./m1_map.sh start
+#   2. Save it                ./m1_map.sh save office
+#   3. Switch to localisation ./m1_map.sh localize office
+#   4. Pick the robot up and put it anywhere in that map
+#   5. Tell AMCL roughly where ./m1_map.sh relocalize      (or RViz "2D Pose Estimate")
+#   6. AMCL converges         the pose snaps to the true position
+#
+# Step 5 is the one thing AMCL cannot do for you. A kidnapped robot is, by
+# definition, a robot with no idea where it is, and one laser scan cannot
+# always disambiguate two similar corridors. The "2D Pose Estimate" click is
+# the human supplying the one piece of information the sensor lacks. After
+# that, AMCL does the work.
+#
+# =============================================================================
+# TUNING NOTES FOR THIS ROBOT
+# =============================================================================
+#   * 360 degree lidar (YDLIDAR Tmini Plus), so laser_max_range matches the
+#     hardware maximum of 12 m, same as slam_toolbox_m1.yaml.
+#   * Mecanum wheels: the robot can strafe, so the motion model allows omni
+#     movement. A pure differential model would badly mispredict sideways
+#     motion and slow convergence.
+#   * update_min_d/a are deliberately small. AMCL only runs the particle filter
+#     when the robot has moved this far; the default 0.25 m / 0.2 rad means a
+#     robot that is nudged or picked up may never trigger an update. Small
+#     values cost CPU but make re-localisation responsive, which is the entire
+#     point of using this mode.
+#   * transform_tolerance is generous because this runs across Wi-Fi, and a
+#     dropped scan should not invalidate the pose.
+# =============================================================================
+
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    alpha1: 0.2
+    alpha2: 0.2
+    alpha3: 0.2
+    alpha4: 0.2
+    alpha5: 0.2
+    base_frame_id: base_footprint
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    do_beamskip: false
+    global_frame_id: map
+    # Mecanum: sideways motion is normal, so allow it in the motion model.
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 12.0
+    laser_min_range: 0.03
+    laser_model_type: likelihood_field
+    # A larger particle cloud than the default: this map is a room with
+    # furniture, and a tight cloud converges to the wrong corner after a
+    # pick-and-place.
+    max_particles: 5000
+    min_particles: 500
+    odom_frame_id: odom
+    pf_err: 0.05
+    pf_z: 0.99
+    recovery_alpha_fast: 0.0
+    recovery_alpha_slow: 0.0
+    resample_interval: 1
+    robot_model_type: nav2_amcl::OmniMotionModel
+    save_pose_rate: 0.5
+    sigma_hit: 0.2
+    tf_broadcast: true
+    transform_tolerance: 0.5
+    update_min_a: 0.05
+    update_min_d: 0.05
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    scan_topic: scan
+    # Always accept a pose supplied by the operator. Without this, a
+    # "2D Pose Estimate" click can be rejected and the robot appears to ignore
+    # the instruction.
+    set_initial_pose: true
+    always_reset_initial_pose: false
+    first_map_only: false
+    initial_pose:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      yaw: 0.0
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    # Overridden by the launch file with the actual map path.
+    yaml_filename: ''
+    topic_name: map
+    frame_id: map

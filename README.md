@@ -41,6 +41,8 @@ to begin — no prior ROS 2 knowledge assumed.
 | Set the robot up from scratch | [`robot/SETUP.md`](robot/SETUP.md) |
 | Set up the operator PC | [`operator-pc/SETUP.md`](operator-pc/SETUP.md) |
 | Understand what was built and why | [`robot/docs/report.md`](robot/docs/report.md) |
+| **Map a space, then localise** | [`docs/MAPPING.md`](docs/MAPPING.md) |
+| **Start / stop / close properly** | [`docs/START_STOP.md`](docs/START_STOP.md) |
 
 ## Design principles
 
@@ -90,7 +92,7 @@ watchdog `0.35 s`.
 | Operator console (PyQt5) | Working — 6 panels, live SLAM map, in-window teleop |
 | Gaze calibration | Working — 8/8 checks, 5-point offset + gain |
 
-Sixteen defects were found and fixed during hardware validation. Three of them
+Eighteen defects were found and fixed during hardware validation. Most of them
 were **silent** — no error, no warning, just a feature that did not work:
 a duplicated limit in the GUI, a DDS environment that never got set, and
 Wi-Fi multicast quietly dropping 7 of every 8 video frames. All are written up

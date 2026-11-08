@@ -119,13 +119,40 @@ def launch_setup(context, *args, **kwargs):
     else:
         actions.append(LogInfo(msg='[bringup] imu_filter_param.yaml missing - IMU filter skipped'))
 
+    # ---------------- 4b. EKF (odom -> base_footprint) ----------------------
+    # Uses the Layer-4 parameter file, not the vendor one. The vendor config
+    # fuses yaw from BOTH the wheels and the IMU, so a hand-turn with the
+    # wheels off the ground moves /odom by 9% of what the IMU actually saw and
+    # slam_toolbox never triggers. See config/ekf_m1.yaml for the measurement.
+    ekf_params = os.path.join(
+        get_package_share_directory('m1_control'), 'config', 'ekf_m1.yaml')
     try:
-        rl_share = get_package_share_directory('robot_localization')
-        actions.append(IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(rl_share, 'launch', 'ekf_M1_launch.py'))))
+        get_package_share_directory('robot_localization')
+        if os.path.exists(ekf_params):
+            actions.append(Node(
+                package='robot_localization',
+                executable='ekf_node',
+                name='ekf_filter_node',
+                output='screen',
+                parameters=[ekf_params],
+                remappings=[('/odometry/filtered', '/odom')],
+            ))
+            actions.append(LogInfo(
+                msg='[bringup] EKF ON (IMU owns yaw - see config/ekf_m1.yaml)'))
+        else:
+            # Falling back to the vendor launch is better than no odometry at
+            # all, but say so loudly: the rotation bug will be present.
+            actions.append(LogInfo(
+                msg=f'[bringup] WARNING {ekf_params} missing - falling back to '
+                    f'the vendor EKF, which ignores IMU yaw when the wheels '
+                    f'are not turning'))
+            rl_share = get_package_share_directory('robot_localization')
+            actions.append(IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(rl_share, 'launch', 'ekf_M1_launch.py'))))
     except Exception as exc:  # noqa: BLE001
-        actions.append(LogInfo(msg=f'[bringup] EKF unavailable ({exc}) - odom TF disabled'))
+        actions.append(LogInfo(
+            msg=f'[bringup] EKF unavailable ({exc}) - odom TF disabled'))
 
     # ---------------- 5. LiDAR (optional, auto-detected) --------------------
     lidar_share = None

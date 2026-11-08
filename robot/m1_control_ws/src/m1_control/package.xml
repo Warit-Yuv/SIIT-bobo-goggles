@@ -20,6 +20,10 @@
        message and TF lookups. Both are standard Humble packages. -->
   <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
+  <!-- The bringup launches our own EKF parameter file (config/ekf_m1.yaml)
+       instead of the vendor one, so robot_localization is a direct
+       dependency now rather than something inherited from the vendor stack. -->
+  <exec_depend>robot_localization</exec_depend>
 
   <!-- Only required on the robot (arbiter publishes yahboomcar_msgs/ServoControl).
        Imported lazily so the same package also builds on the operator PC. -->

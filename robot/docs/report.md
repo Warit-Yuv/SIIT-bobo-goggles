@@ -35,9 +35,9 @@ implemented, built and validated against real hardware:
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
 | Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
 
-**Sixteen defects were found and fixed during validation.** They are documented
-in §7 because each one would have been a silent failure in operation. Five of
-them (§7.12 – §7.16) were found only by testing on the real operator station;
+**Eighteen defects were found and fixed during validation.** They are documented
+in §7 because each one would have been a silent failure in operation. Seven of
+them (§7.12 – §7.18) were found only by testing on the real operator station;
 most produced no error message at all when they failed.
 
 ---
@@ -719,6 +719,106 @@ times and drew a garbled map.
 > programming errors, not just runtime ones. When the pose stayed `None` the
 > code looked like it was waiting for TF, not like it was throwing a
 > `TypeError`.
+
+### 7.17 The EKF threw away 91% of the robot's rotation
+
+Rotating the robot by hand did not move `/odom`, so the map never updated. It
+looked like SLAM had stopped working.
+
+Measured with `scripts/probe_rotation.py`, turning by hand through 61 degrees
+with the wheels off the ground:
+
+| Source | Before fix | After fix |
+|---|---|---|
+| `/imu/data` (the sensor) | 81.9° | 61.6° |
+| `/odom` (what SLAM uses) | **7.7°** | **61.5°** |
+| `/odom_raw` (wheel encoders) | 0.0° | 1.6° |
+
+The gyro saw the whole turn. The EKF kept 9% of it.
+
+The vendor `ekf_A1.yaml` fuses yaw **and yaw-rate from both sources**:
+
+```yaml
+odom0_config: [T, T, F,  F, F, T,   T, T, F,  F, F, T,  F, F, F]
+#                              ^yaw                  ^yaw-rate
+imu0_config:  [F, F, F,  F, F, T,   F, F, F,  F, F, T,  F, F, F]
+```
+
+With the wheels off the ground the encoders report "not rotating" and hold that
+claim with a tight covariance, so the filter mostly believed them. This is the
+correct behaviour for a differential-drive robot on the floor — wheel odometry
+genuinely is a good rotation source there — and completely wrong the moment the
+wheels are not the thing turning the robot.
+
+`slam_toolbox` triggers a scan match on `minimum_travel_heading`, measured
+against the **odometry** pose. With `/odom` barely moving it never fired, so the
+map only ever changed while driving.
+
+**Fix:** `config/ekf_m1.yaml`, a Layer-4 override that removes yaw and yaw-rate
+from `odom0_config`. The IMU becomes the single authority on heading; wheels
+still supply x, y, vx and vy, which mecanum encoders measure well.
+
+**This also explains the wall-collision drift.** Driving into a wall makes the
+wheels slip. Slipping wheels report rotation that did not happen, and the old
+config trusted them — so a collision corrupted the heading and the map sheared
+while reversing out. With heading on the gyro, a slipping wheel can no longer
+lie about which way the robot is facing.
+
+> **Trade-off:** heading now comes from gyro integration, and this IMU has no
+> magnetometer (`use_mag: false`). It drifts a few degrees over a long session.
+> For teleoperation mapping that is the better failure: a map that follows the
+> robot and drifts slightly beats a map that ignores the robot entirely.
+
+> **Lesson:** a fused sensor configuration encodes an assumption about which
+> source is trustworthy. That assumption can be true in the lab and false the
+> moment the robot is picked up. When two sensors disagree, check whether the
+> filter is *averaging* them — sometimes the right answer is to pick one.
+
+### 7.18 RViz could not draw the robot, and the URDF was innocent
+
+The RobotModel display showed `Status: Error` with `Errors loading geometries...`
+while every TF frame underneath reported `Transform OK`. The URDF was fine and
+the meshes were installed.
+
+Two separate causes, and the second is §7.13 wearing a different hat.
+
+**Cause 1: the package was not on the operator machine.** The URDF references
+`package://yahboomcar_description/meshes/M1USBMecanum/*.STL`, and that package
+existed only on the Pi. Copied and built it on the VM.
+
+**Cause 2: the view was launched with a stale environment.** The console started
+RViz with `bash -lc 'ros2 launch ...'`. Ubuntu's `~/.bashrc` returns early for
+non-interactive shells:
+
+```bash
+case $- in *i*) ;; *) return;; esac
+```
+
+so a login-but-not-interactive shell never reaches the `source .../setup.bash`
+lines further down the file. The child inherits whatever `AMENT_PREFIX_PATH` its
+parent had — which is stale if a package was built after the parent started.
+RViz then cannot resolve `package://` and reports a *geometry* error, which
+sends you looking at the URDF instead of the environment.
+
+Measured: `bash -lc 'echo $AMENT_PREFIX_PATH' | grep -c yahboomcar_description`
+returned **0**.
+
+**Fix:** `~/m1_view.sh` on the operator PC, which sources ROS and both
+workspaces explicitly, then checks that the meshes are resolvable and **refuses
+to start** if they are not. The console now calls that wrapper instead of
+composing its own shell command.
+
+```bash
+$ ~/m1_view.sh
+description: /home/rescue/m1_control_ws/install/yahboomcar_description/share/yahboomcar_description
+```
+
+Verified with `resource_retriever.get()` on all eight meshes the URDF
+references — the same code path RViz uses — all 2–4 MB each, all resolving.
+
+> **Lesson:** "Errors loading geometries" is a resource-resolution error, not a
+> model error. When TF is fine but geometry is not, check
+> `AMENT_PREFIX_PATH` before you touch the URDF.
 
 ---
 

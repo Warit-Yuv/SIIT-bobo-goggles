@@ -1603,22 +1603,27 @@ def main(args=None):
             Clicking this twice used to start a second slam_toolbox, and two
             mappers publishing /map with different maps makes the map appear to
             jump around - which reads as "the map keeps resetting" rather than
-            "two mappers are running". The guard is a flock in the child shell
-            rather than a Python flag: the flag would be lost if the console
-            restarted while an orphaned stack survived, and an orphaned stack is
-            exactly how this happens in the first place.
+            "two mappers are running". The guard is a flock in the wrapper.
+
+            The wrapper matters for a second reason. Launching with
+            `bash -lc 'ros2 launch ...'` inherits whatever AMENT_PREFIX_PATH
+            this process happened to start with, and Ubuntu's .bashrc returns
+            early for non-interactive shells so it never sources the workspace
+            itself. Build a package after the console starts and the view
+            inherits a stale path: RViz then shows the RobotModel in ERROR with
+            "Errors loading geometries..." because it cannot resolve
+            package://yahboomcar_description. m1_view.sh sources both setups
+            explicitly and refuses to start if the meshes are unresolvable.
             """
             self.logline('launching SLAM + RViz…')
-            # flock -n fails immediately if another copy holds the lock, and
-            # the lock is released automatically when that process dies - no
-            # stale lock file to clean up.
-            cmd = (
-                'exec flock -n /tmp/m1_operator.lock '
-                'ros2 launch m1_control m1_operator.launch.py'
-            )
+            wrapper = os.path.expanduser('~/m1_view.sh')
+            if not os.path.exists(wrapper):
+                self.logline(f'missing {wrapper} - cannot launch the view')
+                self.logline('  create it as documented in docs/START_STOP.md')
+                return
             try:
                 subprocess.Popen(
-                    ['bash', '-lc', cmd],
+                    ['bash', wrapper],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, start_new_session=True)
                 self.logline('view launched (single instance enforced)')
