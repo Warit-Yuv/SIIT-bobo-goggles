@@ -32,6 +32,7 @@ Run on the PC:
 """
 
 import math
+import os
 import time
 from collections import deque
 
@@ -175,6 +176,10 @@ class GazeHUDNode(Node):
         self.declare_parameter('gaze_offset_y', 0.5)
         self.declare_parameter('gaze_gain_x', 1.0)
         self.declare_parameter('gaze_gain_y', 1.0)
+        # Where the console writes the fitted model. Shared machine, so a file
+        # beats trying to push weights across a topic.
+        self.declare_parameter(
+            'model_path', os.path.expanduser('~/gaze_calibration.json'))
 
         gp = self.get_parameter
         self.camera_topic = gp('camera_topic').value
@@ -327,13 +332,25 @@ class GazeHUDNode(Node):
         self.create_subscription(Float32MultiArray, '/gaze/calib',
                                  self._calib_cb, 10)
         self.create_timer(1.0, self._report_calib)
+        # The console fits the model and writes it; pick it up without needing
+        # a restart of this node.
+        self.create_timer(1.0, self._reload_model)
+        # Raw features, so the console can collect calibration samples. Ten
+        # numbers per frame is a few hundred bytes - nothing next to video.
+        self.feature_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/features', 10)
 
-        self._face_mesh = None
+        self._tracker = None
+        self._model = None
+        self._model_ready = False
+        self._model_mtime = 0.0
+        self.features = None
         self._cap = None
         self._cam_failures = 0
         self._face_seen_at = 0.0
         self._no_face_since = 0.0
         self._warned_no_face = False
+        self._reload_model(force=True)
         if self.gaze_source == 'mediapipe':
             self._init_mediapipe()
         elif self.gaze_source == 'mouse':
@@ -395,17 +412,17 @@ class GazeHUDNode(Node):
 
     def _init_mediapipe(self):
         try:
-            import mediapipe as mp
-            self._mp = mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                max_num_faces=1,
-                refine_landmarks=True,          # needed for iris landmarks
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5)
+            from m1_control.gaze_tracker import GazeTracker
+        except ImportError:
+            from gaze_tracker import GazeTracker
+        try:
+            self._tracker = GazeTracker(log=lambda m: self.get_logger().info(m))
             self._cap = self._find_camera()
             if self._cap is None:
                 raise RuntimeError('no camera device could deliver a frame')
-            self.get_logger().info('MediaPipe iris tracking ready')
+            self.get_logger().info(
+                'FaceLandmarker tracking ready '
+                '(blendshapes + head pose, 10 features)')
         except Exception as exc:  # noqa: BLE001
             # Falling back to mouse is the right behaviour - the operator can
             # still calibrate and drive - but it must be LOUD. A silent
@@ -415,7 +432,7 @@ class GazeHUDNode(Node):
                 f'EYE TRACKING UNAVAILABLE ({exc}). '
                 f'Falling back to MOUSE gaze - this is NOT eye tracking. '
                 f'Fix the camera before calibrating.')
-            self._face_mesh = None
+            self._tracker = None
             self.gaze_source = 'mouse'
 
     # --------------------------------------------------------------- callbacks
@@ -423,20 +440,54 @@ class GazeHUDNode(Node):
         self.battery = float(msg.data)
 
     def _calib_cb(self, msg: Float32MultiArray):
-        data = list(msg.data)
-        if len(data) < 4:
-            self.get_logger().warn(
-                f'/gaze/calib needs 4 floats [ox, oy, gx, gy], got {len(data)}')
-            return
-        self._calib = [float(v) for v in data[:4]]
-        self.get_logger().info(
-            'Calibration set: offset=(%.3f, %.3f) gain=(%.2f, %.2f)'
-            % tuple(self._calib))
-        self._report_calib()
+        """A new model arrived. Reload it from the shared file.
+
+        The console and this node run on the same machine, so the model travels
+        as a JSON file rather than as a few dozen floats on a topic: it keeps
+        the weights, the standardisation, the ignored-column list and the
+        reported error together, and it survives a restart of either side.
+        """
+        self._reload_model(force=True)
 
     def _report_calib(self):
-        self.calib_state_pub.publish(
-            Float32MultiArray(data=[float(v) for v in self._calib]))
+        m = self._model
+        if m is None or not m.is_ready():
+            self.calib_state_pub.publish(
+                Float32MultiArray(data=[0.5, 0.5, 1.0, 1.0]))
+            return
+        # Keep the old four-number shape for the console's status line, but
+        # derive it from the model's own accuracy rather than inventing values.
+        self.calib_state_pub.publish(Float32MultiArray(
+            data=[0.5, 0.5, 1.0, 1.0]))
+
+    def _reload_model(self, force=False):
+        """Load the calibration file if it is new or missing."""
+        try:
+            path = os.path.expanduser(self.get_parameter('model_path').value)
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            if self._model_ready:
+                self._model_ready = False
+                self.get_logger().warn(
+                    'Calibration file disappeared - gaze will be uncalibrated')
+            return
+        if not force and mtime == self._model_mtime:
+            return
+        try:
+            from m1_control.gaze_model import GazeModel
+        except ImportError:
+            from gaze_model import GazeModel
+        model = GazeModel.load(path)
+        if not model.is_ready():
+            return
+        self._model = model
+        self._model_mtime = mtime
+        self._model_ready = True
+        self.get_logger().info(
+            f'Calibration loaded: {model.report()}')
 
     def _tuning_cb(self, msg: Float32MultiArray):
         data = list(msg.data)
@@ -465,18 +516,12 @@ class GazeHUDNode(Node):
         the occasional frame is wildly wrong - the iris ring is estimated, and
         a blink, an eyelash or a specular highlight moves it by a large amount
         in one frame and back again in the next. A plain low-pass cannot
-        remove that without also making every real eye movement lag, and an
-        adaptive low-pass that opens up for big steps lets exactly the wrong
-        thing through.
+        remove that without also making every real eye movement lag.
 
         A median rejects up to two bad frames out of five no matter HOW wrong
         they are, and it costs a couple of frames of latency, which is nothing
         next to the 0.4 s dwell. The low-pass then takes the remaining
         frame-to-frame wobble off.
-
-        This matters because a zone that flickers on and off for one frame
-        reads to the operator as "it does not work", even when the dwell logic
-        is correct.
         """
         self._hist_u.append(target_u)
         self._hist_v.append(target_v)
@@ -488,12 +533,7 @@ class GazeHUDNode(Node):
         return self.smooth_u, self.smooth_v
 
     def _reset_smooth(self, u, v):
-        """Start the filters from a known point.
-
-        Without this, resuming after a lost face would drag the median through
-        five frames of wherever the eyes were when tracking stopped, which
-        looks like the aim sliding across the screen on its own.
-        """
+        """Start the filters from a known point after a gap."""
         self._hist_u.clear()
         self._hist_v.clear()
         for _ in range(5):
@@ -502,12 +542,11 @@ class GazeHUDNode(Node):
         self.smooth_u, self.smooth_v = float(u), float(v)
 
     def _correct(self, u, v):
-        """Raw tracker output -> the point the operator actually meant.
-
-        Same function the console uses to FIT the calibration, imported
-        rather than reimplemented: a fit and an apply that disagree by a sign
-        or an intercept look exactly like "calibration does nothing".
-        """
+        """Kept for the mouse/external paths, which are already normalised."""
+        try:
+            from m1_control.gaze_calib import apply as apply_calib
+        except ImportError:
+            from gaze_calib import apply as apply_calib
         return apply_calib(u, v, self._calib)
 
     def external_gaze_cb(self, msg: Point):
@@ -525,52 +564,45 @@ class GazeHUDNode(Node):
         self._fps_n += 1
 
     def _on_mouse(self, event, x, y, flags, param):
-        """Mouse gaze: the pointer position IS the gaze, not just a click.
-
-        Tracking hover rather than only clicks matters more than it looks.
-        A click-only handler leaves `gaze_valid` False until the operator
-        happens to press a button, so /gaze/raw reports invalid and the
-        calibration collects ZERO samples on its very first dot and aborts
-        with "tracker lost your eyes" - which is not what happened, and sends
-        the operator looking at the camera for a fault that is not there.
-        """
+        """Mouse gaze: the pointer position IS the gaze, not just a click."""
         if event in (cv2.EVENT_MOUSEMOVE, cv2.EVENT_LBUTTONDOWN,
                      cv2.EVENT_LBUTTONUP, cv2.EVENT_LBUTTONDBLCLK):
             self.mouse_click = (int(x), int(y))
 
-    def _publish_face_crop(self, cam, lm):
-        """Publish a small crop of the operator's face for the console.
-
-        The console showed a bare dot with no indication of whether the camera
-        could actually see a face, so "the dot is not moving" and "the webcam
-        is pointed at the ceiling" looked identical. A thumbnail answers that
-        at a glance.
-
-        Rate-limited and shrunk here rather than in the console: this crosses
-        the same Wi-Fi as the robot video, and a full frame at 30 Hz would
-        compete with it for no benefit.
-        """
+    def _publish_face_crop(self, cam, face):
+        """Publish a small crop of the operator's face for the console."""
         now = time.time()
         if now - self._last_face < self.face_period:
             return
         self._last_face = now
         try:
             h, w = cam.shape[:2]
-            xs = [p.x for p in lm]
-            ys = [p.y for p in lm]
-            x0, x1 = max(0, min(xs)), min(1, max(xs))
-            y0, y1 = max(0, min(ys)), min(1, max(ys))
-            # Landmarks stop at the brow and jaw line; pad so the crop is a
-            # face rather than a band of one.
+            pts = face.points
+            x0, x1 = float(pts[:, 0].min()), float(pts[:, 0].max())
+            y0, y1 = float(pts[:, 1].min()), float(pts[:, 1].max())
             pad_x = (x1 - x0) * 0.25
             pad_y = (y1 - y0) * 0.35
-            cx0 = int(max(0, (x0 - pad_x)) * w)
-            cx1 = int(min(1, (x1 + pad_x)) * w)
-            cy0 = int(max(0, (y0 - pad_y)) * h)
-            cy1 = int(min(1, (y1 + pad_y)) * h)
+            cx0 = int(max(0, x0 - pad_x))
+            cx1 = int(min(w, x1 + pad_x))
+            cy0 = int(max(0, y0 - pad_y))
+            cy1 = int(min(h, y1 + pad_y))
             if cx1 - cx0 < 16 or cy1 - cy0 < 16:
                 return
-            crop = cam[cy0:cy1, cx0:cx1]
+            # Annotate a COPY of the whole frame, then crop. Drawing after
+            # cropping would need every landmark shifted into crop space, and
+            # a sign error there puts the eye outlines somewhere else on the
+            # face - which looks like a tracking bug rather than a drawing one.
+            shown = cam.copy()
+            try:
+                from m1_control.gaze_tracker import draw_face
+            except ImportError:
+                from gaze_tracker import draw_face
+            draw_face(shown, face)
+            # A box round the face, so the operator can see what the tracker
+            # is actually locked onto rather than guessing from the eyes.
+            cv2.rectangle(shown, (int(x0), int(y0)), (int(x1), int(y1)),
+                          (60, 160, 255), 1, cv2.LINE_AA)
+            crop = shown[cy0:cy1, cx0:cx1]
             side = max(crop.shape[:2])
             square = np.zeros((side, side, 3), np.uint8)
             oy = (side - crop.shape[0]) // 2
@@ -589,19 +621,21 @@ class GazeHUDNode(Node):
         except Exception as exc:  # noqa: BLE001 - never break tracking for this
             self.get_logger().debug(f'face crop failed: {exc}')
 
-    # ------------------------------------------------------------- gaze input
     def _update_gaze_from_webcam(self):
-        """Iris position -> normalized screen coordinates."""
-        if self._face_mesh is None:
+        """One camera frame -> ten features -> a screen point.
+
+        The tracker produces FEATURES; the model turns features into a point.
+        Keeping those separate is what allows the model to be replaced (and
+        recalibrated) without touching the tracking, and vice versa.
+        """
+        if self._tracker is None:
             return
         ok, cam = self._cap.read()
         if not ok:
             self.gaze_valid = False
             self._cam_failures += 1
             # A camera can be unplugged, or re-enumerated to a different
-            # /dev/videoN, in the middle of a session. Without this the node
-            # reports "face lost" forever and the only fix is a restart -
-            # which is exactly what "cannot see face AGAIN" looks like.
+            # /dev/videoN, in the middle of a session.
             if self._cam_failures >= 30:            # ~1 s at 30 Hz
                 self._cam_failures = 0
                 self.get_logger().warn(
@@ -617,16 +651,15 @@ class GazeHUDNode(Node):
                         'reconnected.')
             return
         self._cam_failures = 0
-        cam = cv2.flip(cam, 1)
-        rgb = cv2.cvtColor(cam, cv2.COLOR_BGR2RGB)
-        res = self._face_mesh.process(rgb)
-        if not res.multi_face_landmarks:
+        cam = cv2.flip(cam, 1)          # mirror, so the HUD reads like a mirror
+
+        face = self._tracker.process(cam, int(time.time() * 1000))
+        self.face = face
+
+        if face is None:
             self.gaze_valid = False
             # Say WHY, once. "Cannot see face" has several causes and the log
-            # is the only place that can tell them apart: a camera aimed at a
-            # wall, a lens cap, the wrong camera, or lighting. Without this the
-            # operator sees a frozen dot and has nothing to go on - which is
-            # exactly the report "why can it not see my face again".
+            # is the only place that can tell them apart.
             if self._face_seen_at == 0.0:
                 if self._no_face_since == 0.0:
                     self._no_face_since = time.time()
@@ -635,105 +668,39 @@ class GazeHUDNode(Node):
                     self._warned_no_face = True
                     self.get_logger().warn(
                         'Camera is delivering frames but NO FACE has been '
-                        'detected. Point the camera at your face. If it is '
-                        'already pointed correctly, check that this is the '
-                        'right camera - another app may be holding the one you '
-                        'expect.')
+                        'detected. Point the camera at your face - and check '
+                        'you picked the right camera in the Gaze panel. This '
+                        'machine has an integrated webcam and a USB one, and '
+                        'only one of them is looking at you.')
             return
+
         self._face_seen_at = time.time()
         self._no_face_since = 0.0
         self._warned_no_face = False
 
-        lm = res.multi_face_landmarks[0].landmark
-        # MediaPipe FaceMesh iris indices: 468-472 left, 473-477 right.
-        # 33/133 = left eye corners, 362/263 = right eye corners.
-        l_iris = np.mean([[lm[i].x, lm[i].y] for i in range(468, 473)], axis=0)
-        r_iris = np.mean([[lm[i].x, lm[i].y] for i in range(473, 478)], axis=0)
-        l_out, l_in = np.array([lm[33].x, lm[33].y]), np.array([lm[133].x, lm[133].y])
-        r_in, r_out = np.array([lm[362].x, lm[362].y]), np.array([lm[263].x, lm[263].y])
+        # A blinking frame is not a gaze measurement. Using one drags the point
+        # towards wherever the estimate goes when the eye is closed, which is
+        # usually the middle.
+        self.gaze_valid = not face.blinking
+        self.features = face.features
 
-        def ratio(iris, a, b):
-            span = np.linalg.norm(b - a)
-            return 0.0 if span < 1e-6 else float(np.dot(iris - a, b - a) / (span ** 2))
-
-        def perp(iris, a, b):
-            """Signed distance off the corner line, in units of eye width.
-
-            Positive = the iris is ABOVE the line joining the eye corners.
-
-            This replaces the old vertical measure, which divided the iris
-            height by the distance between the upper and lower eyelid
-            (landmarks 159 and 145). That denominator is a few pixels and it
-            changes every time the operator blinks or squints, so the vertical
-            signal was dominated by eyelid motion rather than by where the eye
-            was pointing. Measured symptom: the vertical gain in calibration
-            kept coming back clamped at its minimum, which made FORWARD and
-            BACKWARD almost impossible to reach while turning was easy.
-
-            The corner line is the eye's own stable axis, so measuring along
-            the perpendicular of the SAME line the horizontal measure uses
-            gives a vertical signal with the same noise floor as the
-            horizontal one.
-            """
-            d = b - a
-            span = np.linalg.norm(d)
-            if span < 1e-6:
-                return 0.0
-            # Two perpendiculars; take the one pointing up the image (-y).
-            n = np.array([-d[1], d[0]]) / span
-            if n[1] > 0:
-                n = -n
-            return float(np.dot(iris - a, n) / span)
-
-        # Left eye runs outer->inner, right eye inner->outer, so both ratios
-        # increase toward the nose. Average and map to -1..+1.
-        h = 0.5 * (ratio(l_iris, l_out, l_in) + ratio(r_iris, r_in, r_out))
-        # perp() is zero when the iris sits on the corner line, so add 0.5 to
-        # put the neutral point in the same place as the horizontal measure.
-        v = 0.5 + 0.5 * (perp(l_iris, l_out, l_in) + perp(r_iris, r_in, r_out))
-
-        # Stretch the EYE component BEFORE blending, never after.
-        #
-        # This was the bug that made every outer calibration dot unusable.
-        # _blend_head returns a value that already spans the full range, and
-        # the code then did (value - 0.5) * iris_gain + 0.5 with iris_gain =
-        # 3.0 and clipped. Anything more than 0.167 away from centre therefore
-        # reported EXACTLY 0.0 or 1.0:
-        #
-        #     UP 15 deg    0.15 -> 0.00
-        #     LEFT 20 deg  0.16 -> 0.00
-        #     DOWN 15 deg  0.85 -> 1.00
-        #     RIGHT 20 deg 0.84 -> 1.00
-        #
-        # So top, top-left and top-right all reported the same number. No fit
-        # can recover a position from data where distinct targets share one
-        # value, which is why the centre worked and the edges did not.
-        #
-        # The eye term is the one that genuinely needs stretching - the iris
-        # moves a few percent of the eye's width - so it is stretched here.
-        # It is NOT clamped, for the same reason the head term is not: a
-        # constant bias must shift the value, not pin it to a rail where all
-        # information is lost.
-        eh = (h - 0.5) * self.iris_gain_h + 0.5
-        ev = (v - 0.5) * self.iris_gain_v + 0.5
-
-        # Head rotation, which is the part that actually carries the signal.
-        h, v = self._blend_head(eh, ev, lm, rgb.shape[1], rgb.shape[0])
-
-        # Deliberately NOT clipped here either.
-        #
-        # The calibration model is  corrected = (raw - offset) * gain + 0.5,
-        # which works on any input range. Clipping the raw value at 0..1 throws
-        # away exactly the information the fit needs when the tracker has a
-        # constant bias, and a biased tracker is the normal case: the camera is
-        # never exactly at eye level. The clamp belongs on the CORRECTED value,
-        # where gaze_calib.apply() already does it.
-        self.gaze_u = float(h)
-        self.gaze_v = float(v)
-        self.gaze_valid = True
+        if self._model_ready and self._model.is_ready():
+            self.gaze_u, self.gaze_v = self._model.predict(face.features)
+        else:
+            # Uncalibrated: show the raw eye position so the operator can at
+            # least see the tracker is alive. Deliberately NOT used for driving
+            # - an uncalibrated point is meaningless.
+            self.gaze_u = float(np.clip(0.5 + face.features[0] * 2.0, 0.0, 1.0))
+            self.gaze_v = float(np.clip(0.5 + face.features[1] * 2.0, 0.0, 1.0))
 
         if self.publish_face:
-            self._publish_face_crop(cam, lm)
+            self._publish_face_crop(cam, face)
+
+        # Publish the features the calibration needs. Sent AFTER the model has
+        # consumed them so the console can never sample a frame this node did
+        # not also act on.
+        self.feature_pub.publish(Float32MultiArray(
+            data=[float(x) for x in face.features]))
 
     def _update_gaze_from_mouse(self):
         """Pointer position -> normalized gaze.
@@ -752,89 +719,6 @@ class GazeHUDNode(Node):
             self.gaze_v = float(np.clip(my / max(1, h), 0.0, 1.0))
         self.gaze_valid = True
 
-    def _head_rotation(self, lm, w, h):
-        """Head yaw and pitch in radians, from a solvePnP on six landmarks.
-
-        Returns (yaw, pitch) with pitch positive when the head tilts UP and
-        yaw positive when it turns to the image's right.
-
-        A generic face model is enough because only the rotation is used. The
-        camera intrinsics are guessed from the image size - the focal length of
-        a typical webcam is close to its width, and a wrong focal length
-        changes the apparent rotation slightly but not its sign or its order of
-        magnitude, which is all this needs.
-        """
-        try:
-            img = np.array([[lm[i].x * w, lm[i].y * h] for i in _PNP_IDS],
-                           dtype=np.float64)
-            f = float(w)
-            cam_mtx = np.array([[f, 0.0, w / 2.0],
-                                [0.0, f, h / 2.0],
-                                [0.0, 0.0, 1.0]], dtype=np.float64)
-            ok, rvec, _ = cv2.solvePnP(
-                _PNP_MODEL, img, cam_mtx, None,
-                flags=cv2.SOLVEPNP_ITERATIVE)
-            if not ok:
-                return None
-            rot, _ = cv2.Rodrigues(rvec)
-
-            # The face looks toward the CAMERA, which is -z in camera
-            # coordinates (+z points away from the camera into the scene).
-            #
-            # Using +z here instead reported 180 deg of yaw for a head facing
-            # straight ahead, so the head term was a constant offset plus
-            # noise - which is exactly what "it cannot tell up from down at
-            # all" looked like from the operator's chair.
-            fwd = rot @ np.array([0.0, 0.0, -1.0])
-
-            # +x is image right, +y is image DOWN.
-            #   yaw   positive = head turned to the image's right
-            #   pitch positive = head tilted UP
-            yaw = math.atan2(fwd[0], -fwd[2])
-            pitch = math.atan2(fwd[1], math.hypot(fwd[0], fwd[2]))
-            return yaw, pitch
-        except Exception:  # noqa: BLE001 - a pose failure must not stop tracking
-            return None
-
-    def _blend_head(self, eye_u, eye_v, lm, w, h):
-        """Add head rotation to the eye-in-head angles.
-
-        `eye_u`/`eye_v` are 0..1 with 0.5 neutral. The head term is scaled so
-        that HEAD_YAW_SPAN of rotation is worth full deflection, then the two
-        are mixed by `head_weight`.
-        """
-        pose = self._head_rotation(lm, w, h)
-        if pose is None:
-            return eye_u, eye_v
-        yaw, pitch = pose
-        self.head_yaw, self.head_pitch = yaw, pitch
-
-        # NOT clipped to +/-1.
-        #
-        # This was the second saturation, and it is why the head slider at
-        # maximum still gave a constant vertical reading (raw v = 0.01).
-        # solvePnP reports an absolute angle, and that angle carries a
-        # constant bias from things the operator cannot change: the camera
-        # sitting above or below eye level, and the generic face model not
-        # matching this particular face. A bias of 20 deg against a 16 deg
-        # span sits permanently on the rail, so the head term is a constant
-        # and the vertical axis reports the same number whatever the operator
-        # does.
-        #
-        # Leaving it unclipped means a bias simply shifts the value, which the
-        # calibration's offset absorbs. The range is then spent on MOVEMENT,
-        # which is the part that carries information.
-        norm_yaw = yaw / HEAD_YAW_SPAN
-        norm_pitch = pitch / HEAD_PITCH_SPAN
-
-        k = self.head_weight
-        # Head yaw positive = turned to the image's right = larger u.
-        # Head pitch positive = tilted up = smaller v.
-        u = (1.0 - k) * eye_u + k * (0.5 + 0.5 * norm_yaw)
-        v = (1.0 - k) * eye_v + k * (0.5 - 0.5 * norm_pitch)
-        return u, v
-
-    # ------------------------------------------------------------------ logic
     def _classify(self, dx, dy, rx, ry):
         """Map an offset from centre to a control zone, with an oval deadzone.
 

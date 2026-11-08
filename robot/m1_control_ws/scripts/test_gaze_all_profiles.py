@@ -42,6 +42,18 @@ class Tracker:
                 (self.v - 0.5) / 1.2 + 0.55,
                 True, 0.0)
 
+    def features(self, max_age=0.5):
+        """A ten-float vector, shaped like the real tracker's.
+
+        Only the first five columns matter here: these tests check the
+        dialog's plumbing, not the model's accuracy. The last five are head
+        pose and position, held at neutral.
+        """
+        raw = self.latest_raw()
+        u, v = (raw[0], raw[1]) if raw else (0.5, 0.5)
+        return [u - 0.5, v - 0.5, 0.4, u - 0.5, v - 0.5,
+                0.0, 0.0, 0.0, 0.0, 55.0]
+
 
 def run(app, dialog_cls, profile, limit=180):
     tracker = Tracker()

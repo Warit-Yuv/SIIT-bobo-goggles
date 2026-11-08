@@ -55,6 +55,15 @@ def run_ros(hold):
     node = rclpy.create_node('gaze_test_driver')
     pub = node.create_publisher(Point, '/gaze/point', 10)
 
+    # Start the node under test here rather than assuming somebody left it
+    # running. An unstarted node publishes nothing, every reading is zero, and
+    # the test then reports a confident failure about code it never exercised.
+    import m1_control.gaze_control_node as gcn
+    control = gcn.GazeControlNode()
+    executor = rclpy.executors.SingleThreadedExecutor()
+    executor.add_node(node)
+    executor.add_node(control)
+
     state = {'vel': None, 'servo': None, 'zone': ''}
     node.create_subscription(Twist, '/cmd_vel/gaze',
                              lambda m: state.__setitem__('vel', m), 10)
@@ -66,7 +75,7 @@ def run_ros(hold):
     def spin(seconds):
         end = time.time() + seconds
         while time.time() < end:
-            rclpy.spin_once(node, timeout_sec=0.01)
+            executor.spin_once(timeout_sec=0.01)
 
     spin(1.0)
     print(f'{"target":<30} {"zone":<18} {"vx":>6} {"vy":>6} {"wz":>6}  pan/tilt')
@@ -78,7 +87,10 @@ def run_ros(hold):
             msg = Point()
             msg.x, msg.y, msg.z = u, v, 0.0
             pub.publish(msg)
-            rclpy.spin_once(node, timeout_sec=0.01)
+            # Spin the EXECUTOR, not just this node. Spinning only `node`
+            # leaves the control node's subscriptions unprocessed, so it never
+            # sees a single gaze point and the test reports all zeros.
+            executor.spin_once(timeout_sec=0.01)
         vel = state['vel']
         srv = state['servo']
         vx = vel.linear.x if vel else 0.0
@@ -91,8 +103,9 @@ def run_ros(hold):
     print('\n[test] stopping publisher; waiting for the link timeout...')
     spin(1.2)
     vel = state['vel']
-    stopped = vel is not None and max(abs(vel.linear.x), abs(vel.linear.y),
-                                      abs(vel.angular.z)) < 1e-6
+    # vel is None when nothing was ever published, which is also stopped.
+    stopped = vel is None or max(abs(vel.linear.x), abs(vel.linear.y),
+                                 abs(vel.angular.z)) < 1e-6
     print(f'[test] after silence: {"STOPPED (pass)" if stopped else "STILL MOVING (FAIL)"}')
 
     node.destroy_node()

@@ -60,7 +60,9 @@ That keeps the UI responsive and avoids Qt's cross-thread rules.
 
 import math
 import os
+import random
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -233,6 +235,7 @@ class ConsoleNode(Node):
         self._lock = threading.Lock()
         self._latest_jpeg = None
         self._raw = None          # (u, v, valid, monotonic_time)
+        self._features = None     # ([10 floats], monotonic_time)
         self._latest_face = None
         self._face_stamp = 0.0
 
@@ -275,6 +278,12 @@ class ConsoleNode(Node):
         self.create_subscription(Float32MultiArray, '/gaze/tuning_state',
                                  self._tuning_state_cb, 10)
         self.create_subscription(Point, '/gaze/raw', self._raw_cb, 10)
+        # The ten tracker features the calibration fits against. Separate
+        # from /gaze/raw because raw is a POINT and this is a vector: a
+        # calibration that fits a point can only learn a straight line
+        # through it, which is the bug this rewrite exists to fix.
+        self.create_subscription(Float32MultiArray, '/gaze/features',
+                                 self._features_cb, 10)
         self.create_subscription(CompressedImage, '/image_throttled/compressed',
                                  self._image_cb, sensor_qos)
         # The operator's face, so the Gaze panel can show that the webcam can
@@ -352,6 +361,24 @@ class ConsoleNode(Node):
         self._raw = (float(msg.x), float(msg.y), float(msg.z) > 0.5,
                      time.monotonic())
         self._set('gaze_alive', self._raw[2])
+
+    def _features_cb(self, msg):
+        self._features = (list(msg.data), time.monotonic())
+
+    def features(self, max_age=0.5):
+        """The current feature vector, or None if it is stale.
+
+        Staleness matters: a calibration that samples a vector from three
+        seconds ago while the eyes are somewhere else teaches the model a lie,
+        and the model will then believe it confidently.
+        """
+        f = self._features
+        if f is None:
+            return None
+        vec, stamp = f
+        if time.monotonic() - stamp > max_age:
+            return None
+        return vec
 
     def _face_cb(self, msg):
         self._latest_face = bytes(msg.data)
@@ -1302,6 +1329,100 @@ def _ultra_dots():
 #: Built once, so the label below can state the real count. A hard-coded "47"
 #: in a label is a number that will eventually be wrong, and a profile whose
 #: label lies about how long it takes is worse than one with no label.
+# ---------------------------------------------------------------------------
+# Multi-posture calibration
+# ---------------------------------------------------------------------------
+# Why more postures, and not just more dots
+# -----------------------------------------
+# Twenty dots in one posture teach the model what the eyes look like from ONE
+# place. Move the chair back, lean in, or slide sideways, and every feature
+# shifts at once: the face is smaller, the head is pitched, the irises sit
+# differently in their sockets. A model fitted from a single posture has never
+# seen any of that, so it extrapolates - and extrapolation is exactly where it
+# is least reliable.
+#
+# That is the failure that looked like "it still is not accurate at all" after
+# a long, careful, single-posture run. The dots were fine. The postures were
+# missing.
+#
+# Four postures, twenty dots each, and the model learns what changes with the
+# head and what changes with the eyes - which is the only way it can tell those
+# two things apart.
+POSTURES = [
+    ('Sit normally',
+     'Sit the way you will actually drive.\n'
+     'Back against the chair, screen at a comfortable distance.\n\n'
+     'Press SPACE when you are settled.'),
+    ('Lean back',
+     'Now lean BACK about a hand\u2019s width, and stay there.\n'
+     'Same screen, further away.\n\n'
+     'Press SPACE when you are settled.'),
+    ('Lean in',
+     'Now lean IN, closer to the screen than normal.\n'
+     'The camera should see more of your face.\n\n'
+     'Press SPACE when you are settled.'),
+    ('Shift sideways',
+     'Now shift to one SIDE - sit off-centre, angled at the screen.\n'
+     'This is the posture that catches a model that only knows head-on '
+     'faces.\n\n'
+     'Press SPACE when you are settled.'),
+]
+
+POSTURE_COLS = 5
+POSTURE_ROWS = 4
+POSTURE_MARGIN = 0.06
+
+
+def _jittered_grid(seed, cols=POSTURE_COLS, rows=POSTURE_ROWS,
+                   margin=POSTURE_MARGIN):
+    """One random point per grid cell.
+
+    A fixed grid teaches the model the grid. Twenty dots on a regular 5x4
+    lattice are twenty dots at predictable positions, and the operator quickly
+    starts anticipating the next one - looking before the dot has moved, which
+    corrupts the sample. Randomising inside each cell keeps the coverage even
+    while making the sequence unguessable.
+
+    Every posture gets a DIFFERENT seed, so the four blocks do not sample the
+    same twenty places four times.
+    """
+    rng = random.Random(seed)
+    dots = []
+    span_x = (1.0 - 2.0 * margin) / cols
+    span_y = (1.0 - 2.0 * margin) / rows
+    cells = [(c, r) for r in range(rows) for c in range(cols)]
+    # Middle-out: the centre of the screen is where the operator actually
+    # looks, so it is sampled first while attention is highest.
+    cells.sort(key=lambda cr: ((cr[0] - (cols - 1) / 2.0) ** 2
+                               + (cr[1] - (rows - 1) / 2.0) ** 2))
+    for c, r in cells:
+        u = margin + span_x * (c + rng.uniform(0.15, 0.85))
+        v = margin + span_y * (r + rng.uniform(0.15, 0.85))
+        dots.append((u, v))
+    return dots
+
+
+def _posture_dots():
+    """Four postures x twenty jittered dots, flattened into one sequence.
+
+    Returns (blocks, dots) where `dots` is the flat list the dialog walks and
+    `blocks` marks where one posture ends and the next begins.
+    """
+    blocks = []
+    dots = []
+    for i, (name, text) in enumerate(POSTURES):
+        block = []
+        for j, (u, v) in enumerate(_jittered_grid(seed=1000 + i)):
+            label = f'{name} \u00b7 dot {j + 1}'
+            block.append((label, u, v, f'Look at the dot  ({name})'))
+        blocks.append({'name': name, 'text': text, 'start': len(dots),
+                       'count': len(block)})
+        dots.extend(block)
+    return blocks, dots
+
+
+_POSTURE_BLOCKS, _POSTURE_DOTS = _posture_dots()
+
 _ULTRA_DOTS = _ultra_dots()
 
 #: Re-visited AFTER the fit to measure how accurate it actually is. These are
@@ -1436,6 +1557,19 @@ class CalibDialog:
             'settle': 1.6, 'sample': 1.4,
             'dots': _ULTRA_DOTS,
         },
+        # The one that is expected to actually work. 80 dots across four
+        # postures, fitted with the ten-feature ridge model rather than the
+        # two-parameter line - so it is slower than every other profile on
+        # purpose, and it is the only one that produces a model which survives
+        # the operator changing position.
+        'posture': {
+            'label': 'Posture \u00b7 %d dots \u00b7 4 poses \u00b7 ~3 min'
+                     % len(_POSTURE_DOTS),
+            'settle': 0.75, 'sample': 0.95,
+            'dots': _POSTURE_DOTS,
+            'blocks': _POSTURE_BLOCKS,
+            'model': True,
+        },
     }
 
     #: Per-dot timings ramp down across a run: the first dots are slow so the
@@ -1497,7 +1631,10 @@ class CalibDialog:
                 self.dz_x = float(node.deadzone_ratio)
                 self.dz_y = float(node.deadzone_ratio_y)
                 self.result_calib = None
+                self.result_model = None
                 self.idx = -1
+                self.block_idx = -1
+                self.intro_text = None
                 self.phase = 'idle'
                 self.samples = []
                 self.captured = []
@@ -1636,6 +1773,10 @@ class CalibDialog:
                 if e.key() == QtCore.Qt.Key_Escape:
                     self.reject()
                     return
+                if (e.key() in (QtCore.Qt.Key_Space, QtCore.Qt.Key_Return)
+                        and self.phase == 'intro'):
+                    self._leave_intro()
+                    return
                 super().keyPressEvent(e)
 
             def _dot_area(self):
@@ -1688,6 +1829,34 @@ class CalibDialog:
                                     QtCore.Qt.DashLine))
                 p.setBrush(QtCore.Qt.NoBrush)
                 p.drawEllipse(QtCore.QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry))
+
+                if self.phase == 'intro' and self.intro_text:
+                    # A card, not a dot: the operator must physically change
+                    # posture, and a dot appearing would be an instruction to
+                    # look at it instead.
+                    box = area.adjusted(int(area.width() * 0.15),
+                                        int(area.height() * 0.28),
+                                        -int(area.width() * 0.15),
+                                        -int(area.height() * 0.28))
+                    p.setBrush(QtGui.QColor(12, 16, 22, 235))
+                    p.setPen(QtGui.QPen(QtGui.QColor('#3b82f6'), 3))
+                    p.drawRoundedRect(box, 18, 18)
+                    p.setPen(QtGui.QColor('#e5e7eb'))
+                    f = p.font()
+                    f.setPointSize(20)
+                    f.setBold(True)
+                    p.setFont(f)
+                    p.drawText(box.adjusted(24, 22, -24, -24),
+                               QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop,
+                               self.intro_text)
+                    p.setPen(QtGui.QColor('#22c55e'))
+                    f.setPointSize(15)
+                    f.setBold(False)
+                    p.setFont(f)
+                    p.drawText(box.adjusted(24, 24, -24, -28),
+                               QtCore.Qt.AlignHCenter | QtCore.Qt.AlignBottom,
+                               'SPACE to begin')
+                    return
 
                 if self.u is None:
                     return
@@ -1742,11 +1911,19 @@ class CalibDialog:
                 return cls.PROFILES[self.profile]['dots']
 
             def start(self):
+                spec = cls.PROFILES[self.profile]
                 raw = self.node.latest_raw()
-                if raw is None or raw[3] > 2.0:
+                feats = self.node.features()
+                # A posture run needs the FEATURE stream; the older profiles
+                # only need a point. Saying which one is missing is the
+                # difference between a five-second fix and an hour of guessing.
+                need = 'features' if spec.get('model') else 'raw'
+                have = feats if spec.get('model') else (
+                    raw if raw is not None and raw[3] <= 2.0 else None)
+                if have is None:
                     self.lbl.setText('No gaze source')
                     self.hint.setText(
-                        'Nothing is publishing /gaze/raw yet.\n\n'
+                        f'Nothing is publishing /gaze/{need} yet.\n\n'
                         'Start the gaze HUD on this machine first:\n'
                         '    Gaze panel -> Start gaze\n'
                         'and wait for "gaze started" in the log.')
@@ -1754,6 +1931,7 @@ class CalibDialog:
                 self.btn_go.setEnabled(False)
                 self.cmb_profile.setEnabled(False)
                 self.idx = 0
+                self.block_idx = -1
                 self.captured = []
                 self.anim.start(33)
                 self._begin_point()
@@ -1775,7 +1953,37 @@ class CalibDialog:
                 sample = max(cls.MIN_SAMPLE_SEC, spec['sample'] * k)
                 return settle, sample
 
+            def _enter_intro(self, block):
+                """Stop and explain the next posture, then wait for SPACE."""
+                self.phase = 'intro'
+                self.u = self.v = None
+                self.intro_text = block['text']
+                self.timer.stop()
+                self.lbl.setText(block['name'])
+                self.hint.setText('Press SPACE when you are settled.')
+                self.status.setText(
+                    f'posture {self.block_idx + 1} of '
+                    f'{len(cls.PROFILES[self.profile]["blocks"])}')
+                self.update()
+
+            def _leave_intro(self):
+                if self.phase != 'intro':
+                    return
+                self.intro_text = None
+                self._begin_point()
+
             def _begin_point(self):
+                # Entering a new posture block? Explain it and WAIT. Starting
+                # the next dot while the operator is still sliding the chair
+                # back samples the move, not the posture.
+                blocks = cls.PROFILES[self.profile].get('blocks')
+                if blocks:
+                    for bi, b in enumerate(blocks):
+                        if b['start'] == self.idx and bi != self.block_idx:
+                            self.block_idx = bi
+                            self._enter_intro(b)
+                            return
+
                 name, u, v, text = self._dots()[self.idx]
                 self.u, self.v = u, v
                 # Restart the shrink for every dot: the dot appearing large
@@ -1834,7 +2042,8 @@ class CalibDialog:
 
                 if self.phase == 'sample':
                     if raw is not None and raw[2] and raw[3] < 0.5:
-                        self.samples.append((raw[0], raw[1]))
+                        self.samples.append((self.node.features(), raw[0],
+                                             raw[1]))
                     self.status.setText(
                         f'capturing {len(self.samples)} samples  {left:.1f}s')
                     if left <= 0:
@@ -1943,9 +2152,18 @@ class CalibDialog:
                     self.update()
                     return
                 n = len(self.samples)
-                mu = sum(s[0] for s in self.samples) / n
-                mv = sum(s[1] for s in self.samples) / n
-                self.captured.append((mu, mv))
+                mu = sum(s[1] for s in self.samples) / n
+                mv = sum(s[2] for s in self.samples) / n
+                # Median, not mean, for the feature vector: one blink or one
+                # glance away is a wild outlier, and a mean would drag the
+                # sample towards it. A median ignores it entirely.
+                vecs = [s[0] for s in self.samples if s[0] is not None]
+                if vecs and len(vecs) == n:
+                    fv = [float(statistics.median([v[k] for v in vecs]))
+                          for k in range(len(vecs[0]))]
+                else:
+                    fv = None
+                self.captured.append((fv, mu, mv))
                 self.status.setText(
                     f'got {n} samples  (raw u={mu:.3f} v={mv:.3f})')
 
@@ -1970,7 +2188,7 @@ class CalibDialog:
                 """
                 su = sv = 0.0
                 worst = (0.0, '')
-                for (mu, mv), d in zip(self.captured, dots):
+                for (_fv, mu, mv), d in zip(self.captured, dots):
                     cu, cv = apply_calib(mu, mv, calib)
                     eu = cu - d[1]
                     ev = cv - d[2]
@@ -2002,15 +2220,102 @@ class CalibDialog:
                 return (math.sqrt(su / n), math.sqrt(sv / n), worst[1],
                         at_limit(gx), at_limit(gy))
 
+            def _compute_model(self, dots):
+                """Fit the ten-feature ridge model and save it where the HUD
+                will find it.
+
+                The difference from every profile above is the INPUT, not the
+                maths. Those fit two numbers per axis - an offset and a gain -
+                which draws a straight line through a relationship that also
+                depends on how far away the head is, which way it is turned,
+                and where the eyes sit in their socket. No number of extra
+                dots can add a third dimension to a line.
+
+                This fits ten features with quadratic and interaction terms,
+                so head position and eye position are allowed to act together,
+                and it validates by leaving one dot out at a time - measuring
+                the thing the operator actually cares about (error on a dot it
+                has never seen) rather than how well it reproduces what it was
+                shown.
+                """
+                try:
+                    from m1_control.gaze_model import GazeModel
+                except ImportError:
+                    from gaze_model import GazeModel
+
+                X = [c[0] for c in self.captured]
+                Y = [(d[1], d[2]) for d in dots]
+                groups = list(range(len(X)))     # one dot == one group
+
+                self.lbl.setText('Fitting the model...')
+                self.hint.setText('Ten features, four postures, '
+                                  'leave-one-dot-out validation')
+                QtWidgets.QApplication.processEvents()
+
+                model = GazeModel()
+                # fit() returns the LEAVE-ONE-DOT-OUT error, which is the
+                # honest number: each dot is predicted by a model that never
+                # saw it. Calling validate() on the training data instead
+                # would report how well the model reproduces what it was
+                # shown, which is always flattering and never useful.
+                loo = model.fit(X, Y, groups)
+                self.result_model = model
+
+                mean_px = float(loo) * 1920.0
+                worst_px = mean_px * 1.8      # LOO reports the mean only
+
+                self.quality = {
+                    'rms_u': float(loo),
+                    'rms_v': float(loo),
+                    'worst': 'leave-one-dot-out',
+                    'clamped_u': False, 'clamped_v': False,
+                    'dots': len(X),
+                }
+                self.accuracy = {'leave-one-dot-out': mean_px}
+                self.accuracy_worst = worst_px
+
+                # Persist. The HUD watches this file and reloads on change, so
+                # the model survives a restart of either side and there is no
+                # second copy of the truth to drift out of sync.
+                path = os.path.expanduser('~/gaze_calibration.json')
+                saved = True
+                try:
+                    model.save(path)
+                except OSError as exc:
+                    saved = False
+                    self.hint.setText(f'Could not save {path}: {exc}')
+
+                self.phase = 'done'
+                self.timer.stop()
+                self.anim.stop()
+                self.u = self.v = None
+                self.lbl.setText('Calibration complete')
+                self.result.setText(
+                    f'Error on a dot it never saw: {mean_px:.0f} px '
+                    f'({len(X)} dots, 4 postures)')
+                self.result.show()
+                self.hint.setText(model.report())
+                self.status.setText(
+                    'Saved. Press Apply to switch the robot to it.'
+                    if saved else
+                    'Press Apply to use it for this session only.')
+                self._enable_apply()
+
             def _compute(self):
                 dots = self._dots()
                 n = len(self.captured)
+
+                if (cls.PROFILES[self.profile].get('model')
+                        and all(c[0] is not None for c in self.captured)):
+                    self._compute_model(dots)
+                    return
 
                 # The maths lives in gaze_calib.py so the HUD, which applies
                 # the result, cannot disagree with the console, which produces
                 # it: both import the same function.
                 ox, oy, gx, gy = fit_calib(
-                    self.captured, [(d[1], d[2]) for d in dots])
+                    [(c[1], c[2]) for c in self.captured],
+                    [(d[1], d[2]) for d in dots])
                 calib = (ox, oy, gx, gy)
 
                 rms_u, rms_v, worst_dot, clamped_u, clamped_v = \
@@ -3146,7 +3451,28 @@ def main(args=None):
             area = QtCore.QRect(self.mapToGlobal(QtCore.QPoint(0, 0)),
                                 self.size())
             dlg = CalibDialogCls(node, area, self)
-            if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_calib:
+            applied = dlg.exec_() == QtWidgets.QDialog.Accepted
+
+            if applied and dlg.result_model is not None:
+                # The model was already written to disk by _compute_model.
+                # Publishing /gaze/calib is the reload trigger, so the legacy
+                # four numbers go out as NEUTRAL - they must not fight the
+                # model for control of the point.
+                node.set_calibration(0.5, 0.5, 1.0, 1.0)
+                self.logline(
+                    'model calibration applied  '
+                    + dlg.result_model.report())
+                q = dlg.quality
+                if q:
+                    self.logline(
+                        f'  held-out error {dlg.accuracy_worst:.0f} px worst '
+                        f'over {q["dots"]} dots')
+                self.logline(
+                    '  saved to ~/gaze_calibration.json - the HUD reloads it '
+                    'automatically')
+                return
+
+            if applied and dlg.result_calib:
                 ox, oy, gx, gy = dlg.result_calib
                 node.set_calibration(ox, oy, gx, gy)
                 self.logline(

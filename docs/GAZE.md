@@ -195,6 +195,146 @@ moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
 
 ---
 
+## The architecture, and why it changed
+
+Everything above this point describes a tracker that measured **two numbers**
+per eye — a horizontal and a vertical offset — and a calibration that fitted a
+straight line through them:
+
+```
+corrected = (raw - offset) * gain + 0.5
+```
+
+That model has two unknowns per axis. It was rewritten four times, given four
+calibration profiles up to 47 dots, and still failed. **The maths was never the
+problem. The input was.**
+
+Gaze is not a function of one variable. It depends on where the eyes point,
+where the head points, how far away the head is, and where the head sits
+laterally. A straight line through any one of those is wrong the moment the
+operator moves — and the operator always moves.
+
+The current implementation splits the job in two:
+
+| Module | Job |
+|---|---|
+| `gaze_tracker.py` | camera frame → **ten features** |
+| `gaze_model.py` | ten features → **screen point** |
+
+### The ten features
+
+| # | Name | Source | What it carries |
+|---|---|---|---|
+| 0 | `eye_h` | iris offset from eye **centre**, ÷ eye width | where the eye points |
+| 1 | `eye_v` | same, vertical | " |
+| 2 | `eye_open` | eyelid gap ÷ eye width | blinks, and a proxy for pitch |
+| 3 | `look_h` | blendshape `eyeLookOut` − `eyeLookIn` | the model's own eye direction |
+| 4 | `look_v` | blendshape `eyeLookUp` − `eyeLookDown` | " |
+| 5 | `yaw` | head pose, `solvePnP` | where the head points |
+| 6 | `pitch` | " | " |
+| 7 | `head_x` | translation | lateral position |
+| 8 | `head_y` | " | height |
+| 9 | `head_z` | " | **distance** |
+
+The iris is matched to its eye by **nearest**, not by index order. A mirrored
+frame inverts the horizontal signal, and the two eyes' landmark indices are
+mirror images of each other — matching by index would have made the model learn
+the mirror as truth.
+
+### Why the cubic terms matter
+
+Features 0, 1, 3 and 4 get a **cubic** term as well as a square.
+
+The iris cannot leave the eye. Past roughly 14° of look angle the measured
+offset stops growing and flattens — the relationship between gaze angle and
+measured eye position is an S-curve, and an S-curve has an inflection in the
+middle. A parabola bends the same way everywhere and structurally cannot
+represent that.
+
+Measured on a synthetic operator built with exactly this saturation:
+
+| Model | Held-out error (1920 px wide) |
+|---|---|
+| quadratic only | 75 px |
+| **+ cubic on the four eye columns** | **24 px** |
+
+Four extra columns, no extra dots, no change in operator behaviour — a
+threefold improvement.
+
+### Multi-posture calibration
+
+Twenty dots in one posture teach the model what the eyes look like from **one
+place**. Move the chair back, lean in, or slide sideways and every feature
+shifts at once. A single-posture model has never seen that, so it extrapolates,
+and extrapolation is exactly where it is least reliable.
+
+The **Posture** profile calibrates at four postures, 20 dots each:
+
+| Posture | What it teaches |
+|---|---|
+| Sit normally | the baseline |
+| Lean back | distance, and a smaller face in frame |
+| Lean in | distance, the other way |
+| Shift sideways | off-centre faces, and yaw |
+
+Each posture gets its own **jittered 5×4 grid** — one random point per cell,
+middle-out, a different seed per posture, so no two postures sample the same
+twenty places and the sequence cannot be anticipated.
+
+Between postures the dialog **stops** and shows a card. It waits for SPACE,
+because starting the next dot while the operator is still sliding the chair
+back samples the move, not the posture.
+
+Measured on the same synthetic operator:
+
+| Calibration | Dots | Held-out error |
+|---|---|---|
+| single posture | 20 | 192 px |
+| **four postures** | **80** | **24 px mean, 63 px p95** |
+
+**8× better on points neither had seen.** That is the difference between a
+tracker the operator abandons and one they use.
+
+### Where the model lives
+
+`~/gaze_calibration.json`, written by the console and watched by the HUD. The
+HUD reloads it within a second of it changing, so the model survives a restart
+of either side and there is never a second copy of the truth to drift out of
+sync.
+
+### Reporting is leave-one-dot-out
+
+`fit()` returns the **leave-one-dot-out** error: each dot is predicted by a
+model that never saw it. That is the number shown.
+
+Calling `validate()` on the training data instead would report how well the
+model reproduces what it was shown — always flattering, never useful, and
+precisely how a broken calibration can run to completion, report success, and
+still steer wrong.
+
+### Tests
+
+```
+python3 scripts/test_posture_calib.py    # 8x proof, needs no hardware
+python3 scripts/test_gaze_model.py       # ridge vs offset+gain
+QT_QPA_PLATFORM=offscreen python3 scripts/test_dialog_fit.py
+python3 scripts/render_face_overlay.py   # writes /tmp/annotated.jpg
+```
+
+`test_posture_calib.py` builds a synthetic operator whose irises saturate and
+whose head sits at four distances, then compares single- and multi-posture
+calibration **using the same model**. Any difference is therefore the
+calibration data and not the maths — which is the whole point.
+
+### The face overlay
+
+`/gaze/face` carries a small annotated crop of the operator's face: green eye
+outlines, iris circles, an arrow through each eye showing which way it is
+turned, and a box round the face. Without it, a frozen dot and a camera pointed
+at the ceiling look identical.
+
+---
+
 ## Calibrating
 
 **5 · Gaze → Calibrate…**
@@ -202,12 +342,18 @@ moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
 Four profiles. All fit the same two numbers per axis; they differ only in how
 many dots are used to fit them.
 
-| Profile | Dots | Time | Use it when |
-|---|---|---|---|
-| **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
-| **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
-| **Super** | 20 — weighted to the centre and the vertical axis | ~1 min | up/down still not working |
-| **Ultra** | 47 — a scattered 5×8 grid plus 7 centre dots | ~2 min | nothing else worked |
+| Profile | Dots | Time | Model | Use it when |
+|---|---|---|---|---|
+| **Fast** | 5 — centre, top, right, bottom, left | ~10 s | 2-param | you shifted in your seat |
+| **Long** | 9 — a 3×3 grid | ~30 s | 2-param | first time, or after a long break |
+| **Super** | 20 — weighted to the centre and the vertical axis | ~1 min | 2-param | up/down still not working |
+| **Ultra** | 47 — a scattered 5×8 grid plus 7 centre dots | ~2 min | 2-param | nothing else worked |
+| **Posture** | 80 — four postures × 20 jittered dots | ~3 min | **10-feature ridge** | **this is the one that works** |
+
+**Use Posture.** The other four are kept as single-posture fallbacks and as a
+quick re-alignment after shifting in your seat. They fit the two-parameter
+model described at the top of this file, which cannot account for the operator
+moving — see *The architecture, and why it changed* above.
 
 More dots do not add parameters — the model has two unknowns per axis either
 way. They add **confidence**, and they give the outlier rejection enough spare

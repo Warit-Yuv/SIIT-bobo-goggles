@@ -141,7 +141,9 @@ def main():
         # so the operator keeps calibrating a tracker that is not running.
         node = make_node()
         node._cap = None
-        node._face_mesh = None
+        node._tracker = None
+        node._model = None
+        node._model_ready = False
         node._cam_failures = 0
         node._face_seen_at = 0.0
         node._no_face_since = 0.0
@@ -173,15 +175,14 @@ def main():
         node._warned_no_face = False
         node.gaze_valid = True
 
-        # Drive the "no landmarks" branch directly with a stub result.
-        class Res:
-            multi_face_landmarks = None
+        # Drive the "no face" branch directly with a stub tracker.
+        class Tracker:
+            def process(self, _frame, _stamp_ms):
+                return None
 
-        class Mesh:
-            def process(self, _rgb):
-                return Res()
-
-        node._face_mesh = Mesh()
+        node._tracker = Tracker()
+        node._model = None
+        node._model_ready = False
         node._cap = FakeCap(1, opens=True, frames=True)
         node._cam_failures = 0
 

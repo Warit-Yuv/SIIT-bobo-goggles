@@ -106,6 +106,35 @@ class GazeControlNode(Node):
         # Set false to use the handbook's 4 quadrants only.
         self.declare_parameter('enable_strafe', True)
 
+        # ---- horizontal emphasis ----
+        #
+        # Vertical gaze is the weak axis: the iris barely moves up and down
+        # inside the eye, so the vertical signal is mostly noise and head
+        # pitch, and on this hardware it has never been reliable enough to
+        # steer with. Horizontal is clean.
+        #
+        # With this false (the default) ONLY left/right produce chassis motion.
+        # The vertical axis is still used for PTZ tilt, where a small wrong
+        # angle is harmless, but never for driving - so a bad vertical signal
+        # cannot drive the robot into anything.
+        #
+        # Forward/backward is then handled by the jaw clench (EEG), which is a
+        # deliberate, low-latency, single-bit gesture and is far more
+        # dependable than looking up.
+        self.declare_parameter('enable_vertical', False)
+
+        # ---- EEG gating (protocol v1 toggles) ----
+        #
+        #   run=false            nothing moves
+        #   run=true mode=robot  gaze steers the CHASSIS
+        #   mode=camera          gaze steers the PTZ HEAD only, chassis still
+        #
+        # Gating the chassis on `run` is what makes a jaw clench a dead-man
+        # switch: the robot only moves while the operator has deliberately
+        # said so.
+        self.declare_parameter('use_eeg_gating', True)
+        self.declare_parameter('eeg_link_timeout_sec', 1.5)
+
         self.declare_parameter('drive_speed_x', 0.20)
         self.declare_parameter('drive_speed_y', 0.20)
         self.declare_parameter('turn_speed_z', 0.60)
@@ -141,6 +170,9 @@ class GazeControlNode(Node):
         self.dwell_threshold = float(gp('dwell_time_sec').value)
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.enable_strafe = bool(gp('enable_strafe').value)
+        self.enable_vertical = bool(gp('enable_vertical').value)
+        self.use_eeg_gating = bool(gp('use_eeg_gating').value)
+        self.eeg_link_timeout = float(gp('eeg_link_timeout_sec').value)
         self.drive_vx = float(gp('drive_speed_x').value)
         self.drive_vy = float(gp('drive_speed_y').value)
         self.turn_wz = float(gp('turn_speed_z').value)
@@ -174,6 +206,16 @@ class GazeControlNode(Node):
         self.zone_since = time.time()
         self.confirmed_zone = ZONE_CENTER
 
+        # EEG state (protocol v1 toggles). Defaults are the safe ones: not
+        # running, and the head rather than the chassis, so a missing EEG
+        # bridge cannot make the robot drive.
+        self.eeg_run = False
+        self.eeg_mode = 'camera'
+        self.eeg_link = False
+        self.eeg_last = 0.0
+        self.eeg_ever_seen = False
+        self._warned_no_eeg = False
+
         # ---------------- interfaces ----------------
         actuator_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -190,6 +232,14 @@ class GazeControlNode(Node):
 
         self.create_subscription(Point, gp('gaze_topic').value,
                                  self.gaze_cb, 10)
+
+        # EEG toggles. Latched (TRANSIENT_LOCAL) on the publisher side, so a
+        # late subscriber still sees the current state instead of waiting for
+        # the next gesture - which may be minutes away.
+        from std_msgs.msg import Bool as _Bool
+        self.create_subscription(_Bool, '/eeg/run', self._eeg_run_cb, mode_qos)
+        self.create_subscription(String, '/eeg/mode', self._eeg_mode_cb, mode_qos)
+        self.create_subscription(_Bool, '/eeg/link', self._eeg_link_cb, mode_qos)
 
         rate = float(gp('publish_rate_hz').value)
         self.create_timer(1.0 / rate, self.tick)
@@ -220,14 +270,100 @@ class GazeControlNode(Node):
         if self.assert_mode and self.gaze_valid:
             self.mode_pub.publish(UInt8(data=MODE_GAZE))
 
-    # ------------------------------------------------------------- geometry
+    # ------------------------------------------------------------ EEG state
+    def _eeg_run_cb(self, msg):
+        if bool(msg.data) != self.eeg_run:
+            self.get_logger().info(
+                f"EEG run {'ON' if msg.data else 'off'} "
+                f"(mode={self.eeg_mode})")
+        self.eeg_run = bool(msg.data)
+        self.eeg_last = time.time()
+
+    def _eeg_mode_cb(self, msg):
+        m = str(msg.data).strip().lower()
+        if m not in ('robot', 'camera'):
+            self.get_logger().warn(f'ignoring unknown EEG mode "{msg.data}"')
+            return
+        if m != self.eeg_mode:
+            self.get_logger().info(f'EEG mode -> {m}')
+        self.eeg_mode = m
+        self.eeg_last = time.time()
+
+    def _eeg_link_cb(self, msg):
+        link = bool(msg.data)
+        if link != self.eeg_link:
+            self.get_logger().info(f"EEG link {'ok' if link else 'LOST'}")
+        if link:
+            self.eeg_ever_seen = True
+        self.eeg_link = link
+        self.eeg_last = time.time()
+
+    def _chassis_allowed(self, now):
+        """May the chassis move at all right now?
+
+        Three independent gates, and all three must agree:
+
+          * `run` is the operator's explicit go/stop (jaw clench)
+          * `mode` is which thing gaze is steering (double blink)
+          * a live EEG link, so a dead laptop cannot leave the robot driving
+
+        The EEG gate only engages once an EEG has actually been seen.
+
+        Blocking on a link that was never there is a trap: the operator starts
+        the system without the headset, gaze moves the cursor, and the robot
+        does not budge - with nothing anywhere saying why. That is
+        indistinguishable from a broken tracker, and it sends them off
+        recalibrating something that was never wrong.
+
+        Once the link HAS been up, its disappearance is a dropout and the
+        chassis stops. A dead laptop must never leave the robot driving.
+        """
+        if not self.use_eeg_gating:
+            return True
+        if self.eeg_ever_seen:
+            if (not self.eeg_link
+                    or now - self.eeg_last > self.eeg_link_timeout):
+                return False
+            return self.eeg_run and self.eeg_mode == 'robot'
+        # No EEG has ever connected: gaze alone is in charge.
+        if not self._warned_no_eeg:
+            self._warned_no_eeg = True
+            self.get_logger().warn(
+                'No EEG link has ever been seen - gaze is driving the chassis '
+                'without the jaw-clench run gate. Start the EEG bridge, or set '
+                'use_eeg_gating:=false to silence this.')
+        return True
+
     def _classify(self, dx, dy, deadzone_r):
         """Map an offset from centre to a control zone.
 
         `dx` is +right, `dy` is +down (image convention). The angle is measured
         from "straight up the screen" so that 0 deg means FORWARD, +90 deg means
         screen-right, which keeps the table readable.
+
+        With `enable_vertical` false - the default - ONLY left and right produce
+        a zone. Vertical gaze is the weak axis on this hardware: the iris barely
+        moves up and down inside the eye, so the signal is mostly noise and head
+        pitch. Letting it drive would mean the robot lurching forward whenever
+        the operator glanced down at a keyboard, which is the single most
+        dangerous failure this controller could have.
+
+        So forward/backward is left to the jaw clench, which is a deliberate
+        one-bit gesture with none of that ambiguity.
         """
+        if not self.enable_vertical:
+            # Horizontal only, so ONLY the horizontal offset is allowed to
+            # decide. Testing the distance from centre instead would mean that
+            # looking straight up - dx exactly 0 - clears the deadzone and then
+            # falls through to "dx < 0 is false, so turn RIGHT". A glance at
+            # the ceiling would spin the robot on the spot.
+            #
+            # A vertical deadzone also makes the rule honest: up and down
+            # cannot leave the deadzone at all, so vertical gaze cannot drive.
+            if abs(dx) < deadzone_r:
+                return ZONE_CENTER
+            return ZONE_TURN_LEFT if dx < 0 else ZONE_TURN_RIGHT
+
         if float(np.hypot(dx, dy)) < deadzone_r:
             return ZONE_CENTER
 
@@ -337,7 +473,12 @@ class GazeControlNode(Node):
         else:
             # Dwell gate: rejects saccades, which would otherwise cause
             # spurious drives on every glance.
-            if now - self.zone_since >= self.dwell_threshold:
+            #
+            # And the chassis gate: `run` must be ON, the mode must be "robot",
+            # and the EEG link must be live. A dead laptop therefore leaves the
+            # robot standing, which is the only acceptable failure direction.
+            if (now - self.zone_since >= self.dwell_threshold
+                    and self._chassis_allowed(now)):
                 self.confirmed_zone = zone
                 fx, fy, fz = ZONE_MOTION.get(zone, (0.0, 0.0, 0.0))
                 twist.linear.x = fx * self.drive_vx
