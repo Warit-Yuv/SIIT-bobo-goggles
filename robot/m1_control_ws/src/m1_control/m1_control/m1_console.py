@@ -1049,43 +1049,106 @@ def make_map_view(QtCore, QtGui, QtWidgets):
 # Five-point gaze calibration
 # ---------------------------------------------------------------------------
 
+def _order_nearest(points, start=(0.50, 0.50)):
+    """Order points by nearest-neighbour, then shorten the long edges.
+
+    Deliberately NOT a raster sweep. A sweep walks each row left-to-right,
+    which means the eyes traverse the same horizontal path eight times and the
+    samples are strongly correlated with each other - the fit sees almost the
+    same measurement repeated, not independent evidence. A nearest-neighbour
+    walk over the same set scatters the order, so consecutive samples are not
+    systematically biased in one direction.
+
+    Nearest-neighbour alone is not enough, though: it paints itself into a
+    corner and the last few points can be a long way from where it ended up.
+    Measured on this grid, the longest single move was 0.63 of the screen - a
+    jump the operator's eyes are still finishing when sampling starts. A 2-opt
+    pass then reverses segments while that shortens the path, which removes
+    the stragglers.
+
+    `points` is a list of (name, u, v, text). The returned list starts from the
+    point nearest `start` and is a permutation of the input.
+    """
+    remaining = list(points)
+    ordered = []
+    cu, cv = start
+    while remaining:
+        i = min(range(len(remaining)),
+                key=lambda k: (remaining[k][1] - cu) ** 2
+                              + (remaining[k][2] - cv) ** 2)
+        nxt = remaining.pop(i)
+        ordered.append(nxt)
+        cu, cv = nxt[1], nxt[2]
+
+    def gap(a, b):
+        return ((a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+    # 2-opt: reverse a segment whenever doing so shortens the path. Cheap at
+    # this size and it turns a greedy walk into one with no long hops.
+    n = len(ordered)
+    for _ in range(8):
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n):
+                a, b, c = ordered[i], ordered[i + 1], ordered[j]
+                if j + 1 < n:
+                    d = ordered[j + 1]
+                    before = gap(a, b) + gap(c, d)
+                    after = gap(a, c) + gap(b, d)
+                else:
+                    before = gap(a, b)
+                    after = gap(a, c)
+                if after < before - 1e-9:
+                    ordered[i + 1:j + 1] = reversed(ordered[i + 1:j + 1])
+                    improved = True
+        if not improved:
+            break
+    return ordered
+
+
 def _ultra_dots():
-    """47 dots over about three and a half minutes, weighted to the vertical.
+    """47 dots, weighted to the vertical, visited in a scattered order.
 
     Built rather than written out because the pattern matters more than the
     individual positions, and 47 hand-typed tuples is 47 chances to make a typo
     that silently skews one axis.
 
-    The grid is 5 columns by 8 rows, and each row is walked in the opposite
-    direction to the one before. Snaking matters over this many dots: without
-    it the dot jumps from the right edge back to the left edge eight times, and
-    every one of those is a large saccade that the operator's eyes are still
-    finishing when sampling starts.
+    The point set is a 5-column grid plus seven extra dots on the centre
+    column, halfway between the rows. Vertical is where this tracker is
+    weakest - the iris barely moves up and down inside the eye, so most of that
+    signal is head pitch - and the centre column is where vertical is measured
+    with the least horizontal interference.
 
-    Seven extra dots are woven into the centre column, halfway between rows.
-    Vertical is where this tracker is weakest - the iris barely moves up and
-    down inside the eye, so most of that signal is head pitch - and the centre
-    column is where vertical is measured with the least horizontal
-    interference. They are interleaved rather than appended so no dot is ever
-    far from the one before it: measured, the longest move between consecutive
-    dots is 0.24 of the screen, against 0.93 when they were tacked on the end.
+    The VISIT ORDER is a nearest-neighbour walk from the centre, not a raster.
+    See _order_nearest() for why that matters.
+
+    Timing is handled by the dialog, which ramps it down across the run.
     """
     cols = (0.08, 0.29, 0.50, 0.71, 0.92)
     rows = (0.07, 0.19, 0.31, 0.43, 0.55, 0.67, 0.79, 0.93)
-    dots = []
+    points = []
     for ri, v in enumerate(rows):
-        # Snake: alternate direction per row so consecutive dots are neighbours.
-        order = cols if ri % 2 == 0 else tuple(reversed(cols))
-        for u in order:
-            dots.append(('r%dc%d' % (ri + 1, len(dots) + 1), u, v,
-                         'Look at the dot, and move the way you naturally would'))
-            if abs(u - 0.50) < 1e-9 and ri + 1 < len(rows):
-                # Halfway to the next row, on the centre column: one more
-                # vertical sample that costs no extra travel.
-                vm = round((v + rows[ri + 1]) / 2.0, 3)
-                dots.append(('mid%d' % (len(dots) + 1), 0.50, vm,
-                             'Look at the CENTRE dot, head and eyes together'))
-    return dots
+        for ci, u in enumerate(cols):
+            points.append(('r%dc%d' % (ri + 1, ci + 1), u, v,
+                           'Look at the dot, and move the way you naturally '
+                           'would'))
+        if ri + 1 < len(rows):
+            vm = round((v + rows[ri + 1]) / 2.0, 3)
+            points.append(('mid%d' % (ri + 1), 0.50, vm,
+                           'Look at the CENTRE dot, head and eyes together'))
+    return _order_nearest(points)
+
+
+#: Re-visited AFTER the fit to measure how accurate it actually is. These are
+#: the five directions the operator complains about, so the report speaks in
+#: the same terms they think in.
+VALIDATION_DOTS = [
+    ('CENTRE', 0.50, 0.50),
+    ('TOP', 0.50, 0.08),
+    ('BOTTOM', 0.50, 0.92),
+    ('LEFT', 0.08, 0.50),
+    ('RIGHT', 0.92, 0.50),
+]
 
 
 class CalibDialog:
@@ -1199,11 +1262,30 @@ class CalibDialog:
         # 48 dots x (2.0 s settle + 2.2 s sample) is about 3.4 minutes. At the
         # HUD's 30 Hz that is roughly 66 samples per dot.
         'ultra': {
-            'label': 'Ultra · 48 dots · ~3½ min',
-            'settle': 2.0, 'sample': 2.2,
+            'label': 'Ultra · 47 dots · ~2 min',
+            'settle': 1.6, 'sample': 1.4,
             'dots': _ultra_dots(),
         },
     }
+
+    #: Per-dot timings ramp down across a run: the first dots are slow so the
+    #: operator can settle into a posture, and the last are quick because by
+    #: then they know the rhythm. 0.55 means the final dot takes 55% as long as
+    #: the first.
+    #:
+    #: A flat timing is what made the 47-dot run feel endless. The tail of a
+    #: long run is also where attention fades, so speeding it up there costs
+    #: less than it would at the start.
+    RAMP = 0.55
+
+    #: Never let the ramp squeeze a sample window below this, whatever the
+    #: profile says. The HUD publishes at 30 Hz and this dialog ticks at 50 ms,
+    #: so 0.5 s is about 10 usable samples - comfortably above MIN_SAMPLES.
+    #:
+    #: Without this floor the fastest dots of a ramped run collected three
+    #: samples and were discarded as "tracker lost your eyes", which is a lie:
+    #: the window was simply too short to collect any.
+    MIN_SAMPLE_SEC = 0.5
 
     # A dot with fewer usable samples than this is treated as lost, and the
     # whole run is refused rather than fitted from noise.
@@ -1252,6 +1334,17 @@ class CalibDialog:
                 self.u = None
                 self.v = None
                 self.pulse_t0 = None
+                # Validation state. After the fit the five cardinal directions
+                # are re-visited to MEASURE how accurate the result is, rather
+                # than trusting the fit's own error estimate.
+                self.val_samples = []
+                self.val_idx = 0
+                self.val_errors = []
+                # Always present, so the caller can read them without a
+                # getattr guard even when the run is cancelled early.
+                self.quality = None
+                self.accuracy = None
+                self.accuracy_worst = None
                 self.timer = QtCore.QTimer(self)
                 self.timer.timeout.connect(self._tick)
                 self.phase_end = 0.0
@@ -1305,6 +1398,26 @@ class CalibDialog:
                 self.hint.setAlignment(QtCore.Qt.AlignCenter)
                 self.hint.setWordWrap(True)
                 bv.addWidget(self.hint)
+
+                # The result gets its OWN label, in its own colour, with a
+                # fixed height so it cannot be squeezed to nothing.
+                #
+                # This is why the previous quality report was invisible: it was
+                # appended to `hint`, which is a dim wrapped paragraph already
+                # holding several lines of instructions. The extra text pushed
+                # the label past what the bar could show and it was simply
+                # clipped away - the calibration appeared to end with no
+                # verdict at all.
+                self.result = QtWidgets.QLabel('')
+                self.result.setAlignment(QtCore.Qt.AlignCenter)
+                self.result.setWordWrap(True)
+                self.result.setMinimumHeight(46)
+                self.result.setStyleSheet(
+                    'color:#bbf7d0; background:#14532d;'
+                    'border:1px solid #16a34a; border-radius:6px;'
+                    'padding:6px; font-weight:bold;')
+                self.result.hide()
+                bv.addWidget(self.result)
 
                 prow = QtWidgets.QHBoxLayout()
                 prow.addWidget(QtWidgets.QLabel('Profile'))
@@ -1467,6 +1580,23 @@ class CalibDialog:
                 self.anim.start(33)
                 self._begin_point()
 
+            def _timing(self):
+                """(settle, sample) for the dot about to be shown.
+
+                Ramps down across the run: slow at the start so the operator can
+                settle into a posture, quick at the end because by then they
+                know the rhythm. A flat timing is what made the 47-dot run feel
+                endless, and the tail of a long run is where attention fades
+                anyway, so speeding up there costs least.
+                """
+                spec = cls.PROFILES[self.profile]
+                total = max(1, len(self._dots()))
+                frac = min(1.0, self.idx / float(total))
+                k = 1.0 - (1.0 - cls.RAMP) * frac
+                settle = max(cls.MIN_SAMPLE_SEC, spec['settle'] * k)
+                sample = max(cls.MIN_SAMPLE_SEC, spec['sample'] * k)
+                return settle, sample
+
             def _begin_point(self):
                 name, u, v, text = self._dots()[self.idx]
                 self.u, self.v = u, v
@@ -1477,9 +1607,37 @@ class CalibDialog:
                     f'{name}  ·  {self.idx + 1} of {len(self._dots())}')
                 self.hint.setText(text)
                 self.samples = []
+                settle, _sample = self._timing()
                 self.phase = 'settle'
-                self.phase_end = (time.monotonic() +
-                                  cls.PROFILES[self.profile]['settle'])
+                self.phase_end = time.monotonic() + settle
+                self.timer.start(50)
+                self.update()
+
+            def _begin_validation(self):
+                """Re-visit the five cardinal directions and MEASURE the error.
+
+                The fit reports how well it reproduces the dots it was trained
+                on, which is not the same as being accurate. This visits points
+                the fit has already seen the direction of, and reports the
+                actual distance between where the operator looked and where the
+                model says they looked - per direction, in the words the
+                operator uses.
+                """
+                self.phase = 'val_settle'
+                self.val_idx = 0
+                self.val_samples = []
+                self.val_errors = []
+                self._begin_val_point()
+
+            def _begin_val_point(self):
+                name, u, v = VALIDATION_DOTS[self.val_idx]
+                self.u, self.v = u, v
+                self.pulse_t0 = time.monotonic()
+                self.lbl.setText(f'Checking  ·  {name}')
+                self.hint.setText('Look at the dot — this measures the result')
+                self.samples = []
+                self.phase = 'val_settle'
+                self.phase_end = time.monotonic() + 0.9
                 self.timer.start(50)
                 self.update()
 
@@ -1492,8 +1650,8 @@ class CalibDialog:
                     self.status.setText(f'get your eyes on the dot… {left:.1f}s')
                     if left <= 0:
                         self.phase = 'sample'
-                        self.phase_end = (now +
-                                          cls.PROFILES[self.profile]['sample'])
+                        _settle, sample = self._timing()
+                        self.phase_end = now + sample
                     return
 
                 if self.phase == 'sample':
@@ -1505,8 +1663,91 @@ class CalibDialog:
                         self._finish_point()
                     return
 
+                if self.phase == 'val_settle':
+                    self.status.setText(f'checking… {left:.1f}s')
+                    if left <= 0:
+                        self.phase = 'val_sample'
+                        self.phase_end = now + 0.9
+                    return
+
+                if self.phase == 'val_sample':
+                    if raw is not None and raw[2] and raw[3] < 0.5:
+                        self.samples.append((raw[0], raw[1]))
+                    self.status.setText(
+                        f'checking {len(self.samples)} samples  {left:.1f}s')
+                    if left <= 0:
+                        self._finish_val_point()
+                    return
+
                 if self.phase == 'done':
                     self.timer.stop()
+
+            def _finish_val_point(self):
+                name, u, v = VALIDATION_DOTS[self.val_idx]
+                if len(self.samples) >= cls.MIN_SAMPLES:
+                    n = len(self.samples)
+                    mu = sum(s[0] for s in self.samples) / n
+                    mv = sum(s[1] for s in self.samples) / n
+                    cu, cv = apply_calib(mu, mv, self.result_calib)
+                    # Report in pixels of a maximised window, because that is
+                    # the unit the operator can judge.
+                    px = math.hypot((cu - u) * 1920, (cv - v) * 1080)
+                    self.val_errors.append((name, px))
+                self.val_idx += 1
+                if self.val_idx < len(VALIDATION_DOTS):
+                    self._begin_val_point()
+                else:
+                    self._report_accuracy()
+
+            def _report_accuracy(self):
+                """Show the measured error per direction, and say what it means."""
+                self.phase = 'done'
+                self.timer.stop()
+                self.anim.stop()
+                self.u = self.v = None
+
+                if not self.val_errors:
+                    worst = 0.0
+                    summary = 'Could not measure accuracy (no samples).'
+                else:
+                    worst = max(e for _n, e in self.val_errors)
+                    parts = '   '.join('%s %d' % (n, round(e))
+                                       for n, e in self.val_errors)
+                    summary = 'Measured error (px):  ' + parts
+
+                self.accuracy = dict(self.val_errors)
+                self.accuracy_worst = worst
+
+                # The worst direction is the actionable one, so it gets named.
+                if self.val_errors and worst > 220:
+                    bad = max(self.val_errors, key=lambda e: e[1])[0]
+                    verdict = (f'{bad} is off by {worst:.0f} px. Raise the Head '
+                               f'slider and run this again.')
+                elif self.val_errors and worst > 110:
+                    bad = max(self.val_errors, key=lambda e: e[1])[0]
+                    verdict = f'{bad} is the weakest direction ({worst:.0f} px).'
+                elif self.val_errors:
+                    verdict = 'Accurate in all five directions.'
+                else:
+                    verdict = 'Press Apply to use this calibration.'
+
+                self.lbl.setText('Calibration complete')
+                self.result.setText(summary + '\n' + verdict)
+                self.result.show()
+                self.hint.setText(
+                    f'offset=({self.result_calib[0]:+.3f}, '
+                    f'{self.result_calib[1]:+.3f})   '
+                    f'gain=({self.result_calib[2]:.2f}, '
+                    f'{self.result_calib[3]:.2f})')
+                self.status.setText('Press Apply to send this to the robot.')
+                self.btn_go.setText('Apply')
+                self.btn_go.setEnabled(True)
+                try:
+                    self.btn_go.clicked.disconnect()
+                except TypeError:
+                    pass
+                self.btn_go.clicked.connect(self.accept)
+                self.update()
 
             def _finish_point(self):
                 if len(self.samples) < cls.MIN_SAMPLES:
@@ -1603,25 +1844,38 @@ class CalibDialog:
                 }
 
                 self.result_calib = calib
-                self.phase = 'done'
-                self.timer.stop()
-                self.anim.stop()
-                self.u = self.v = None
 
-                # Report the fit error in a unit the operator can judge.
-                # A maximised window is about 1920 px wide, so 0.01 is ~19 px.
-                px_u = rms_u * 1920
-                px_v = rms_v * 1080
+                # Fit quality first: if a gain is pinned, the SIGNAL is wrong
+                # and re-visiting dots will not tell us anything new, so say so
+                # immediately instead of making the operator sit through a
+                # validation pass that cannot help.
                 verdict = self._verdict(rms_u, rms_v, gx, gy)
+                if clamped_u or clamped_v:
+                    self.phase = 'done'
+                    self.timer.stop()
+                    self.anim.stop()
+                    self.u = self.v = None
+                    self.lbl.setText('Calibration failed')
+                    self.result.setText(verdict)
+                    self.result.show()
+                    self.hint.setText(
+                        f'gain=({gx:.2f}, {gy:.2f})   '
+                        f'fit error {rms_u * 1920:.0f} px across, '
+                        f'{rms_v * 1080:.0f} px down')
+                    self.status.setText('Press Apply to use it anyway, or '
+                                        'Cancel and fix the signal.')
+                    self._enable_apply()
+                    return
 
-                self.lbl.setText('Calibration complete')
-                self.hint.setText(
-                    f'offset=({ox:+.3f}, {oy:+.3f})   '
-                    f'gain=({gx:.2f}, {gy:.2f})\n'
-                    f'fit error {px_u:.0f} px across, {px_v:.0f} px down\n'
-                    f'{verdict}')
-                self.status.setText(
-                    f'{n} dots · worst was {worst_dot} · press Apply')
+                # Otherwise measure it for real. The fit's own error is how well
+                # it reproduces the dots it was trained on, which is not the
+                # same as being accurate - and "accurate" is the only question
+                # the operator actually asks.
+                self.lbl.setText('Measuring accuracy…')
+                self.hint.setText('Five more dots — this checks the result')
+                self._begin_validation()
+
+            def _enable_apply(self):
                 self.btn_go.setText('Apply')
                 self.btn_go.setEnabled(True)
                 try:
@@ -2604,7 +2858,7 @@ def main(args=None):
                 # the dialog is gone by the time the operator is actually
                 # driving, and "is this calibration any good" is a question
                 # asked later, not at Apply.
-                q = getattr(dlg, 'quality', None)
+                q = dlg.quality
                 if q:
                     self.logline(
                         f'  fit error {q["rms_u"] * 1920:.0f} px across, '
@@ -2615,6 +2869,15 @@ def main(args=None):
                         self.logline(
                             f'  WARNING: {axis} gain hit a limit - the tracker '
                             f'and the dots do not agree on that axis')
+                # And the MEASURED accuracy, which is the number that matters.
+                acc = dlg.accuracy
+                if acc:
+                    parts = '  '.join(f'{k} {v:.0f}' for k, v in acc.items())
+                    self.logline(f'  measured error (px):  {parts}')
+                    if dlg.accuracy_worst and dlg.accuracy_worst > 110:
+                        self.logline(
+                            f'  weakest direction is off by '
+                            f'{dlg.accuracy_worst:.0f} px')
 
         def _reset_calibration(self):
             # Neutral is offset 0.5 and gain 1.0: (raw - 0.5) + 0.5 == raw.

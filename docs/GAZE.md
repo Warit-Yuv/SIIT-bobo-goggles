@@ -107,6 +107,28 @@ movement. At k=0 the vertical axis is flat.
 > landmarks from known rotations, so a sign flip fails the test instead of
 > reaching the operator.
 
+### The signal is stretched before blending, never after
+
+The eye term is multiplied by `iris_gain` to fill the range, and the head term
+is already full-range. Getting that order wrong cost a whole debugging cycle:
+
+```
+UP 15°     blended 0.15 → ×3 clipped → 0.00
+LEFT 20°   blended 0.16 → ×3 clipped → 0.00     ← identical
+DOWN 15°   blended 0.85 → ×3 clipped → 1.00
+RIGHT 20°  blended 0.84 → ×3 clipped → 1.00     ← identical
+```
+
+Everything more than 0.167 from centre reported **exactly** 0.0 or 1.0, so top,
+top-left and top-right all reported the same number. No fit can recover a
+position from data where distinct targets share one value — which is precisely
+why the centre worked and the edges did not, however long the calibration ran.
+
+The gain is now applied to the eye component *before* blending, so the clamp
+only ever touches the term that genuinely needs stretching.
+`scripts/test_gaze_noclip.py` asserts that distinct head poses produce distinct
+values and that nothing sits pinned at a rail.
+
 **Head position (near / far) is not used.** solvePnP recovers translation too,
 but only rotation is blended in, which is why leaning closer or further does
 not shift the aim. The reference implementation's multi-posture calibration
@@ -163,7 +185,7 @@ many dots are used to fit them.
 | **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
 | **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
 | **Super** | 20 — weighted to the centre and the vertical axis | ~1 min | up/down still not working |
-| **Ultra** | 47 — a snaking 5×8 grid plus 7 interleaved centre dots | ~3½ min | nothing else worked |
+| **Ultra** | 47 — a scattered 5×8 grid plus 7 centre dots | ~2 min | nothing else worked |
 
 More dots do not add parameters — the model has two unknowns per axis either
 way. They add **confidence**, and they give the outlier rejection enough spare
@@ -174,40 +196,40 @@ columns: the samples are concentrated on the centre column, because vertical is
 where this tracker is weakest — the iris barely moves up and down inside the
 eye, so most of that signal is head pitch.
 
-**Ultra** also *snakes*: each row is walked in the opposite direction to the
-one before, and its seven centre-column dots are woven in between the rows
-rather than tacked on the end. Measured, the longest move between consecutive
-dots is 0.22 of the screen, against 0.93 when they were appended. That matters
-over 47 dots — every long jump is a saccade the operator's eyes are still
-finishing when sampling starts.
+**Ultra** also does not sweep. A raster walk visits each row left-to-right,
+which means the eyes traverse the same horizontal path eight times and the
+samples are correlated with each other rather than independent. It uses a
+nearest-neighbour walk plus a 2-opt pass instead: scattered (38 row changes
+across 47 dots) but never jumping more than 0.24 of the screen.
+
+Timing **ramps down** across the run — 1.6 s settle at the start, 0.9 s at the
+end — because the operator knows the rhythm by then, and the tail of a long run
+is where attention fades anyway. A floor stops the ramp squeezing a sample
+window below the point where it can collect enough samples.
 
 ### Is the calibration any good?
 
-At the end of a run the dialog reports the **fit error** in pixels and a
-one-line verdict:
+After the fit, the five cardinal directions are **re-visited and measured**.
+That is the honest answer to the question, because the fit's own error only
+tells you how well it reproduces the dots it was trained on.
 
 ```
-offset=(+0.62, +0.55)   gain=(2.00, 1.20)
-fit error 12 px across, 31 px down
-Excellent fit. Press Apply.
+Measured error (px):  CENTRE 8   TOP 41   BOTTOM 33   LEFT 12   RIGHT 19
+Accurate in all five directions.
 ```
 
-This exists because "is this calibration any good?" previously had no answer.
-Four numbers that look plausible whatever they are is how a broken calibration
-runs to completion, reports success, and still steers wrong.
+The result is shown in its **own label**, not appended to the instructions. It
+used to be appended, which pushed the dim wrapped paragraph past what the bar
+could show and clipped it away — the calibration appeared to end with no verdict
+at all.
 
-A gain pinned at a limit is reported explicitly, and it matters in **both**
-directions:
+If a gain pins at a limit the run stops before validating and says why, since
+re-visiting dots cannot help when the signal itself is wrong:
 
 | Gain | Means | What to do |
 |---|---|---|
 | at `GAIN_MAX` (5.0) | the raw signal barely moved between dots — a **weak** signal | raise the **Head** slider |
 | at `GAIN_MIN` (0.25) | the raw signal moved far more than the dots did — **noise** dominating | check lighting, retry |
-
-Either way it cannot be fixed by calibrating again, which is exactly why it has
-to be reported rather than averaged away. The same numbers go to the console
-log after Apply, because the dialog is gone by the time you are actually
-driving.
 
 ### The dot shrinks
 

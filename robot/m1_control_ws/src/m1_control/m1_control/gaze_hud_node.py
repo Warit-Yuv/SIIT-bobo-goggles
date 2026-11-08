@@ -593,13 +593,35 @@ class GazeHUDNode(Node):
         # put the neutral point in the same place as the horizontal measure.
         v = 0.5 + 0.5 * (perp(l_iris, l_out, l_in) + perp(r_iris, r_in, r_out))
 
-        # Head rotation, which is the part that actually carries the signal.
-        h, v = self._blend_head(h, v, lm, rgb.shape[1], rgb.shape[0])
+        # Stretch the EYE component BEFORE blending, never after.
+        #
+        # This was the bug that made every outer calibration dot unusable.
+        # _blend_head returns a value that already spans the full 0..1 range
+        # (22 deg of head yaw is worth the whole range), and the code then did
+        # (value - 0.5) * iris_gain + 0.5 with iris_gain = 3.0 and clipped.
+        # Anything more than 0.167 away from centre therefore reported EXACTLY
+        # 0.0 or 1.0:
+        #
+        #     UP 15 deg    0.15 -> 0.00
+        #     LEFT 20 deg  0.16 -> 0.00
+        #     DOWN 15 deg  0.85 -> 1.00
+        #     RIGHT 20 deg 0.84 -> 1.00
+        #
+        # So top, top-left and top-right all reported the same number. No fit
+        # can recover a position from data where distinct targets share one
+        # value, which is why the centre worked and the edges did not.
+        #
+        # The eye term is the one that genuinely needs stretching - the iris
+        # moves a few percent of the eye's width - so it is stretched here and
+        # clamped, and the head term is left alone.
+        eh = float(np.clip((h - 0.5) * self.iris_gain_h + 0.5, 0.0, 1.0))
+        ev = float(np.clip((v - 0.5) * self.iris_gain_v + 0.5, 0.0, 1.0))
 
-        # Keep the raw value inside 0..1: the calibration maps targets into
-        # that square, and a sample outside it cannot be fitted against.
-        self.gaze_u = float(np.clip((h - 0.5) * self.iris_gain_h + 0.5, 0.0, 1.0))
-        self.gaze_v = float(np.clip((v - 0.5) * self.iris_gain_v + 0.5, 0.0, 1.0))
+        # Head rotation, which is the part that actually carries the signal.
+        h, v = self._blend_head(eh, ev, lm, rgb.shape[1], rgb.shape[0])
+
+        self.gaze_u = float(np.clip(h, 0.0, 1.0))
+        self.gaze_v = float(np.clip(v, 0.0, 1.0))
         self.gaze_valid = True
 
         if self.publish_face:
