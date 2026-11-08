@@ -152,6 +152,17 @@ def call_api(api_key: str, model: str, api_url: str, prompt: str, b64: str | Non
 
 
 def main() -> None:
+    # Model output routinely contains characters outside latin-1 (arrows,
+    # arrows in GUI labels, CJK). On a terminal whose locale resolves to
+    # latin-1, print() raises UnicodeEncodeError *after* the API call has
+    # already been paid for, losing the whole answer. Force UTF-8 and degrade
+    # unencodable characters to '?' rather than crashing.
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
     ap = argparse.ArgumentParser(
         description="Send an image to a vision model and print text back.",
     )

@@ -112,14 +112,14 @@ QPushButton:hover { background: #2c333d; border-color: #3f4954; }
 QPushButton:pressed { background: #1a1f26; }
 QPushButton:disabled { color: #555b63; border-color: #242a31; background: #1a1e24; }
 QPushButton#mode {
-    text-align: center; font-weight: bold; padding: 11px 6px; font-size: 12px;
+    text-align: center; font-weight: bold; padding: 8px 6px; font-size: 12px;
 }
 QPushButton#mode:checked {
     background: #1e3a5f; border: 1px solid #3b82f6; color: #dbeafe;
 }
 QPushButton#estop {
     background: #7f1d1d; border: 1px solid #b91c1c;
-    font-size: 15px; font-weight: bold; text-align: center; padding: 15px;
+    font-size: 14px; font-weight: bold; text-align: center; padding: 12px;
 }
 QPushButton#estop:hover { background: #991b1b; border-color: #dc2626; }
 QPushButton#estop:pressed { background: #641414; }
@@ -1123,7 +1123,7 @@ def main(args=None):
         def __init__(self):
             super().__init__()
             self.setWindowTitle('ROSMASTER M1 — Operator Console')
-            self.resize(1320, 830)
+            self.resize(1340, 900)
             self.setMinimumSize(1040, 680)
             self.setStyleSheet(STYLE)
             self.held = set()
@@ -1226,7 +1226,8 @@ def main(args=None):
             panel = QtWidgets.QWidget()
             v = QtWidgets.QVBoxLayout(panel)
             v.setContentsMargins(0, 0, 6, 0)
-            v.setSpacing(10)
+            # Tighter than the other columns: four panels share this one.
+            v.setSpacing(7)
 
             # -- robot ----------------------------------------------------
             g = QtWidgets.QGroupBox('1 · Robot')
@@ -1253,8 +1254,8 @@ def main(args=None):
             gm.setSpacing(6)
             self.mode_buttons = {}
             for i, (mode, label) in enumerate([
-                    (1, '1\nKeyboard'), (2, '2\nGaze'),
-                    (3, '3\nEEG'), (4, '4\nGaze + EEG')]):
+                    (1, '1  Keyboard'), (2, '2  Gaze'),
+                    (3, '3  EEG'), (4, '4  Gaze + EEG')]):
                 b = QtWidgets.QPushButton(label)
                 b.setObjectName('mode')
                 b.setCheckable(True)
@@ -1270,14 +1271,20 @@ def main(args=None):
             # -- servo ----------------------------------------------------
             g = QtWidgets.QGroupBox('3 · Camera head')
             gs = QtWidgets.QVBoxLayout(g)
-            gs.setSpacing(6)
+            gs.setSpacing(4)
+            # Both sliders plus the centre button need this much; without a
+            # floor the TILT bar is the first thing to be clipped when the
+            # column gets crowded.
+            g.setMinimumHeight(192)
 
             self.bar_pan = ServoBar(node.s2_min, node.s2_max, node.s2_center)
             self.bar_tilt = ServoBar(node.s1_min, node.s1_max, node.s1_center)
 
-            for label, bar, hint in (
-                    ('PAN  (J / L)', self.bar_pan, '← left   right →'),
-                    ('TILT (I / K)', self.bar_tilt, '↑ up   down ↓')):
+            # No per-slider direction hints. They cost a text row each, and the
+            # keys are already listed in the Drive panel - with the Voice panel
+            # sharing this column there is no room to say everything twice.
+            for label, bar in (('PAN  (J / L)', self.bar_pan),
+                               ('TILT (I / K)', self.bar_tilt)):
                 cap = QtWidgets.QHBoxLayout()
                 t = QtWidgets.QLabel(label)
                 t.setObjectName('dim')
@@ -1288,25 +1295,72 @@ def main(args=None):
                 cap.addWidget(val)
                 gs.addLayout(cap)
                 gs.addWidget(bar)
-                h = QtWidgets.QLabel(hint)
-                h.setObjectName('dim')
-                gs.addWidget(h)
                 if bar is self.bar_pan:
                     self.lbl_pan = val
                 else:
                     self.lbl_tilt = val
 
+            # Range readout and the centre button share one row. They were two
+            # rows until the Voice panel moved into this column and there was no
+            # longer room for both - the Centre button was being squeezed out
+            # entirely, which is a bad thing to lose from a camera control.
+            row = QtWidgets.QHBoxLayout()
             rng = QtWidgets.QLabel(
-                f'pan {node.s2_min:.0f}–{node.s2_max:.0f}   '
+                f'pan {node.s2_min:.0f}–{node.s2_max:.0f}  '
                 f'tilt {node.s1_min:.0f}–{node.s1_max:.0f}')
             rng.setObjectName('dim')
-            gs.addWidget(rng)
-
-            row = QtWidgets.QHBoxLayout()
+            row.addWidget(rng)
+            row.addStretch(1)
             self.btn_centre = QtWidgets.QPushButton('Centre (U)')
             self.btn_centre.clicked.connect(node.centre_servo)
             row.addWidget(self.btn_centre)
             gs.addLayout(row)
+            v.addWidget(g)
+
+            # -- voice ----------------------------------------------------
+            # Sits under the camera head rather than in the right column: the
+            # left column was shorter than the others and left a visible gap
+            # above the log, and voice is a "robot hardware" control like the
+            # head, so it belongs next to it.
+            g = QtWidgets.QGroupBox('4 · Voice')
+            gv = QtWidgets.QVBoxLayout(g)
+            gv.setSpacing(4)
+            # Explicit floor: the panel was landing exactly on its minimum and
+            # the status line then sat against the border.
+            g.setMinimumHeight(186)
+            self.btn_audio = QtWidgets.QPushButton('Enable audio')
+            self.btn_audio.setObjectName('primary')
+            self.btn_audio.clicked.connect(self._toggle_audio)
+            gv.addWidget(self.btn_audio)
+
+            self.chk_mic = QtWidgets.QCheckBox('My mic → robot speaker')
+            self.chk_mic.setChecked(True)
+            self.chk_mic.toggled.connect(lambda v: node.audio(mic=v))
+            gv.addWidget(self.chk_mic)
+
+            self.chk_spk = QtWidgets.QCheckBox('Robot mic → my speakers')
+            self.chk_spk.setChecked(True)
+            self.chk_spk.toggled.connect(lambda v: node.audio(speaker=v))
+            gv.addWidget(self.chk_spk)
+
+            # Both meters on one row. Stacked, they cost two text rows in a
+            # column that has four panels in it - and a 6px-tall bar does not
+            # need its own line to be readable.
+            self.meter_sent = Meter()
+            self.meter_recv = MeterGreen()
+            mr = QtWidgets.QHBoxLayout()
+            mr.setSpacing(4)
+            for label, m in (('out', self.meter_sent), ('in', self.meter_recv)):
+                t = QtWidgets.QLabel(label)
+                t.setObjectName('dim')
+                t.setFixedWidth(20)
+                mr.addWidget(t)
+                mr.addWidget(m, 1)
+            gv.addLayout(mr)
+
+            self.lbl_audio = QtWidgets.QLabel('off')
+            self.lbl_audio.setObjectName('mono')
+            gv.addWidget(self.lbl_audio)
             v.addWidget(g)
 
             v.addStretch(1)
@@ -1383,7 +1437,7 @@ def main(args=None):
             v.setSpacing(10)
 
             # -- gaze calibration -----------------------------------------
-            g = QtWidgets.QGroupBox('4 · Gaze')
+            g = QtWidgets.QGroupBox('5 · Gaze')
             gv = QtWidgets.QVBoxLayout(g)
             gv.setSpacing(6)
             self.gaze_map = GazeMap()
@@ -1415,51 +1469,51 @@ def main(args=None):
             gv.addWidget(self.lbl_calib)
             v.addWidget(g)
 
-            # -- voice ----------------------------------------------------
-            g = QtWidgets.QGroupBox('5 · Voice')
-            gv = QtWidgets.QVBoxLayout(g)
-            gv.setSpacing(6)
-            self.btn_audio = QtWidgets.QPushButton('Enable audio')
-            self.btn_audio.setObjectName('primary')
-            self.btn_audio.clicked.connect(self._toggle_audio)
-            gv.addWidget(self.btn_audio)
-
-            self.chk_mic = QtWidgets.QCheckBox('My mic → robot speaker')
-            self.chk_mic.setChecked(True)
-            self.chk_mic.toggled.connect(lambda v: node.audio(mic=v))
-            gv.addWidget(self.chk_mic)
-
-            self.chk_spk = QtWidgets.QCheckBox('Robot mic → my speakers')
-            self.chk_spk.setChecked(True)
-            self.chk_spk.toggled.connect(lambda v: node.audio(speaker=v))
-            gv.addWidget(self.chk_spk)
-
-            self.meter_sent = Meter()
-            self.meter_recv = MeterGreen()
-            for label, m in (('sent', self.meter_sent),
-                             ('recv', self.meter_recv)):
-                r = QtWidgets.QHBoxLayout()
-                t = QtWidgets.QLabel(label)
-                t.setObjectName('dim')
-                t.setFixedWidth(34)
-                r.addWidget(t)
-                r.addWidget(m, 1)
-                gv.addLayout(r)
-
-            self.lbl_audio = QtWidgets.QLabel('off')
-            self.lbl_audio.setObjectName('mono')
-            gv.addWidget(self.lbl_audio)
-            v.addWidget(g)
-
             # -- map ------------------------------------------------------
             g = QtWidgets.QGroupBox('6 · Map')
             gm = QtWidgets.QVBoxLayout(g)
             gm.setContentsMargins(6, 6, 6, 6)
+            gm.setSpacing(6)
             self.map_view = MapView()
-            gm.addWidget(self.map_view)
-            v.addWidget(g, 1)
+            gm.addWidget(self.map_view, 1)
 
-            v.addStretch(0)
+            self.lbl_map = QtWidgets.QLabel('no map')
+            self.lbl_map.setObjectName('mono')
+            self.lbl_map.setAlignment(QtCore.Qt.AlignCenter)
+            gm.addWidget(self.lbl_map)
+
+            # Localisation controls, right where the map is. These were
+            # command-line only, which meant a working map sat on screen with
+            # no obvious way to fix a wrong pose.
+            mrow = QtWidgets.QHBoxLayout()
+            mrow.setSpacing(4)
+            self.btn_findme = QtWidgets.QPushButton('Find me')
+            self.btn_findme.setObjectName('primary')
+            self.btn_findme.setToolTip(
+                'Match the laser scan against the map and publish the best '
+                'pose. Use this after the robot has been moved.')
+            self.btn_findme.clicked.connect(lambda: self._map_cmd('autolocalize'))
+            mrow.addWidget(self.btn_findme)
+            self.btn_savemap = QtWidgets.QPushButton('Save')
+            self.btn_savemap.setToolTip('Save the current map to ~/maps/')
+            self.btn_savemap.clicked.connect(self._save_map_dialog)
+            mrow.addWidget(self.btn_savemap)
+            gm.addLayout(mrow)
+
+            mrow2 = QtWidgets.QHBoxLayout()
+            mrow2.setSpacing(4)
+            self.btn_localize = QtWidgets.QPushButton('Localise…')
+            self.btn_localize.setToolTip(
+                'Stop mapping and localise against a saved map (AMCL)')
+            self.btn_localize.clicked.connect(self._localize_dialog)
+            mrow2.addWidget(self.btn_localize)
+            self.btn_mapstop = QtWidgets.QPushButton('Stop map')
+            self.btn_mapstop.setToolTip('Stop mapping or localisation')
+            self.btn_mapstop.clicked.connect(lambda: self._map_cmd('stop'))
+            mrow2.addWidget(self.btn_mapstop)
+            gm.addLayout(mrow2)
+
+            v.addWidget(g, 1)
             return panel
 
         def _build_log(self):
@@ -1468,7 +1522,7 @@ def main(args=None):
             gv.setContentsMargins(8, 8, 8, 8)
             self.log = QtWidgets.QPlainTextEdit()
             self.log.setReadOnly(True)
-            self.log.setMaximumHeight(104)
+            self.log.setMaximumHeight(84)
             gv.addWidget(self.log)
             return g
 
@@ -1674,6 +1728,62 @@ def main(args=None):
             except Exception:  # noqa: BLE001
                 return False
 
+        # ------------------------------------------------------------ mapping
+        def _map_cmd(self, *args):
+            """Run scripts/m1_map.sh on a worker thread, logging its output.
+
+            The script talks to the ROS graph, so it needs the same environment
+            as everything else here - m1_map.sh sources it itself, which is why
+            this does not use `bash -lc`.
+            """
+            script = os.path.expanduser('~/m1_control_ws/scripts/m1_map.sh')
+            if not os.path.exists(script):
+                self.logline(f'missing {script}')
+                return
+            label = ' '.join(args) if args else 'status'
+            self.logline(f'map: {label}…')
+
+            def work():
+                try:
+                    r = subprocess.run(['bash', script, *args],
+                                       capture_output=True, text=True,
+                                       timeout=180)
+                    out = (r.stdout or '') + (r.stderr or '')
+                    for line in out.strip().splitlines():
+                        s = line.strip()
+                        if not s or s.startswith('[INFO]'):
+                            continue
+                        self.logline(s[:110])
+                    if r.returncode != 0:
+                        self.logline(f'map {label} failed (rc={r.returncode})')
+                except Exception as exc:  # noqa: BLE001
+                    self.logline(f'map {label} error: {exc}')
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _save_map_dialog(self):
+            name, ok = QtWidgets.QInputDialog.getText(
+                self, 'Save map', 'Map name:',
+                QtWidgets.QLineEdit.Normal,
+                time.strftime('map_%Y%m%d_%H%M'))
+            if ok and name.strip():
+                self._map_cmd('save', name.strip())
+
+        def _localize_dialog(self):
+            """Pick a saved map and start localising against it."""
+            maps_dir = os.path.expanduser('~/maps')
+            names = []
+            if os.path.isdir(maps_dir):
+                names = sorted(f[:-5] for f in os.listdir(maps_dir)
+                               if f.endswith('.yaml'))
+            if not names:
+                self.logline('no saved maps in ~/maps - save one first')
+                return
+            name, ok = QtWidgets.QInputDialog.getItem(
+                self, 'Localise', 'Saved map:', names, 0, False)
+            if ok and name:
+                self._map_cmd('localize', name)
+
         def _poll_view(self):
             # pgrep is local and returns in a few milliseconds, so unlike the
             # SSH link probe this is safe on the GUI thread.
@@ -1833,6 +1943,22 @@ def main(args=None):
                     m, sc, pose,
                     time.monotonic() - node._scan_stamp if sc else 99.0,
                     time.monotonic() - node._map_stamp if m else 99.0)
+
+                # A one-line verdict next to the map. "Laser points not on the
+                # walls" means the pose is wrong, and the fix is Find me - say
+                # so here rather than leaving the operator to work it out from
+                # the picture.
+                if m is None:
+                    self.lbl_map.setText('no map')
+                    self._style(self.lbl_map, 'dim')
+                elif pose is None:
+                    self.lbl_map.setText('map ok · pose unknown')
+                    self._style(self.lbl_map, 'warn')
+                else:
+                    self.lbl_map.setText(
+                        f'x {pose[0]:+.2f}  y {pose[1]:+.2f}  '
+                        f'{math.degrees(pose[2]):+.0f}°')
+                    self._style(self.lbl_map, 'good')
 
             # audio
             txt = s['audio']
