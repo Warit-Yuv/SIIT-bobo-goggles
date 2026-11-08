@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""ROSMASTER M1 operator console — one window for everything.
+
+Built for the project's actual user: someone operating the robot on behalf of a
+person who cannot leave their bed. That shapes every choice here.
+
+    ros2 run m1_control m1_console
+    ros2 run m1_control m1_console --ros-args -p robot_ip:=10.0.0.54
+
+Why a single window
+-------------------
+Switching modes, driving, hearing the room and watching the map were spread
+across four terminals and a `ros2 topic pub` command. When something goes wrong
+you need one place to look and one button to press. Everything below is on one
+screen, in the order you would reach for it:
+
+    [ ROBOT ]  start / stop the stack on the Pi
+    [ MODE  ]  keyboard / gaze / eeg / fusion / E-STOP
+    [ DRIVE ]  live keyboard teleop - no terminal needed
+    [ AUDIO ]  hear the room, speak to it, per-direction mute
+    [ VIEW  ]  launch SLAM + RViz, camera feed
+    [ STATE ]  battery, video rate, gaze zone, link health
+
+Keyboard teleop from the GUI
+----------------------------
+This was the most-asked question ("where do I type?"). The answer is: here.
+
+The window grabs WASD/QE/A/D and publishes `/cmd_vel/keyboard` directly, so it
+works while the gaze or EEG node is running - the arbiter lets a recent
+keyboard command win for 0.4 s regardless of mode. No terminal, no focus
+juggling.
+
+Holding a key repeats. Releasing stops within 0.25 s because the teleop loop
+publishes zero when no key is down, and the arbiter's watchdog is a second
+safety net behind that.
+
+Threading model
+---------------
+ROS spins in a background thread; Qt owns the main thread. Nothing in the ROS
+callbacks touches a widget directly - they only update a plain dict that a
+QTimer reads. That keeps the UI responsive and avoids Qt's cross-thread rules.
+"""
+
+import os
+import subprocess
+import sys
+import threading
+import time
+
+import rclpy
+from geometry_msgs.msg import Point, Twist, Vector3
+from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
+                       ReliabilityPolicy)
+from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import Bool, Float32, String, UInt8
+
+MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
+MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
+
+# Qt stylesheet - dark, high contrast, large targets.
+STYLE = """
+QWidget { background: #14171c; color: #e6e6e6; font-family: 'DejaVu Sans'; font-size: 12px; }
+QGroupBox {
+    border: 1px solid #2b3138; border-radius: 6px; margin-top: 10px;
+    padding-top: 10px; font-weight: bold;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #8ab4f8; }
+QPushButton {
+    background: #232830; border: 1px solid #333b45; border-radius: 5px;
+    padding: 7px 10px; text-align: left;
+}
+QPushButton:hover { background: #2c333d; }
+QPushButton:pressed { background: #1a1f26; }
+QPushButton:disabled { color: #555b63; border-color: #242a31; }
+QPushButton#mode { text-align: center; font-weight: bold; padding: 12px 6px; }
+QPushButton#estop { background: #7f1d1d; border-color: #b91c1c; font-size: 15px;
+                    font-weight: bold; text-align: center; padding: 16px; }
+QPushButton#estop:hover { background: #991b1b; }
+QLabel#big { font-size: 20px; font-weight: bold; }
+QLabel#dim { color: #8b939c; }
+QLabel#warn { color: #fbbf24; }
+QLabel#bad { color: #ef4444; }
+QLabel#good { color: #34d399; }
+QPlainTextEdit {
+    background: #0d1014; border: 1px solid #2b3138; border-radius: 5px;
+    font-family: 'DejaVu Sans Mono'; font-size: 11px;
+}
+"""
+
+
+class ConsoleNode(Node):
+    """ROS interface. Publishes commands, collects state into `state`."""
+
+    def __init__(self):
+        super().__init__('m1_console')
+        self.declare_parameter('robot_ip', '10.0.0.54')
+        self.declare_parameter('publish_rate_hz', 20.0)
+        # Servo geometry. These MUST agree with the arbiter, otherwise the GUI
+        # lets the operator ask for travel the robot will silently refuse.
+        # Measured on the hardware: pan (s2) moves freely 0..112 then stops
+        # dead (firmware clamp), so a centre of 90 gives 90 units right and
+        # only 20 left. We use 80..100 (+-10): a camera that swings ~90 degrees
+        # loses the view straight ahead, which is dangerous while driving.
+        self.declare_parameter('servo_s1_center', 40.0)
+        self.declare_parameter('servo_s2_center', 90.0)
+        self.declare_parameter('servo_s1_min', 5.0)
+        self.declare_parameter('servo_s1_max', 75.0)
+        self.declare_parameter('servo_s2_min', 80.0)
+        self.declare_parameter('servo_s2_max', 100.0)
+        self.declare_parameter('servo_step', 4.0)
+        self.robot_ip = self.get_parameter('robot_ip').value
+        gp = self.get_parameter
+        self.s1_center = float(gp('servo_s1_center').value)
+        self.s2_center = float(gp('servo_s2_center').value)
+        self.s1_min = float(gp('servo_s1_min').value)
+        self.s1_max = float(gp('servo_s1_max').value)
+        self.s2_min = float(gp('servo_s2_min').value)
+        self.s2_max = float(gp('servo_s2_max').value)
+        self.servo_step = float(gp('servo_step').value)
+
+        self.state = {
+            'mode': None, 'voltage': float('nan'), 'zone': '',
+            'image_hz': 0.0, 'audio': '', 'connected': False,
+        }
+        self._image_times = []
+        self._lock = threading.Lock()
+
+        mode_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                              history=HistoryPolicy.KEEP_LAST,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                              depth=1)
+        sensor_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST, depth=1)
+
+        self.mode_pub = self.create_publisher(UInt8, '/control_mode', mode_qos)
+        self.vel_pub = self.create_publisher(Twist, '/cmd_vel/keyboard', 10)
+        self.servo_pub = self.create_publisher(Vector3, '/servo/keyboard', 10)
+        self.audio_en_pub = self.create_publisher(Bool, '/audio/enable', 10)
+        self.audio_mic_pub = self.create_publisher(Bool, '/audio/mic', 10)
+        self.audio_spk_pub = self.create_publisher(Bool, '/audio/speaker', 10)
+
+        self.create_subscription(UInt8, '/control_mode_state',
+                                 lambda m: self._set('mode', int(m.data)),
+                                 mode_qos)
+        self.create_subscription(Float32, '/voltage',
+                                 lambda m: self._set('voltage', float(m.data)),
+                                 sensor_qos)
+        self.create_subscription(String, '/gaze/zone',
+                                 lambda m: self._set('zone', m.data), 10)
+        self.create_subscription(String, '/audio/status',
+                                 lambda m: self._set('audio', m.data), 10)
+        self.create_subscription(CompressedImage, '/image_throttled/compressed',
+                                 self._image_cb, sensor_qos)
+
+        # Teleop state, written by the GUI thread, read by the publish timer.
+        self.teleop = Twist()
+        self.servo = {'s1': self.s1_center, 's2': self.s2_center}
+        self._servo_dirty = False
+
+        rate = float(self.get_parameter('publish_rate_hz').value)
+        self.create_timer(1.0 / rate, self._publish_loop)
+        self.get_logger().info(f'Console up (robot {self.robot_ip})')
+
+    def _set(self, key, value):
+        with self._lock:
+            self.state[key] = value
+            self.state['connected'] = True
+
+    def snapshot(self):
+        with self._lock:
+            s = dict(self.state)
+            s['image_hz'] = self._image_hz()
+        return s
+
+    def _image_cb(self, _msg):
+        now = time.time()
+        self._image_times.append(now)
+        self._image_times = [t for t in self._image_times if now - t < 2.0]
+        self._set('connected', True)
+
+    def _image_hz(self):
+        return len(self._image_times) / 2.0
+
+    # ------------------------------------------------------------- commands
+    def set_mode(self, mode):
+        self.mode_pub.publish(UInt8(data=int(mode)))
+
+    def estop(self):
+        self.set_mode(0)
+        self.teleop = Twist()
+        self.vel_pub.publish(Twist())
+
+    def audio(self, enable=None, mic=None, speaker=None):
+        if enable is not None:
+            self.audio_en_pub.publish(Bool(data=bool(enable)))
+        if mic is not None:
+            self.audio_mic_pub.publish(Bool(data=bool(mic)))
+        if speaker is not None:
+            self.audio_spk_pub.publish(Bool(data=bool(speaker)))
+
+    def nudge_servo(self, d_tilt=0.0, d_pan=0.0):
+        self.servo['s1'] = min(self.s1_max, max(self.s1_min, self.servo['s1'] + d_tilt))
+        self.servo['s2'] = min(self.s2_max, max(self.s2_min, self.servo['s2'] + d_pan))
+        self._servo_dirty = True
+
+    def centre_servo(self):
+        self.servo['s1'], self.servo['s2'] = self.s1_center, self.s2_center
+        self._servo_dirty = True
+
+    def _publish_loop(self):
+        self.vel_pub.publish(self.teleop)
+        if self._servo_dirty:
+            msg = Vector3()
+            msg.x = self.servo['s1']
+            msg.y = self.servo['s2']
+            self.servo_pub.publish(msg)
+            self._servo_dirty = False
+
+
+# ---------------------------------------------------------------------------
+# Remote control of the robot stack
+# ---------------------------------------------------------------------------
+
+class RobotShell:
+    """Run commands on the Pi over SSH, without blocking the UI."""
+
+    def __init__(self, ip, user='pi'):
+        self.ip = ip
+        self.user = user
+
+    def _ssh(self, cmd, timeout=30):
+        return subprocess.run(
+            ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=6',
+             f'{self.user}@{self.ip}', cmd],
+            capture_output=True, text=True, timeout=timeout)
+
+    def test(self):
+        try:
+            r = self._ssh('echo OK', timeout=10)
+            return r.returncode == 0 and 'OK' in r.stdout
+        except Exception:  # noqa: BLE001
+            return False
+
+    def start(self):
+        return self._ssh('cd /home/pi && ./m1.sh bg', timeout=60)
+
+    def stop(self):
+        return self._ssh('cd /home/pi && ./m1.sh stop --hard', timeout=90)
+
+    def diag(self):
+        return self._ssh('cd /home/pi && ./m1.sh diag', timeout=120)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ConsoleNode()
+
+    stop_event = threading.Event()
+
+    def spin():
+        # ExternalShutdownException is raised normally when rclpy shuts down
+        # while spin_once is blocked. Without catching it, closing the window
+        # prints a full traceback that looks like a crash.
+        from rclpy.executors import ExternalShutdownException
+        while not stop_event.is_set() and rclpy.ok():
+            try:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            except ExternalShutdownException:
+                break
+            except Exception as exc:  # noqa: BLE001
+                print(f'[console] spin error: {exc}', file=sys.stderr)
+                break
+
+    ros_thread = threading.Thread(target=spin, daemon=True)
+    ros_thread.start()
+
+    try:
+        from PyQt5 import QtCore, QtGui, QtWidgets
+    except ImportError:
+        print('PyQt5 is required.\n    sudo apt install python3-pyqt5',
+              file=sys.stderr)
+        stop_event.set()
+        return 1
+
+    shell = RobotShell(node.robot_ip)
+
+    class Console(QtWidgets.QMainWindow):
+
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle('ROSMASTER M1 — Operator Console')
+            self.resize(1180, 760)
+            self.setStyleSheet(STYLE)
+            self.held = set()
+            self.audio_on = False
+
+            central = QtWidgets.QWidget()
+            self.setCentralWidget(central)
+            root = QtWidgets.QHBoxLayout(central)
+            root.setContentsMargins(12, 12, 12, 12)
+            root.setSpacing(12)
+
+            left = QtWidgets.QVBoxLayout()
+            left.setSpacing(10)
+            root.addLayout(left, 0)
+            right = QtWidgets.QVBoxLayout()
+            right.setSpacing(10)
+            root.addLayout(right, 1)
+
+            # ---------------- robot stack ----------------
+            g_robot = QtWidgets.QGroupBox('1 · Robot')
+            v = QtWidgets.QVBoxLayout(g_robot)
+            self.lbl_link = QtWidgets.QLabel('checking link…')
+            self.lbl_link.setObjectName('dim')
+            v.addWidget(self.lbl_link)
+
+            row = QtWidgets.QHBoxLayout()
+            self.btn_start = QtWidgets.QPushButton('Start stack')
+            self.btn_stop = QtWidgets.QPushButton('Stop stack')
+            self.btn_diag = QtWidgets.QPushButton('Diagnose')
+            for b in (self.btn_start, self.btn_stop, self.btn_diag):
+                b.setEnabled(False)
+                row.addWidget(b)
+            v.addLayout(row)
+
+            self.btn_start.clicked.connect(lambda: self._remote('start'))
+            self.btn_stop.clicked.connect(lambda: self._remote('stop'))
+            self.btn_diag.clicked.connect(lambda: self._remote('diag'))
+            left.addWidget(g_robot)
+
+            # ---------------- mode ----------------
+            g_mode = QtWidgets.QGroupBox('2 · Control mode')
+            gm = QtWidgets.QGridLayout(g_mode)
+            self.mode_buttons = {}
+            for i, (mode, label) in enumerate([
+                    (1, '1  Keyboard'), (2, '2  Gaze'),
+                    (3, '3  EEG'), (4, '4  Gaze + EEG')]):
+                b = QtWidgets.QPushButton(label)
+                b.setObjectName('mode')
+                b.clicked.connect(lambda _c, m=mode: node.set_mode(m))
+                gm.addWidget(b, i // 2, i % 2)
+                self.mode_buttons[mode] = b
+
+            self.btn_estop = QtWidgets.QPushButton('■  EMERGENCY STOP')
+            self.btn_estop.setObjectName('estop')
+            self.btn_estop.clicked.connect(node.estop)
+            gm.addWidget(self.btn_estop, 2, 0, 1, 2)
+            left.addWidget(g_mode)
+
+            # ---------------- drive ----------------
+            g_drive = QtWidgets.QGroupBox('3 · Drive  (keys work here)')
+            gd = QtWidgets.QVBoxLayout(g_drive)
+            hint = QtWidgets.QLabel(
+                'W/S forward-back · Q/E strafe · A/D rotate\n'
+                'I/K tilt · J/L pan · U centre')
+            hint.setObjectName('dim')
+            gd.addWidget(hint)
+            self.lbl_drive = QtWidgets.QLabel('idle')
+            self.lbl_drive.setObjectName('dim')
+            gd.addWidget(self.lbl_drive)
+            left.addWidget(g_drive)
+
+            # ---------------- audio ----------------
+            g_audio = QtWidgets.QGroupBox('4 · Voice')
+            ga = QtWidgets.QVBoxLayout(g_audio)
+            self.btn_audio = QtWidgets.QPushButton('Enable audio')
+            self.btn_audio.clicked.connect(self._toggle_audio)
+            ga.addWidget(self.btn_audio)
+
+            self.chk_mic = QtWidgets.QCheckBox('My microphone → robot speaker')
+            self.chk_mic.setChecked(True)
+            self.chk_mic.toggled.connect(lambda v: node.audio(mic=v))
+            ga.addWidget(self.chk_mic)
+
+            self.chk_spk = QtWidgets.QCheckBox('Robot microphone → my speakers')
+            self.chk_spk.setChecked(True)
+            self.chk_spk.toggled.connect(lambda v: node.audio(speaker=v))
+            ga.addWidget(self.chk_spk)
+
+            self.lbl_audio = QtWidgets.QLabel('off')
+            self.lbl_audio.setObjectName('dim')
+            ga.addWidget(self.lbl_audio)
+            left.addWidget(g_audio)
+            left.addStretch(1)
+
+            # ---------------- status ----------------
+            g_state = QtWidgets.QGroupBox('Status')
+            gs = QtWidgets.QGridLayout(g_state)
+            self.lbl_mode = QtWidgets.QLabel('—')
+            self.lbl_mode.setObjectName('big')
+            self.lbl_bat = QtWidgets.QLabel('—')
+            self.lbl_video = QtWidgets.QLabel('—')
+            self.lbl_zone = QtWidgets.QLabel('—')
+            gs.addWidget(QtWidgets.QLabel('Mode'), 0, 0)
+            gs.addWidget(self.lbl_mode, 0, 1)
+            gs.addWidget(QtWidgets.QLabel('Battery'), 1, 0)
+            gs.addWidget(self.lbl_bat, 1, 1)
+            gs.addWidget(QtWidgets.QLabel('Video'), 2, 0)
+            gs.addWidget(self.lbl_video, 2, 1)
+            gs.addWidget(QtWidgets.QLabel('Gaze zone'), 3, 0)
+            gs.addWidget(self.lbl_zone, 3, 1)
+            right.addWidget(g_state)
+
+            # ---------------- view ----------------
+            g_view = QtWidgets.QGroupBox('5 · View')
+            gv = QtWidgets.QHBoxLayout(g_view)
+            self.btn_slam = QtWidgets.QPushButton('Launch SLAM + RViz')
+            self.btn_slam.clicked.connect(self._launch_view)
+            gv.addWidget(self.btn_slam)
+            self.btn_killview = QtWidgets.QPushButton('Stop view')
+            self.btn_killview.clicked.connect(self._kill_view)
+            gv.addWidget(self.btn_killview)
+            right.addWidget(g_view)
+
+            # ---------------- camera ----------------
+            g_cam = QtWidgets.QGroupBox('Camera')
+            gc = QtWidgets.QVBoxLayout(g_cam)
+            self.lbl_cam = QtWidgets.QLabel('waiting for /image_throttled/compressed…')
+            self.lbl_cam.setAlignment(QtCore.Qt.AlignCenter)
+            self.lbl_cam.setMinimumHeight(280)
+            self.lbl_cam.setStyleSheet(
+                'background:#0d1014; border:1px solid #2b3138; border-radius:5px;')
+            gc.addWidget(self.lbl_cam)
+            right.addWidget(g_cam, 1)
+
+            # ---------------- log ----------------
+            g_log = QtWidgets.QGroupBox('Log')
+            gl = QtWidgets.QVBoxLayout(g_log)
+            self.log = QtWidgets.QPlainTextEdit()
+            self.log.setReadOnly(True)
+            self.log.setMaximumHeight(130)
+            gl.addWidget(self.log)
+            right.addWidget(g_log)
+
+            # ---------------- timers ----------------
+            self.timer = QtCore.QTimer(self)
+            self.timer.timeout.connect(self.refresh)
+            self.timer.start(120)
+
+            self.link_timer = QtCore.QTimer(self)
+            self.link_timer.timeout.connect(self._check_link)
+            self.link_timer.start(5000)
+            self._check_link()
+
+        # ------------------------------------------------------------ helpers
+        def logline(self, text):
+            self.log.appendPlainText(f'{time.strftime("%H:%M:%S")}  {text}')
+
+        def _check_link(self):
+            ok = shell.test()
+            if ok:
+                self.lbl_link.setText(f'● connected to {node.robot_ip}')
+                self.lbl_link.setObjectName('good')
+            else:
+                self.lbl_link.setText(f'● cannot reach {node.robot_ip}')
+                self.lbl_link.setObjectName('bad')
+            self.lbl_link.style().unpolish(self.lbl_link)
+            self.lbl_link.style().polish(self.lbl_link)
+            for b in (self.btn_start, self.btn_stop, self.btn_diag):
+                b.setEnabled(ok)
+
+        def _remote(self, action):
+            self.logline(f'robot {action}…')
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(False)
+            self.btn_diag.setEnabled(False)
+
+            def work():
+                try:
+                    r = getattr(shell, action)()
+                    out = (r.stdout or '') + (r.stderr or '')
+                    tail = '\n'.join(out.strip().splitlines()[-4:])
+                    self.logline(f'{action} rc={r.returncode}')
+                    if tail:
+                        self.logline(tail)
+                except Exception as exc:  # noqa: BLE001
+                    self.logline(f'{action} failed: {exc}')
+                finally:
+                    QtCore.QTimer.singleShot(0, self._check_link)
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _toggle_audio(self):
+            self.audio_on = not self.audio_on
+            node.audio(enable=self.audio_on,
+                       mic=self.chk_mic.isChecked(),
+                       speaker=self.chk_spk.isChecked())
+            self.btn_audio.setText('Disable audio' if self.audio_on
+                                   else 'Enable audio')
+            self.logline(f"audio {'on' if self.audio_on else 'off'}")
+
+        def _launch_view(self):
+            self.logline('launching SLAM + RViz…')
+            try:
+                subprocess.Popen(
+                    ['bash', '-lc',
+                     'ros2 launch m1_control m1_operator.launch.py'],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+                self.logline('view launched (separate process group)')
+            except Exception as exc:  # noqa: BLE001
+                self.logline(f'launch failed: {exc}')
+
+        def _kill_view(self):
+            self.logline('stopping view…')
+            script = os.path.expanduser('~/m1_control_ws/scripts/kill_vm.sh')
+            if not os.path.exists(script):
+                self.logline(f'missing {script}')
+                return
+            subprocess.Popen(['bash', script], start_new_session=True,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+
+        # ------------------------------------------------------------- keys
+        def keyPressEvent(self, event):
+            if event.isAutoRepeat():
+                return
+            key = event.key()
+            text = event.text().lower()
+
+            if text in MODE_KEYS:
+                node.set_mode(MODE_KEYS[text])
+                return
+            if key == QtCore.Qt.Key_Space:
+                node.estop()
+                self.logline('E-STOP')
+                return
+
+            mapping = {
+                'w': ('linear', 'x', 0.20), 's': ('linear', 'x', -0.20),
+                'q': ('linear', 'y', 0.20), 'e': ('linear', 'y', -0.20),
+                'a': ('angular', 'z', 0.60), 'd': ('angular', 'z', -0.60),
+            }
+            if text in mapping:
+                group, axis, value = mapping[text]
+                setattr(getattr(node.teleop, group), axis, value)
+                self.held.add(text)
+                self.lbl_drive.setText(f'driving: {text.upper()}')
+                return
+
+            servo = {'i': (5.0, 0.0), 'k': (-5.0, 0.0),
+                     'j': (0.0, 5.0), 'l': (0.0, -5.0)}
+            if text in servo:
+                node.nudge_servo(*servo[text])
+                return
+            if text == 'u':
+                node.centre_servo()
+                return
+            super().keyPressEvent(event)
+
+        def keyReleaseEvent(self, event):
+            if event.isAutoRepeat():
+                return
+            text = event.text().lower()
+            mapping = {'w', 's', 'q', 'e', 'a', 'd'}
+            if text in mapping:
+                node.teleop = Twist()
+                self.held.discard(text)
+                self.lbl_drive.setText('idle' if not self.held else 'driving')
+                return
+            super().keyReleaseEvent(event)
+
+        # ------------------------------------------------------------ refresh
+        def refresh(self):
+            s = node.snapshot()
+
+            mode = s['mode']
+            if mode is None:
+                self.lbl_mode.setText('no data')
+                self.lbl_mode.setObjectName('warn')
+            else:
+                self.lbl_mode.setText(MODE_NAMES.get(mode, str(mode)))
+                self.lbl_mode.setObjectName(
+                    'bad' if mode == 0 else 'good')
+            self.lbl_mode.style().unpolish(self.lbl_mode)
+            self.lbl_mode.style().polish(self.lbl_mode)
+
+            for m, b in self.mode_buttons.items():
+                active = (mode == m)
+                b.setStyleSheet(
+                    'background:#1e3a5f; border:1px solid #3b82f6;' if active
+                    else '')
+
+            v = s['voltage']
+            if v != v:
+                self.lbl_bat.setText('—')
+                self.lbl_bat.setObjectName('dim')
+            else:
+                self.lbl_bat.setText(f'{v:.1f} V')
+                self.lbl_bat.setObjectName('bad' if v < 10.5 else 'good')
+            self.lbl_bat.style().unpolish(self.lbl_bat)
+            self.lbl_bat.style().polish(self.lbl_bat)
+
+            self.lbl_video.setText(f"{s['image_hz']:.0f} fps")
+            self.lbl_zone.setText(s['zone'] or '—')
+
+            if s['audio']:
+                self.lbl_audio.setText(s['audio'])
+            elif self.audio_on:
+                self.lbl_audio.setText('no bridge running on robot')
+
+        def closeEvent(self, event):
+            node.estop()
+            stop_event.set()
+            event.accept()
+
+    app = QtWidgets.QApplication(sys.argv)
+    win = Console()
+    win.show()
+    try:
+        app.exec_()
+    finally:
+        stop_event.set()
+        ros_thread.join(timeout=1.0)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -75,6 +75,11 @@ from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
 from sensor_msgs.msg import CompressedImage, LaserScan
 from std_msgs.msg import Bool, Float32, Float32MultiArray, String, UInt8
 
+try:
+    from m1_control.gaze_calib import fit as fit_calib
+except ImportError:  # run as a plain script rather than through ros2 run
+    from gaze_calib import fit as fit_calib
+
 MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
 MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 
@@ -862,110 +867,238 @@ def make_map_view(QtCore, QtGui, QtWidgets):
 # ---------------------------------------------------------------------------
 
 class CalibDialog:
-    """Guided 5-point calibration.
+    """Gaze calibration whose dots sit ON the camera image.
 
-    Each eye tracker has a resting bias: the operator looks straight ahead and
-    the model reports u=0.62 instead of 0.5. Uncorrected, "neutral" steering
-    pulls the robot to one side forever and the operator fights the offset all
-    session. Five points also recover the gain, so a small comfortable eye
-    movement still covers the full steering range.
+    The old version showed the dots in a 460x400 dialog in the middle of the
+    window. That cannot work. The gaze model is calibrated in the coordinates
+    of the camera picture, so a dot at u=0.15 has to be 15% across the CAMERA
+    IMAGE, not 15% across a small box that happens to be somewhere else on the
+    screen. Calibrating in the wrong rectangle teaches the model an offset and
+    a gain scaled by the ratio between the two rectangles - it does not merely
+    look wrong, it steers wrong.
 
-    The maths, with corrected = (raw - offset) * gain + 0.5:
-        centre_raw  -> 0.5   =>  offset = centre_raw - 0.5
-        right, left -> 0.85, 0.15
-                            =>  gain = 0.7 / (right_raw - left_raw)
+    So this is a frameless overlay the size of the main window. It dims
+    everything except the camera image and draws each dot at its exact
+    position inside that image. What you look at is what you drive.
+
+    Two profiles, after the reference implementation (GazeModel):
+
+      fast  4 dots - top, right, bottom, left. About 8 s.
+            A re-alignment. It recovers offset and gain on both axes, which
+            is exactly the four numbers this robot uses, so it is a complete
+            calibration and not an approximation of one. Use it after you
+            have shifted in your seat.
+
+      long  9 dots - a 3x3 grid. About 30 s.
+            The same four numbers, but sampled across the middle of the range
+            as well, so the fit is not extrapolated from the edges alone and
+            one bad sample cannot swing it.
+
+    The model, per axis:   corrected = (raw - offset) * gain + 0.5
+    Fitting a line  target = gain * raw + b  across the dots, then
+        gain = slope        offset = (0.5 - b) / gain
+    recovers both numbers by least squares for any number of dots, which is
+    why one fitter serves both profiles.
     """
 
-    TARGETS = [
-        ('centre', 0.50, 0.50, 'Look at the centre of the screen'),
-        ('left', 0.15, 0.50, 'Look at the LEFT dot, keep your head still'),
-        ('right', 0.85, 0.50, 'Look at the RIGHT dot, keep your head still'),
-        ('up', 0.50, 0.15, 'Look at the TOP dot, keep your head still'),
-        ('down', 0.50, 0.85, 'Look at the BOTTOM dot, keep your head still'),
-    ]
+    PROFILES = {
+        'fast': {
+            'label': 'Fast · 4 dots · ~8 s',
+            'settle': 0.9, 'sample': 1.0,
+            'dots': [
+                ('TOP', 0.50, 0.15, 'Look at the TOP dot, keep your head still'),
+                ('RIGHT', 0.85, 0.50, 'Look at the RIGHT dot, keep your head still'),
+                ('BOTTOM', 0.50, 0.85, 'Look at the BOTTOM dot, keep your head still'),
+                ('LEFT', 0.15, 0.50, 'Look at the LEFT dot, keep your head still'),
+            ],
+        },
+        'long': {
+            'label': 'Long · 9 dots · ~30 s',
+            'settle': 1.0, 'sample': 1.3,
+            'dots': [
+                ('top-left', 0.15, 0.15, 'Look at the TOP-LEFT dot'),
+                ('top', 0.50, 0.15, 'Look at the TOP dot'),
+                ('top-right', 0.85, 0.15, 'Look at the TOP-RIGHT dot'),
+                ('left', 0.15, 0.50, 'Look at the LEFT dot'),
+                ('centre', 0.50, 0.50, 'Look at the CENTRE dot'),
+                ('right', 0.85, 0.50, 'Look at the RIGHT dot'),
+                ('bottom-left', 0.15, 0.85, 'Look at the BOTTOM-LEFT dot'),
+                ('bottom', 0.50, 0.85, 'Look at the BOTTOM dot'),
+                ('bottom-right', 0.85, 0.85, 'Look at the BOTTOM-RIGHT dot'),
+            ],
+        },
+    }
 
-    SETTLE_S = 1.4
-    SAMPLE_S = 1.6
+    # A dot with fewer usable samples than this is treated as lost, and the
+    # whole run is refused rather than fitted from noise.
+    MIN_SAMPLES = 5
 
     @classmethod
     def build(cls, QtCore, QtGui, QtWidgets):
         class _Dialog(QtWidgets.QDialog):
 
-            def __init__(self, node, parent=None):
+            def __init__(self, node, cam_rect, parent=None):
                 super().__init__(parent)
                 self.node = node
+                # GLOBAL screen rect of the camera picture. Everything is
+                # positioned relative to this, which is the whole point.
+                self.cam = QtCore.QRect(cam_rect)
+                self.profile = 'fast'
                 self.result_calib = None
                 self.idx = -1
                 self.phase = 'idle'
                 self.samples = []
-                self.captured = {}
+                self.captured = []
+                self.u = None
+                self.v = None
                 self.timer = QtCore.QTimer(self)
                 self.timer.timeout.connect(self._tick)
                 self.phase_end = 0.0
 
-                self.setWindowTitle('Gaze calibration')
+                # Frameless and translucent. A QDialog with a parent is still
+                # a top-level window, so its geometry is in global screen
+                # coordinates - that is what lets the dots land exactly on the
+                # camera image instead of on some other rectangle.
+                self.setWindowFlags(QtCore.Qt.FramelessWindowHint |
+                                    QtCore.Qt.Dialog)
+                self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
                 self.setModal(True)
-                self.resize(460, 400)
+                self.setWindowTitle('Gaze calibration')
+                if parent is not None:
+                    tl = parent.mapToGlobal(QtCore.QPoint(0, 0))
+                    self.setGeometry(QtCore.QRect(tl, parent.size()))
 
                 v = QtWidgets.QVBoxLayout(self)
+                v.setContentsMargins(0, 0, 0, 22)
+                v.addStretch(1)
+
+                bar = QtWidgets.QFrame()
+                bar.setObjectName('calibbar')
+                bar.setStyleSheet(
+                    '#calibbar { background: rgba(14,17,22,0.97);'
+                    ' border:1px solid #2b3138; border-radius:8px; }')
+                bar.setMaximumWidth(760)
+                bv = QtWidgets.QVBoxLayout(bar)
+
                 self.lbl = QtWidgets.QLabel('Ready')
                 self.lbl.setObjectName('h1')
                 self.lbl.setAlignment(QtCore.Qt.AlignCenter)
-                v.addWidget(self.lbl)
+                bv.addWidget(self.lbl)
 
                 self.hint = QtWidgets.QLabel(
-                    'You will be shown five dots. Look at each one and hold '
-                    'your gaze steady.\nSit as you would normally drive.')
+                    'The dots appear inside the camera picture, so where you '
+                    'look is exactly where the robot thinks you are looking.\n'
+                    'Look at each dot and hold your head still.')
                 self.hint.setObjectName('dim')
                 self.hint.setAlignment(QtCore.Qt.AlignCenter)
                 self.hint.setWordWrap(True)
-                v.addWidget(self.hint)
+                bv.addWidget(self.hint)
 
-                self.canvas = _Target(self)
-                self.canvas.setMinimumHeight(170)
-                v.addWidget(self.canvas, 1)
+                prow = QtWidgets.QHBoxLayout()
+                prow.addWidget(QtWidgets.QLabel('Profile'))
+                self.cmb_profile = QtWidgets.QComboBox()
+                # cls, not self: PROFILES lives on the outer CalibDialog class
+                # and _Dialog is a nested class, so self.PROFILES would only
+                # work if it were re-declared here - which is exactly the bug
+                # this line had.
+                for key in ('fast', 'long'):
+                    self.cmb_profile.addItem(cls.PROFILES[key]['label'], key)
+                self.cmb_profile.currentIndexChanged.connect(self._on_profile)
+                prow.addWidget(self.cmb_profile, 1)
+                bv.addLayout(prow)
 
                 self.status = QtWidgets.QLabel('')
                 self.status.setObjectName('mono')
                 self.status.setAlignment(QtCore.Qt.AlignCenter)
-                v.addWidget(self.status)
+                bv.addWidget(self.status)
 
                 row = QtWidgets.QHBoxLayout()
                 self.btn_go = QtWidgets.QPushButton('Start')
                 self.btn_go.setObjectName('primary')
                 self.btn_go.clicked.connect(self.start)
-                self.btn_cancel = QtWidgets.QPushButton('Cancel')
+                self.btn_cancel = QtWidgets.QPushButton('Cancel  (Esc)')
                 self.btn_cancel.clicked.connect(self.reject)
                 row.addWidget(self.btn_go)
                 row.addWidget(self.btn_cancel)
-                v.addLayout(row)
+                bv.addLayout(row)
+
+                v.addWidget(bar, 0, QtCore.Qt.AlignHCenter)
+
+            # ------------------------------------------------------- painting
+            def _on_profile(self, _i):
+                self.profile = self.cmb_profile.currentData() or 'fast'
+
+            def keyPressEvent(self, e):
+                if e.key() == QtCore.Qt.Key_Escape:
+                    self.reject()
+                    return
+                super().keyPressEvent(e)
+
+            def paintEvent(self, _e):
+                p = QtGui.QPainter(self)
+                p.setRenderHint(QtGui.QPainter.Antialiasing)
+
+                full = QtCore.QRect(0, 0, self.width(), self.height())
+                cam = QtCore.QRect(self.cam)
+                cam.moveTopLeft(self.mapFromGlobal(cam.topLeft()))
+
+                # Dim everything EXCEPT the camera picture. The operator keeps
+                # seeing the view they drive with, at exactly the right place
+                # and size, with no dialog covering it.
+                path = QtGui.QPainterPath()
+                path.addRect(QtCore.QRectF(full))
+                path.addRect(QtCore.QRectF(cam))
+                path.setFillRule(QtCore.Qt.OddEvenFill)
+                p.fillPath(path, QtGui.QColor(6, 8, 11, 208))
+
+                p.setPen(QtGui.QPen(QtGui.QColor('#3b82f6'), 2))
+                p.drawRect(cam.adjusted(1, 1, -1, -1))
+
+                if self.u is None:
+                    return
+
+                c = QtCore.QPointF(cam.left() + cam.width() * self.u,
+                                   cam.top() + cam.height() * self.v)
+                p.setPen(QtCore.Qt.NoPen)
+                p.setBrush(QtGui.QColor(37, 99, 235, 70))
+                p.drawEllipse(c, 26, 26)
+                p.setBrush(QtGui.QColor('#2563eb'))
+                p.drawEllipse(c, 13, 13)
+                p.setBrush(QtGui.QColor('#dbeafe'))
+                p.drawEllipse(c, 5, 5)
 
             # -------------------------------------------------------- control
+            def _dots(self):
+                return cls.PROFILES[self.profile]['dots']
+
             def start(self):
                 raw = self.node.latest_raw()
                 if raw is None or raw[3] > 2.0:
                     self.lbl.setText('No gaze source')
                     self.hint.setText(
                         'Nothing is publishing /gaze/raw yet.\n\n'
-                        'Either start the gaze pipeline on the robot:\n'
-                        '    ./m1.sh stop --hard && ./m1.sh bg\n'
-                        'or run the gaze HUD on this machine:\n'
-                        '    ros2 launch m1_control m1_operator.launch.py '
-                        'gaze_source:=mouse')
+                        'Start the gaze HUD on this machine first:\n'
+                        '    Gaze panel -> Start gaze\n'
+                        'and wait for "gaze started" in the log.')
                     return
                 self.btn_go.setEnabled(False)
+                self.cmb_profile.setEnabled(False)
                 self.idx = 0
+                self.captured = []
                 self._begin_point()
 
             def _begin_point(self):
-                name, u, v, text = self.TARGETS[self.idx]
-                self.canvas.set_target(u, v)
-                self.lbl.setText(f'Step {self.idx + 1} of {len(self.TARGETS)}')
+                name, u, v, text = self._dots()[self.idx]
+                self.u, self.v = u, v
+                self.lbl.setText(
+                    f'{name}  ·  {self.idx + 1} of {len(self._dots())}')
                 self.hint.setText(text)
                 self.samples = []
                 self.phase = 'settle'
-                self.phase_end = time.monotonic() + self.SETTLE_S
+                self.phase_end = (time.monotonic() +
+                                  cls.PROFILES[self.profile]['settle'])
                 self.timer.start(50)
+                self.update()
 
             def _tick(self):
                 now = time.monotonic()
@@ -973,18 +1106,18 @@ class CalibDialog:
                 raw = self.node.latest_raw()
 
                 if self.phase == 'settle':
-                    self.status.setText(f'hold still... {left:.1f}s')
+                    self.status.setText(f'get your eyes on the dot… {left:.1f}s')
                     if left <= 0:
                         self.phase = 'sample'
-                        self.phase_end = now + self.SAMPLE_S
+                        self.phase_end = (now +
+                                          cls.PROFILES[self.profile]['sample'])
                     return
 
                 if self.phase == 'sample':
                     if raw is not None and raw[2] and raw[3] < 0.5:
                         self.samples.append((raw[0], raw[1]))
                     self.status.setText(
-                        f'capturing {len(self.samples)} samples  '
-                        f'{left:.1f}s')
+                        f'capturing {len(self.samples)} samples  {left:.1f}s')
                     if left <= 0:
                         self._finish_point()
                     return
@@ -993,69 +1126,53 @@ class CalibDialog:
                     self.timer.stop()
 
             def _finish_point(self):
-                name = self.TARGETS[self.idx][0]
-                if len(self.samples) < 5:
+                if len(self.samples) < cls.MIN_SAMPLES:
                     self.lbl.setText('Not enough samples')
                     self.hint.setText(
-                        'The tracker lost your eyes. Check the camera, then '
-                        'press Retry.')
+                        'The tracker lost your eyes on that dot. Check the '
+                        'camera and the lighting, then press Retry.')
                     self.btn_go.setText('Retry')
                     self.btn_go.setEnabled(True)
+                    self.cmb_profile.setEnabled(True)
                     self.phase = 'idle'
+                    self.u = self.v = None
                     self.timer.stop()
+                    self.update()
                     return
                 n = len(self.samples)
                 mu = sum(s[0] for s in self.samples) / n
                 mv = sum(s[1] for s in self.samples) / n
-                self.captured[name] = (mu, mv)
-                self.status.setText(f'{name}: u={mu:.3f} v={mv:.3f}')
+                self.captured.append((mu, mv))
+                self.status.setText(
+                    f'got {n} samples  (raw u={mu:.3f} v={mv:.3f})')
 
                 self.idx += 1
-                if self.idx < len(self.TARGETS):
+                if self.idx < len(self._dots()):
                     self._begin_point()
                 else:
                     self._compute()
 
             def _compute(self):
-                cu, cv = self.captured['centre']
-                lu, _ = self.captured['left']
-                ru, _ = self.captured['right']
-                _, uu = self.captured['up']
-                _, dv = self.captured['down']
+                dots = self._dots()
+                n = len(self.captured)
 
-                # The robot applies  corrected = (raw - offset) * gain + 0.5.
-                # For the resting gaze to land on 0.5 the offset must be the
-                # raw value itself, NOT (raw - 0.5). Subtracting 0.5 there
-                # yields corrected = 1.0 and pins the robot to one side - it
-                # looks like calibration "did nothing", which is worse than
-                # not calibrating at all.
-                ox = cu
-                oy = cv
-
-                # 0.7 of the output range should come from the eye travel
-                # between the left and right targets:
-                #   (ru - ox)*gx + 0.5 = 0.85
-                #   (lu - ox)*gx + 0.5 = 0.15
-                # Subtracting gives gx = 0.7 / (ru - lu).
-                dx = ru - lu
-                dy = dv - uu
-                gx = 0.7 / dx if abs(dx) > 1e-3 else 1.0
-                gy = 0.7 / dy if abs(dy) > 1e-3 else 1.0
-
-                # A tracker that barely moved between targets produces a huge
-                # gain, which would make the robot twitch on noise.
-                gx = min(5.0, max(0.25, gx))
-                gy = min(5.0, max(0.25, gy))
+                # The maths lives in gaze_calib.py so the HUD, which applies
+                # the result, cannot disagree with the console, which produces
+                # it: both import the same function.
+                ox, oy, gx, gy = fit_calib(
+                    self.captured, [(d[1], d[2]) for d in dots])
 
                 self.result_calib = (ox, oy, gx, gy)
                 self.phase = 'done'
                 self.timer.stop()
-                self.canvas.set_target(None, None)
+                self.u = self.v = None
                 self.lbl.setText('Calibration complete')
                 self.hint.setText(
-                    f'offset=({ox:+.3f}, {oy:+.3f})  '
-                    f'gain=({gx:.2f}, {gy:.2f})')
-                self.status.setText('Press Apply to send this to the robot.')
+                    f'offset=({ox:+.3f}, {oy:+.3f})   '
+                    f'gain=({gx:.2f}, {gy:.2f})\n'
+                    'Press Apply to send this to the robot.')
+                self.status.setText(
+                    f'{n} dots · profile {self.profile}')
                 self.btn_go.setText('Apply')
                 self.btn_go.setEnabled(True)
                 try:
@@ -1063,39 +1180,11 @@ class CalibDialog:
                 except TypeError:
                     pass
                 self.btn_go.clicked.connect(self.accept)
+                self.update()
 
             def reject(self):
                 self.timer.stop()
                 super().reject()
-
-        class _Target(QtWidgets.QWidget):
-            def __init__(self, parent=None):
-                super().__init__(parent)
-                self.u = None
-                self.v = None
-
-            def set_target(self, u, v):
-                self.u, self.v = u, v
-                self.update()
-
-            def paintEvent(self, _e):
-                p = QtGui.QPainter(self)
-                p.setRenderHint(QtGui.QPainter.Antialiasing)
-                r = self.rect().adjusted(2, 2, -2, -2)
-                p.setPen(QtCore.Qt.NoPen)
-                p.setBrush(QtGui.QColor('#0d1014'))
-                p.drawRoundedRect(QtCore.QRectF(r), 6, 6)
-                p.setPen(QtGui.QPen(QtGui.QColor('#232a33'), 1))
-                p.drawRect(r)
-                if self.u is None:
-                    return
-                c = QtCore.QPointF(r.left() + r.width() * self.u,
-                                   r.top() + r.height() * self.v)
-                p.setPen(QtCore.Qt.NoPen)
-                p.setBrush(QtGui.QColor('#2563eb'))
-                p.drawEllipse(c, 13, 13)
-                p.setBrush(QtGui.QColor('#dbeafe'))
-                p.drawEllipse(c, 5, 5)
 
         return _Dialog
 
@@ -1167,6 +1256,7 @@ def main(args=None):
             self.held = set()
             self.audio_on = False
             self._last_jpeg = None
+            self._cam_px = None
             self._map_sig = None
             self._link_busy = False
 
@@ -1868,9 +1958,55 @@ def main(args=None):
             self.btn_gaze_stop.setEnabled(running)
             self.btn_gaze.setText('Gaze running' if running else 'Start gaze')
 
+        def _kill_gaze_now(self):
+            """Stop the gaze HUD synchronously, without waiting for it.
+
+            The HUD is started detached (start_new_session) so a crash here
+            cannot take it down mid-drive. That is right for a crash and wrong
+            for a clean exit: the process outlives the console, keeps the
+            webcam open, and leaves an OpenCV window on screen with nobody
+            driving it. Closing the console has to close it too.
+
+            SIGTERM, not SIGKILL: the node's shutdown path releases the V4L2
+            capture, and killing it outright can leave /dev/video0 held until
+            the kernel notices.
+            """
+            pids = self._gaze_pids()
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)
+                except ProcessLookupError:
+                    pass          # already gone, which is the goal
+                except Exception:  # noqa: BLE001 - never block closing
+                    pass
+            return pids
+
         # ---------------------------------------------------------- calibration
+        def camera_image_rect(self):
+            """Where the camera picture is actually drawn, in window coordinates.
+
+            The label is larger than the image: KeepAspectRatio letterboxes,
+            so the picture is centred inside the label with dark bars on two
+            sides. Gaze calibration must use the picture rect, not the label
+            rect - using the label rect stretches the calibration by the ratio
+            between them, and a 4:3 image in a wide label is a big ratio.
+            """
+            lbl = self.lbl_cam
+            r = QtCore.QRect(lbl.mapTo(self, QtCore.QPoint(0, 0)), lbl.size())
+            if self._cam_px:
+                w, h = self._cam_px
+                if 0 < w <= r.width() and 0 < h <= r.height():
+                    return QtCore.QRect(r.x() + (r.width() - w) // 2,
+                                        r.y() + (r.height() - h) // 2, w, h)
+            return r
+
         def _calibrate(self):
-            dlg = CalibDialogCls(node, self)
+            # Hand the overlay the GLOBAL rect of the picture: a parented
+            # QDialog is still a top-level window, so its geometry is in
+            # screen coordinates and this is what makes the dots line up.
+            cam = self.camera_image_rect()
+            cam.moveTopLeft(self.mapToGlobal(cam.topLeft()))
+            dlg = CalibDialogCls(node, cam, self)
             if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_calib:
                 ox, oy, gx, gy = dlg.result_calib
                 node.set_calibration(ox, oy, gx, gy)
@@ -2166,9 +2302,15 @@ def main(args=None):
                 self._last_jpeg = jpeg
                 pix = QtGui.QPixmap()
                 if pix.loadFromData(jpeg, 'JPEG'):
-                    self.lbl_cam.setPixmap(pix.scaled(
+                    scaled = pix.scaled(
                         self.lbl_cam.size(), QtCore.Qt.KeepAspectRatio,
-                        QtCore.Qt.SmoothTransformation))
+                        QtCore.Qt.SmoothTransformation)
+                    self.lbl_cam.setPixmap(scaled)
+                    # Remember the size the picture was actually drawn at.
+                    # KeepAspectRatio letterboxes inside the label, so the
+                    # label rect and the image rect are not the same thing,
+                    # and gaze calibration has to use the IMAGE rect.
+                    self._cam_px = (scaled.width(), scaled.height())
             elif jpeg is None:
                 self.lbl_cam.setText('waiting for /image_throttled/compressed…')
 
@@ -2294,6 +2436,13 @@ def main(args=None):
             """
             node.estop()
             self._stop_operator_audio()
+
+            # The gaze HUD was started detached and does not die with this
+            # process, so it has to be stopped explicitly. Unconditional: it
+            # is a window this console opened, and it holds the webcam.
+            killed = self._kill_gaze_now()
+            if killed:
+                self.logline(f'stopped gaze ({len(killed)} process(es))')
 
             if self.chk_stopview.isChecked() and self._view_running():
                 script = os.path.expanduser(

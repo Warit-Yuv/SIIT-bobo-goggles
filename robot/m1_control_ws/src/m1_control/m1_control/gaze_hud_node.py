@@ -41,9 +41,18 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, UInt8
+from std_msgs.msg import Float32, Float32MultiArray, UInt8
+
+try:
+    from m1_control.gaze_calib import apply as apply_calib
+except ImportError:  # run as a plain script rather than through ros2 run
+    from gaze_calib import apply as apply_calib
 
 MODE_GAZE = 2
+
+#: One place for the window title, because it is also the key used to ask
+#: OpenCV whether the window still exists.
+WINDOW_TITLE = 'M1 Gaze Teleoperation HUD'
 
 # Quadrant labels
 ZONE_CENTER = 'CENTER'
@@ -88,6 +97,13 @@ class GazeHUDNode(Node):
         # flipped back to GAZE within ~16 ms of every KEYBOARD command.
         self.declare_parameter('assert_mode', False)
 
+        # Per-axis correction, same four numbers and same formula as
+        # gaze_udp_bridge:  corrected = (raw - offset) * gain + 0.5
+        self.declare_parameter('gaze_offset_x', 0.5)
+        self.declare_parameter('gaze_offset_y', 0.5)
+        self.declare_parameter('gaze_gain_x', 1.0)
+        self.declare_parameter('gaze_gain_y', 1.0)
+
         gp = self.get_parameter
         self.camera_topic = gp('camera_topic').value
         self.gaze_source = str(gp('gaze_source').value).lower()
@@ -108,6 +124,14 @@ class GazeHUDNode(Node):
         self.invert_pan = bool(gp('invert_pan').value)
         self.invert_tilt = bool(gp('invert_tilt').value)
 
+        # Held in memory rather than re-read from the parameters: the console
+        # sets it over /gaze/calib, and gaze_udp_bridge already learned that
+        # set_parameters() from inside a callback silently fails to stick.
+        self._calib = [float(gp('gaze_offset_x').value),
+                       float(gp('gaze_offset_y').value),
+                       float(gp('gaze_gain_x').value),
+                       float(gp('gaze_gain_y').value)]
+
         servo_period = 1.0 / max(1.0, float(gp('servo_rate_limit_hz').value))
         self._last_servo = 0.0
         self._servo_period = servo_period
@@ -124,6 +148,8 @@ class GazeHUDNode(Node):
         self.gaze_valid = False
         self.mouse_click = None
         self._window_ready = False
+        self._saw_visible = False
+        self._WIN = WINDOW_TITLE
 
         self.zone = ZONE_CENTER
         self.zone_since = time.time()
@@ -156,10 +182,28 @@ class GazeHUDNode(Node):
         # z carries validity: 1.0 = a real fix, 0.0 = face lost / blink.
         self.raw_pub = self.create_publisher(Point, '/gaze/raw', 10)
 
+        # The CORRECTED point, which is what should steer anything.
+        #
+        # This was missing, and it is why the console's Calibrate button did
+        # nothing at all: the console published /gaze/calib, but on the
+        # mediapipe path no node subscribed to it. Only gaze_udp_bridge did,
+        # and that is the *other* gaze source. The numbers went nowhere.
+        #
+        # Publishing the corrected point here also lets the Pi-side
+        # gaze_control_node work with the local HUD, which it previously
+        # could not: the HUD drove /cmd_vel/gaze itself and never emitted
+        # /gaze/point.
+        self.point_pub = self.create_publisher(Point, '/gaze/point', 10)
+        self.calib_state_pub = self.create_publisher(
+            Float32MultiArray, '/gaze/calib_state', 10)
+
         self.create_subscription(CompressedImage, self.camera_topic,
                                  self.image_cb, sensor_qos)
         self.create_subscription(Float32, '/voltage', self.voltage_cb, sensor_qos)
         self.create_subscription(Point, '/gaze/point', self.external_gaze_cb, 10)
+        self.create_subscription(Float32MultiArray, '/gaze/calib',
+                                 self._calib_cb, 10)
+        self.create_timer(1.0, self._report_calib)
 
         self._face_mesh = None
         if self.gaze_source == 'mediapipe':
@@ -202,6 +246,31 @@ class GazeHUDNode(Node):
     # --------------------------------------------------------------- callbacks
     def voltage_cb(self, msg: Float32):
         self.battery = float(msg.data)
+
+    def _calib_cb(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        if len(data) < 4:
+            self.get_logger().warn(
+                f'/gaze/calib needs 4 floats [ox, oy, gx, gy], got {len(data)}')
+            return
+        self._calib = [float(v) for v in data[:4]]
+        self.get_logger().info(
+            'Calibration set: offset=(%.3f, %.3f) gain=(%.2f, %.2f)'
+            % tuple(self._calib))
+        self._report_calib()
+
+    def _report_calib(self):
+        self.calib_state_pub.publish(
+            Float32MultiArray(data=[float(v) for v in self._calib]))
+
+    def _correct(self, u, v):
+        """Raw tracker output -> the point the operator actually meant.
+
+        Same function the console uses to FIT the calibration, imported
+        rather than reimplemented: a fit and an apply that disagree by a sign
+        or an intercept look exactly like "calibration does nothing".
+        """
+        return apply_calib(u, v, self._calib)
 
     def external_gaze_cb(self, msg: Point):
         if self.gaze_source in ('external', 'keyboard'):
@@ -302,6 +371,19 @@ class GazeHUDNode(Node):
         raw.z = 1.0 if self.gaze_valid else 0.0
         self.raw_pub.publish(raw)
 
+        # Apply the calibration for the mediapipe source only. Mouse gaze is
+        # already in the frame the operator is pointing at, and the external
+        # source has been corrected upstream by gaze_udp_bridge - correcting
+        # either of those again would shift them for no reason.
+        if self.gaze_source == 'mediapipe':
+            cu, cv = self._correct(self.gaze_u, self.gaze_v)
+            pt = Point()
+            pt.x, pt.y = float(cu), float(cv)
+            pt.z = 0.0
+            self.point_pub.publish(pt)
+        else:
+            cu, cv = self.gaze_u, self.gaze_v
+
         frame = self.frame
         if frame is None:
             return
@@ -317,8 +399,14 @@ class GazeHUDNode(Node):
             self.gaze_v = float(np.clip(my / max(1, h), 0.0, 1.0))
             self.gaze_valid = True
 
-        gx = int(self.gaze_u * w)
-        gy = int(self.gaze_v * h)
+        # Everything downstream works on the CORRECTED point: that is where
+        # the operator meant to look. The raw point is still drawn, hollow,
+        # so it is obvious when the calibration is pulling hard in one
+        # direction.
+        gx = int(cu * w)
+        gy = int(cv * h)
+        rx = int(self.gaze_u * w)
+        ry = int(self.gaze_v * h)
         dx, dy = gx - cx, gy - cy
 
         zone, dist = self._classify(dx, dy, deadzone_r)
@@ -369,6 +457,7 @@ class GazeHUDNode(Node):
 
         # Reticle colour encodes state: red = driving, green = looking.
         col = (0, 0, 255) if self.confirmed_zone != ZONE_CENTER else (0, 255, 0)
+        cv2.circle(overlay, (rx, ry), 14, (120, 120, 120), 1)
         cv2.circle(overlay, (gx, gy), 10, col, 2)
         cv2.circle(overlay, (gx, gy), 2, col, -1)
 
@@ -404,11 +493,36 @@ class GazeHUDNode(Node):
 
         if self.show_window:
             if not self._window_ready:
-                cv2.namedWindow('M1 Gaze Teleoperation HUD', cv2.WINDOW_NORMAL)
-                cv2.setMouseCallback('M1 Gaze Teleoperation HUD', self._on_mouse)
+                cv2.namedWindow(self._WIN, cv2.WINDOW_NORMAL)
+                cv2.setMouseCallback(self._WIN, self._on_mouse)
                 self._window_ready = True
-            cv2.imshow('M1 Gaze Teleoperation HUD', overlay)
+            cv2.imshow(self._WIN, overlay)
             key = cv2.waitKey(1) & 0xFF
+
+            # Closing the window with the X button does NOT stop this loop.
+            # imshow() then re-creates the window on the next frame, so the
+            # HUD looked like it "kept reopening" no matter how many times it
+            # was closed - nothing was ever asking whether it still existed.
+            #
+            # getWindowProperty raises cv2.error once the window is gone on
+            # some backends and returns < 1 on others, so both mean the same
+            # thing here: the operator wants out.
+            #
+            # Guarded by _saw_visible on purpose. Not every OpenCV backend
+            # implements WND_PROP_VISIBLE; those return -1 forever. Without the
+            # guard the HUD would exit on its first frame on exactly the
+            # machines where the check cannot work - turning "the window will
+            # not close" into "the window never opens".
+            try:
+                vis = cv2.getWindowProperty(self._WIN, cv2.WND_PROP_VISIBLE)
+                if vis >= 1:
+                    self._saw_visible = True
+                elif self._saw_visible:
+                    raise KeyboardInterrupt
+            except cv2.error:
+                if self._saw_visible:
+                    raise KeyboardInterrupt
+
             if key == ord('q'):
                 raise KeyboardInterrupt
             if key == ord('u'):
