@@ -65,6 +65,36 @@ pip3 install --target ~/gaze-libs "mediapipe==0.10.14" "numpy<1.27"
 
 ---
 
+## What the tracker actually measures
+
+Iris position only — **not** head pose.
+
+Mediapipe FaceMesh gives 478 landmarks including an iris ring per eye. From
+those, two numbers are derived per eye:
+
+| Axis | How |
+|---|---|
+| Horizontal | where the iris sits **along** the line joining the eye corners, as a fraction |
+| Vertical | how far the iris sits **off** that same line, in units of eye width |
+
+Both eyes are averaged. Because both axes are measured against the *same*
+stable reference — the eye-corner line — they have the same noise floor.
+
+> An earlier version measured vertical against the distance between the upper
+> and lower eyelid. That denominator is a few pixels and changes on every
+> blink, so the vertical signal was mostly eyelid motion. The symptom was
+> exactly what an operator would report as "up and down is hard to tell apart":
+> the vertical gain in calibration kept coming back clamped at its minimum.
+
+**This means the tracker does not compensate for head movement.** Look at the
+same spot while moving your head and the reading changes. Full head-pose
+compensation (the `geo_iris` model in [GazeModel](https://github.com/lANXEZ/GazeModel))
+adds a solved 3D head rotation to the eye-in-head angle. That is a real
+improvement and it is **not implemented here** — sit still and it does not
+matter; move around and it does.
+
+---
+
 ## The pipeline
 
 ```
@@ -96,32 +126,61 @@ pip3 install --target ~/gaze-libs "mediapipe==0.10.14" "numpy<1.27"
 It comes from `gaze_udp_bridge` on the robot **and** from `gaze_hud_node` on the
 PC, so calibration works with any source.
 
+`/gaze/face` carries a 112×112 JPEG crop of the operator's face at 5 Hz, which
+the console shows beside the gaze plot. It exists because "the dot is not
+moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
+
 ---
 
 ## Calibrating
 
 **5 · Gaze → Calibrate…**
 
-You are shown five dots — centre, left, right, up, down. Look at each and hold
-still. The console fits:
+Two profiles. Both fit the same two numbers per axis; they differ only in how
+many dots are used to fit them.
+
+| Profile | Dots | Time | Use it when |
+|---|---|---|---|
+| **Fast** | 5 — centre, top, right, bottom, left | ~10 s | you shifted in your seat |
+| **Long** | 9 — a 3×3 grid | ~30 s | first time, or after a long break |
+
+The dots are drawn **inside the robot camera image**, not in a separate box.
+The tracker works in camera-image coordinates, so a dot at `u=0.15` has to be
+15% across that image — anywhere else and the fit learns a gain scaled by the
+ratio between the two rectangles. It does not merely look wrong; it steers
+wrong.
+
+The console fits:
 
 ```
 corrected = (raw - offset) * gain + 0.5
 ```
 
-Five points recover **gain** as well as offset, so a small comfortable eye
-movement still covers the full steering range. Without gain, an operator who
-barely moves their eyes could never reach the edges of the screen.
+by least squares — a line of *target against raw* per axis:
+
+```
+t = gain * raw + b     =>     gain = slope,  offset = (0.5 - b) / gain
+```
+
+That works for any number of dots, which is why one fitter serves both
+profiles. The intercept is pinned through the centroid, so clamping the gain
+cannot drag the neutral point off centre.
 
 The **offset** is the raw value at rest — if your neutral gaze reads `u=0.62`,
 the offset becomes `0.62` so that neutral maps to `0.5`. Getting this wrong is
 what makes "calibration did nothing" happen.
 
+The **long** profile also drops a dot that fits three times worse than the
+median and refits. Measured on a simulated tracker, one bad dot moved the
+fitted gain from 2.00 to 1.26 — a 37% error that feels like the head barely
+moving. The **fast** profile drops nothing: with no spare dots there is no way
+to know which one is wrong, which is exactly its trade-off.
+
 Press **Reset** to return to neutral (offset 0.5, gain 1.0, i.e. passthrough).
 
 ### What calibration cannot fix
 
-- **Head movement.** Mediapipe tracks iris position relative to the eye, so
+- **Head movement.** See above — iris position is relative to the eye, so
   moving your head while looking at the same place changes the reading. Sit
   however you intend to sit while driving.
 - **Glasses with strong reflections.** Try tilting the screen or adding a light
@@ -136,13 +195,73 @@ Press **Reset** to return to neutral (offset 0.5, gain 1.0, i.e. passthrough).
 
 | Gaze position | Result |
 |---|---|
-| Inside the deadzone circle | Chassis still, gaze drives PTZ pan/tilt |
+| Inside the deadzone | Chassis still, gaze drives PTZ pan/tilt |
 | Outside, held for `dwell_time_sec` | Chassis drives in that direction |
 
 The **deadzone** exists so that looking around does not drive the robot. The
 **dwell** exists because eyes saccade constantly — requiring the gaze to stay in
 one zone for 0.4 s rejects the natural jitter that would otherwise cause
 constant false commands.
+
+### The deadzone is an oval, not a circle
+
+```
+deadzone_radius_ratio    0.25    horizontal
+ deadzone_radius_ratio_y  0.14    vertical
+```
+
+The eye travels much further sideways than up and down. With a circular
+deadzone sized for comfortable turning, FORWARD and BACKWARD were almost
+unreachable — the operator could turn easily but could not get far enough above
+or below centre to drive. Each axis is now normalised by its own radius, and
+the direction test compares those normalised offsets, so "up" competes on equal
+terms with "sideways" instead of losing because the eye moves less that way.
+
+---
+
+## PTZ aiming is positional
+
+The head does **not** integrate your gaze. A small look left is a small angle
+to the left, and it stops there; look back to centre and the head returns.
+
+```
+pan_target  = pan_centre  + fx * (pan_span  / 2)      fx in -1..+1
+```
+
+where `fx` is the gaze offset as a fraction of the deadzone radius.
+
+> An earlier version added a small step to the servo angle on every tick. At
+> 30 Hz a full deflection moved the servo 45°/s and never stopped moving while
+> your eyes were off centre — it drove into the travel limit and sat there.
+> That is joystick behaviour, it makes fine aiming impossible, and it was
+> reported as "the servo is so jerky".
+
+A low-pass (`servo_smoothing`, default 0.25) then removes tracker jitter.
+
+**Axis order matters.** The arbiter reads `/servo/gaze` as `s1 = msg.x`
+(TILT, range 5–75) and `s2 = msg.y` (PAN, range 80–100). The HUD used to send
+pan in `.x`, so each axis was clamped to the *other* axis's limits — pan to
+5–75 and tilt to 80–100. Both were pinned against a wall, which looked like
+jerking.
+
+---
+
+## Driving from one window
+
+**5 · Gaze → Overlay** draws the gaze HUD onto the robot camera image in the
+main window: the oval deadzone, the raw point as a hollow ring, the corrected
+point filled and coloured by whether the chassis is driving, and the zone name.
+
+Off by default — the raw view is what you want when something is wrong.
+
+The face thumbnail beside the gaze plot is fed by `/gaze/face` at 5 Hz. If it
+says `no face`, the camera cannot see you and no amount of calibration will
+help.
+
+The overlay uses the console's own `deadzone_radius_ratio` and
+`deadzone_radius_ratio_y`. **These must stay equal to the HUD's.** A picture
+that disagrees with the zones the robot actually uses is the worst kind of
+wrong, because it looks right.
 
 ---
 
@@ -152,11 +271,15 @@ constant false commands.
 |---|---|---|
 | `no source` in the Gaze panel | nothing publishing `/gaze/raw` | Start gaze, or start the robot stack (the bridge is in it) |
 | `face lost` | mediapipe cannot see you | Move into frame; improve lighting |
+| `no face` thumbnail | nothing on `/gaze/face` | Start gaze; it only publishes while tracking |
 | Falls back to mouse | webcam busy or mediapipe missing | Close other camera apps (`cheese`, `guvcview`); check `~/gaze-libs` |
 | `webcam did not open` | another process holds `/dev/video0` | `sudo fuser -v /dev/video0` — close it |
 | Cursor drifts to one edge | uncalibrated | Run **Calibrate…** |
 | Nothing moves but gaze is live | wrong control mode | Select mode **2 Gaze** (or **4** for fusion) |
 | Robot jitters | deadzone too small | Raise `deadzone_ratio` |
+| Turning is easy, forward is not | vertical deadzone too wide | Lower `deadzone_radius_ratio_y` |
+| Head sweeps to a limit and stops | servo running in rate mode | Check `servo_pan_span` / `servo_smoothing` |
+| Head moves the wrong way | axis inverted | `invert_pan` / `invert_tilt` |
 
 ### Checking the camera is free
 

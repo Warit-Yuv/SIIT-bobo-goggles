@@ -22,9 +22,9 @@ For a dot shown at target `t`:
     t = gain * raw + b        =>   gain = slope,  offset = (0.5 - b) / gain
 
 so a least-squares line of target against raw gives both numbers, for any
-number of dots. That is why the 4-dot "fast" profile is a real calibration and
-not an approximation: the model only has two unknowns per axis, and four dots
-over-determine them.
+number of dots. That is why the 5-dot "fast" profile is a real calibration and
+not an approximation: the model only has two unknowns per axis, and five dots
+over-determine them while also sampling the middle of the range.
 """
 
 #: Gains outside this range are refused. A tracker that barely moved between
@@ -90,6 +90,10 @@ def _residual(sample, target, calib):
 #: tracker jitter never triggers it.
 OUTLIER_FACTOR = 3.0
 
+#: Below this many dots there is not enough agreement to identify which dot is
+#: the bad one, so nothing is dropped. 7 lets the 9-dot grid prune twice.
+MIN_DOTS_TO_PRUNE = 7
+
 
 def fit(samples, targets):
     """Fit (ox, oy, gx, gy).
@@ -103,9 +107,10 @@ def fit(samples, targets):
     Measured on the 9-dot profile, a single bad dot moved the fitted gain from
     2.00 to 1.26 - a 37% error that would feel like the head barely moving.
 
-    With only four dots there is no redundancy to tell which one is wrong, so
-    nothing is dropped: that is the fast profile's whole trade-off, and why the
-    long one exists.
+    Only profiles with enough spare dots are pruned. Dropping a dot needs the
+    remaining ones to agree well enough to say which was wrong, so a small
+    profile keeps everything: refusing to guess is better than guessing wrong,
+    and it is the trade-off the short profile exists to make.
     """
     if len(samples) < 2 or len(samples) != len(targets):
         raise ValueError('fit() needs one target per sample, at least two')
@@ -116,7 +121,7 @@ def fit(samples, targets):
     # Two passes is enough: one grossly wrong dot is the realistic case, and
     # each pass needs the others to be good to know which one is bad.
     for _ in range(2):
-        if len(keep) < 5:
+        if len(keep) < MIN_DOTS_TO_PRUNE:
             break
         res = [_residual(samples[i], targets[i], calib) for i in keep]
         ordered = sorted(res)

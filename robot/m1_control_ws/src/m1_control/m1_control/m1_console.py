@@ -198,6 +198,11 @@ class ConsoleNode(Node):
         self.declare_parameter('servo_s2_min', 80.0)
         self.declare_parameter('servo_s2_max', 100.0)
         self.declare_parameter('servo_step', 4.0)
+        # Gaze overlay geometry. These MUST match the HUD's own deadzone, or
+        # the picture the operator sees would disagree with the zones the robot
+        # actually uses - the worst kind of wrong, because it looks right.
+        self.declare_parameter('deadzone_radius_ratio', 0.25)
+        self.declare_parameter('deadzone_radius_ratio_y', 0.14)
 
         gp = self.get_parameter
         self.robot_ip = gp('robot_ip').value
@@ -208,6 +213,8 @@ class ConsoleNode(Node):
         self.s2_min = float(gp('servo_s2_min').value)
         self.s2_max = float(gp('servo_s2_max').value)
         self.servo_step = float(gp('servo_step').value)
+        self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
+        self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
 
         self.state = {
             'mode': None, 'voltage': float('nan'), 'zone': '',
@@ -218,6 +225,8 @@ class ConsoleNode(Node):
         self._lock = threading.Lock()
         self._latest_jpeg = None
         self._raw = None          # (u, v, valid, monotonic_time)
+        self._latest_face = None
+        self._face_stamp = 0.0
 
         mode_qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                               history=HistoryPolicy.KEEP_LAST,
@@ -256,6 +265,11 @@ class ConsoleNode(Node):
         self.create_subscription(Point, '/gaze/raw', self._raw_cb, 10)
         self.create_subscription(CompressedImage, '/image_throttled/compressed',
                                  self._image_cb, sensor_qos)
+        # The operator's face, so the Gaze panel can show that the webcam can
+        # actually see them. Without it a frozen dot and a camera pointed at
+        # the ceiling look identical.
+        self.create_subscription(CompressedImage, '/gaze/face',
+                                 self._face_cb, sensor_qos)
 
         # ---- SLAM map ------------------------------------------------------
         # slam_toolbox publishes /map with TRANSIENT_LOCAL durability, which is
@@ -312,6 +326,10 @@ class ConsoleNode(Node):
         self._raw = (float(msg.x), float(msg.y), float(msg.z) > 0.5,
                      time.monotonic())
         self._set('gaze_alive', self._raw[2])
+
+    def _face_cb(self, msg):
+        self._latest_face = bytes(msg.data)
+        self._face_stamp = time.monotonic()
 
     def _image_cb(self, msg):
         now = time.monotonic()
@@ -393,6 +411,13 @@ class ConsoleNode(Node):
         if r is None:
             return None
         return r[0], r[1], r[2], time.monotonic() - r[3]
+
+    def latest_face(self):
+        """(jpeg_bytes, age_seconds) or None. Age lets the GUI drop a stale
+        face instead of showing the last one forever after tracking stops."""
+        if self._latest_face is None:
+            return None
+        return self._latest_face, time.monotonic() - self._face_stamp
 
     # -------------------------------------------------------------- commands
     def set_mode(self, mode):
@@ -637,6 +662,83 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
                 p.drawText(box, QtCore.Qt.AlignCenter, 'no gaze source')
 
     return GazeMap
+
+
+def make_gaze_overlay(QtCore, QtGui):
+    """Draws the gaze HUD onto the robot camera image.
+
+    Returns draw(pix, zone, raw, calib, dz_x, dz_y) -> pix.
+
+    Same geometry as gaze_hud_node's own window: oval deadzone, raw point
+    hollow, corrected point filled and coloured by whether the chassis is
+    driving. The operator can then drive from this one window instead of
+    watching a second one beside it.
+
+    The deadzone radii are passed in rather than read from anywhere, because
+    the HUD and this drawing MUST use the same numbers. A picture that
+    disagrees with the zones the robot actually uses is the worst kind of
+    wrong, because it looks right.
+
+    A factory rather than a widget so it can be exercised without a display.
+    """
+
+    def draw(pix, zone, raw, calib, dz_x, dz_y):
+        p = QtGui.QPainter(pix)
+        try:
+            p.setRenderHint(QtGui.QPainter.Antialiasing)
+            w, h = pix.width(), pix.height()
+            cx, cy = w / 2.0, h / 2.0
+            rx = w * dz_x * 0.5
+            ry = h * dz_y * 0.5
+
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.setPen(QtGui.QPen(QtGui.QColor(120, 120, 120, 110), 1,
+                                QtCore.Qt.DashLine))
+            p.drawLine(QtCore.QPointF(0, cy), QtCore.QPointF(w, cy))
+            p.drawLine(QtCore.QPointF(cx, 0), QtCore.QPointF(cx, h))
+
+            p.setPen(QtGui.QPen(QtGui.QColor('#22c55e'), 2))
+            p.drawEllipse(QtCore.QRectF(cx - rx, cy - ry, 2 * rx, 2 * ry))
+
+            if raw is None:
+                p.setPen(QtGui.QColor('#f59e0b'))
+                p.drawText(QtCore.QPointF(10, 22), 'GAZE: no source')
+                return pix
+
+            u, v, valid, age = raw
+            if age > 1.0 or not valid:
+                p.setPen(QtGui.QColor('#f59e0b'))
+                p.drawText(QtCore.QPointF(10, 22),
+                           'GAZE: stale' if age > 1.0 else 'GAZE: face lost')
+                return pix
+
+            ox, oy, gx, gy = calib
+            cu = min(1.0, max(0.0, (u - ox) * gx + 0.5))
+            cv = min(1.0, max(0.0, (v - oy) * gy + 0.5))
+
+            # Raw, hollow: makes a calibration pulling hard visible at a glance.
+            p.setPen(QtGui.QPen(QtGui.QColor(150, 150, 150, 170), 1))
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawEllipse(QtCore.QPointF(u * w, v * h), 9.0, 9.0)
+
+            driving = (zone or 'CENTER') != 'CENTER'
+            col = QtGui.QColor('#ef4444' if driving else '#22c55e')
+            p.setPen(QtGui.QPen(col, 2))
+            p.setBrush(col)
+            p.drawEllipse(QtCore.QPointF(cu * w, cv * h), 5.0, 5.0)
+            p.setBrush(QtCore.Qt.NoBrush)
+            p.drawEllipse(QtCore.QPointF(cu * w, cv * h), 12.0, 12.0)
+
+            p.setPen(col)
+            p.drawText(QtCore.QPointF(10, 22), 'ZONE: ' + (zone or '-'))
+            return pix
+        finally:
+            # A QPainter left active on a pixmap keeps painting on it and
+            # eventually warns "QPainter::begin: Paint device returned
+            # engine == 0". end() must run even if drawing raised.
+            p.end()
+
+    return draw
 
 
 def make_drive_pad(QtCore, QtGui, QtWidgets):
@@ -903,9 +1005,10 @@ class CalibDialog:
 
     PROFILES = {
         'fast': {
-            'label': 'Fast · 4 dots · ~8 s',
+            'label': 'Fast · 5 dots · ~10 s',
             'settle': 0.9, 'sample': 1.0,
             'dots': [
+                ('CENTRE', 0.50, 0.50, 'Look at the CENTRE dot, keep your head still'),
                 ('TOP', 0.50, 0.15, 'Look at the TOP dot, keep your head still'),
                 ('RIGHT', 0.85, 0.50, 'Look at the RIGHT dot, keep your head still'),
                 ('BOTTOM', 0.50, 0.85, 'Look at the BOTTOM dot, keep your head still'),
@@ -1228,6 +1331,7 @@ def main(args=None):
     MeterGreen = make_meter(QtCore, QtGui, QtWidgets, '#34d399')
     ServoBar = make_servo_bar(QtCore, QtGui, QtWidgets)
     GazeMap = make_gaze_map(QtCore, QtGui, QtWidgets)
+    DrawGazeOverlay = make_gaze_overlay(QtCore, QtGui)
     MapView = make_map_view(QtCore, QtGui, QtWidgets)
     DrivePad = make_drive_pad(QtCore, QtGui, QtWidgets)
     # Bind to a NEW name: assigning back to CalibDialog would make it a
@@ -1256,6 +1360,7 @@ def main(args=None):
             self.held = set()
             self.audio_on = False
             self._last_jpeg = None
+            self._last_face = None
             self._cam_px = None
             self._map_sig = None
             self._link_busy = False
@@ -1598,8 +1703,22 @@ def main(args=None):
             g = QtWidgets.QGroupBox('5 · Gaze')
             gv = QtWidgets.QVBoxLayout(g)
             gv.setSpacing(6)
+
+            # Face + plot side by side. The plot alone says "the dot is here";
+            # it cannot say whether the webcam can see a face at all, and those
+            # two failures look identical on a bare dot.
+            top = QtWidgets.QHBoxLayout()
+            top.setSpacing(8)
+            self.lbl_face = QtWidgets.QLabel('no\nface')
+            self.lbl_face.setAlignment(QtCore.Qt.AlignCenter)
+            self.lbl_face.setFixedSize(72, 72)
+            self.lbl_face.setStyleSheet(
+                'background:#0d1014; border:1px solid #2b3138;'
+                'border-radius:5px; color:#6b7280; font-size:9px;')
+            top.addWidget(self.lbl_face, 0, QtCore.Qt.AlignTop)
             self.gaze_map = GazeMap()
-            gv.addWidget(self.gaze_map, 0, QtCore.Qt.AlignHCenter)
+            top.addWidget(self.gaze_map, 1)
+            gv.addLayout(top)
 
             self.lbl_gaze = QtWidgets.QLabel('no source')
             self.lbl_gaze.setObjectName('mono')
@@ -1642,6 +1761,17 @@ def main(args=None):
             self.btn_calib_reset = QtWidgets.QPushButton('Reset')
             self.btn_calib_reset.clicked.connect(self._reset_calibration)
             row.addWidget(self.btn_calib_reset)
+            # Draw the gaze HUD on the robot camera image, so the operator can
+            # drive from one window instead of watching a separate HUD next to
+            # it. Off by default: the raw view is what you want when something
+            # is wrong.
+            self.btn_overlay = QtWidgets.QPushButton('Overlay')
+            self.btn_overlay.setObjectName('toggle')
+            self.btn_overlay.setCheckable(True)
+            self.btn_overlay.setToolTip(
+                'Draw the gaze point, deadzone and zone on the camera image.')
+            self.btn_overlay.toggled.connect(self._toggle_overlay)
+            row.addWidget(self.btn_overlay)
             gv.addLayout(row)
 
             self.lbl_calib = QtWidgets.QLabel('offset —  gain —')
@@ -1951,6 +2081,25 @@ def main(args=None):
                     pass
             self.logline('gaze stopped')
             QtCore.QTimer.singleShot(1500, self._poll_gaze)
+
+        def _toggle_overlay(self, on):
+            self._style_toggle(self.btn_overlay, on=on,
+                               on_text='Overlay on', off_text='Overlay',
+                               off_kind='grey')
+            # Force the next frame to be redrawn: the picture is only rebuilt
+            # when a new JPEG arrives, so without this the overlay would not
+            # appear (or disappear) until the video happened to update.
+            self._last_jpeg = None
+
+        def _overlay_camera(self, pix, s):
+            """Draw the gaze HUD onto the robot camera image.
+
+            The drawing itself lives in make_gaze_overlay() so it can be
+            exercised without a display. This only supplies the live values.
+            """
+            return DrawGazeOverlay(pix, s['zone'], node.latest_raw(),
+                                   s['calib'], node.deadzone_ratio,
+                                   node.deadzone_ratio_y)
 
         def _poll_gaze(self):
             running = bool(self._gaze_pids())
@@ -2305,6 +2454,8 @@ def main(args=None):
                     scaled = pix.scaled(
                         self.lbl_cam.size(), QtCore.Qt.KeepAspectRatio,
                         QtCore.Qt.SmoothTransformation)
+                    if self.btn_overlay.isChecked():
+                        scaled = self._overlay_camera(scaled, s)
                     self.lbl_cam.setPixmap(scaled)
                     # Remember the size the picture was actually drawn at.
                     # KeepAspectRatio letterboxes inside the label, so the
@@ -2345,6 +2496,25 @@ def main(args=None):
             self.lbl_zone.setText(s['zone'] or '—')
             self.lbl_calib.setText(
                 f'offset {ox:+.2f},{oy:+.2f}   gain {gx:.2f},{gy:.2f}')
+
+            # face thumbnail
+            face = node.latest_face()
+            if face is None:
+                self.lbl_face.setText('no\nface')
+            else:
+                fdata, fage = face
+                if fage > 2.0:
+                    # Drop a stale face rather than showing the last one
+                    # forever: a frozen picture of a face reads as "tracking
+                    # is fine" when in fact nothing is arriving.
+                    self.lbl_face.setText('no\nface')
+                elif fdata is not self._last_face:
+                    self._last_face = fdata
+                    fpix = QtGui.QPixmap()
+                    if fpix.loadFromData(fdata, 'JPEG'):
+                        self.lbl_face.setPixmap(fpix.scaled(
+                            self.lbl_face.size(), QtCore.Qt.KeepAspectRatio,
+                            QtCore.Qt.SmoothTransformation))
 
             # Map. Repainting the occupancy grid is the expensive part of a
             # refresh, so only touch it when the data actually changed: the map

@@ -41,7 +41,7 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Float32MultiArray, UInt8
+from std_msgs.msg import Float32, Float32MultiArray, String, UInt8
 
 try:
     from m1_control.gaze_calib import apply as apply_calib
@@ -73,13 +73,36 @@ class GazeHUDNode(Node):
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('dwell_time_sec', 0.40)
         self.declare_parameter('deadzone_radius_ratio', 0.25)
+        # Vertical deadzone, separately. The eye moves much further sideways
+        # than up and down, so a circular deadzone makes FORWARD/BACKWARD the
+        # hardest thing to reach while turning is easy. A smaller vertical
+        # radius makes the two directions equally attainable.
+        self.declare_parameter('deadzone_radius_ratio_y', 0.14)
 
         self.declare_parameter('drive_speed_x', 0.20)
         self.declare_parameter('drive_speed_y', 0.20)
         self.declare_parameter('turn_speed_z', 0.60)
-        self.declare_parameter('servo_gain_pan', 1.5)
-        self.declare_parameter('servo_gain_tilt', 1.5)
+
+        # PTZ aiming is POSITIONAL, not integrating - see _hud_tick(). The span
+        # is the travel used across the whole deadzone: looking at its edge aims
+        # half a span from centre and no further, and looking back returns the
+        # head to centre.
+        self.declare_parameter('servo_pan_span', 10.0)
+        self.declare_parameter('servo_tilt_span', 20.0)
+        # Low-pass per tick. 1.0 = instant (twitchy), 0.2 = very smooth.
+        self.declare_parameter('servo_smoothing', 0.25)
         self.declare_parameter('servo_rate_limit_hz', 12.0)
+
+        # How far the iris signal is stretched before calibration. Calibration
+        # learns the real scale, so this only matters for the uncalibrated case
+        # and for keeping the raw value inside 0..1.
+        self.declare_parameter('iris_gain_h', 3.0)
+        self.declare_parameter('iris_gain_v', 3.0)
+        # Publish the operator's face so the console can show it. Small and
+        # slow on purpose: it travels over the same Wi-Fi as the video feed.
+        self.declare_parameter('publish_face', True)
+        self.declare_parameter('face_publish_hz', 5.0)
+        self.declare_parameter('face_size', 112)
 
         self.declare_parameter('servo_s1_center', 40.0)
         self.declare_parameter('servo_s2_center', 90.0)
@@ -109,16 +132,37 @@ class GazeHUDNode(Node):
         self.gaze_source = str(gp('gaze_source').value).lower()
         self.dwell_threshold = float(gp('dwell_time_sec').value)
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
+        self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
         self.drive_vx = float(gp('drive_speed_x').value)
         self.drive_vy = float(gp('drive_speed_y').value)
         self.turn_wz = float(gp('turn_speed_z').value)
-        self.gain_pan = float(gp('servo_gain_pan').value)
-        self.gain_tilt = float(gp('servo_gain_tilt').value)
+        self.pan_span = float(gp('servo_pan_span').value)
+        self.tilt_span = float(gp('servo_tilt_span').value)
+        self.servo_smoothing = float(np.clip(gp('servo_smoothing').value,
+                                             0.01, 1.0))
+        self.iris_gain_h = float(gp('iris_gain_h').value)
+        self.iris_gain_v = float(gp('iris_gain_v').value)
+        self.publish_face = bool(gp('publish_face').value)
+        self.face_period = 1.0 / max(0.5, float(gp('face_publish_hz').value))
+        self.face_size = int(gp('face_size').value)
         self.show_window = bool(gp('show_window').value)
         self.assert_mode = bool(gp('assert_mode').value)
 
-        self.pan = float(gp('servo_s1_center').value)
-        self.tilt = float(gp('servo_s2_center').value)
+        # NAMED AS THE HARDWARE NAMES THEM.
+        #
+        #   s1 = TILT  centre 40, range 5..75    larger = look UP
+        #   s2 = PAN   centre 90, range 80..100  larger = look LEFT
+        #
+        # The arbiter reads /servo/gaze as s1 = msg.x, s2 = msg.y. This node
+        # used to hold pan in .x and clip pan to the s1 range, which clamped
+        # pan to 5..75 (its real range is 80..100) and tilt to 80..100 (its
+        # real range is 5..75). Both axes were therefore pinned against the
+        # wrong limits, which is what made the head slam to a stop and look
+        # jerky rather than following the eyes.
+        self.pan_center = float(gp('servo_s2_center').value)
+        self.tilt_center = float(gp('servo_s1_center').value)
+        self.pan = self.pan_center
+        self.tilt = self.tilt_center
         self.s1_min, self.s1_max = float(gp('servo_s1_min').value), float(gp('servo_s1_max').value)
         self.s2_min, self.s2_max = float(gp('servo_s2_min').value), float(gp('servo_s2_max').value)
         self.invert_pan = bool(gp('invert_pan').value)
@@ -150,6 +194,7 @@ class GazeHUDNode(Node):
         self._window_ready = False
         self._saw_visible = False
         self._WIN = WINDOW_TITLE
+        self._last_face = 0.0
 
         self.zone = ZONE_CENTER
         self.zone_since = time.time()
@@ -196,6 +241,11 @@ class GazeHUDNode(Node):
         self.point_pub = self.create_publisher(Point, '/gaze/point', 10)
         self.calib_state_pub = self.create_publisher(
             Float32MultiArray, '/gaze/calib_state', 10)
+        # The console needs the zone to draw its overlay, and it should not
+        # have to reimplement the dwell state machine to work it out.
+        self.zone_pub = self.create_publisher(String, '/gaze/zone', 10)
+        self.face_pub = self.create_publisher(
+            CompressedImage, '/gaze/face', sensor_qos)
 
         self.create_subscription(CompressedImage, self.camera_topic,
                                  self.image_cb, sensor_qos)
@@ -292,6 +342,57 @@ class GazeHUDNode(Node):
                 or event == cv2.EVENT_LBUTTONDOWN:
             self.mouse_click = (int(x), int(y))
 
+    def _publish_face_crop(self, cam, lm):
+        """Publish a small crop of the operator's face for the console.
+
+        The console showed a bare dot with no indication of whether the camera
+        could actually see a face, so "the dot is not moving" and "the webcam
+        is pointed at the ceiling" looked identical. A thumbnail answers that
+        at a glance.
+
+        Rate-limited and shrunk here rather than in the console: this crosses
+        the same Wi-Fi as the robot video, and a full frame at 30 Hz would
+        compete with it for no benefit.
+        """
+        now = time.time()
+        if now - self._last_face < self.face_period:
+            return
+        self._last_face = now
+        try:
+            h, w = cam.shape[:2]
+            xs = [p.x for p in lm]
+            ys = [p.y for p in lm]
+            x0, x1 = max(0, min(xs)), min(1, max(xs))
+            y0, y1 = max(0, min(ys)), min(1, max(ys))
+            # Landmarks stop at the brow and jaw line; pad so the crop is a
+            # face rather than a band of one.
+            pad_x = (x1 - x0) * 0.25
+            pad_y = (y1 - y0) * 0.35
+            cx0 = int(max(0, (x0 - pad_x)) * w)
+            cx1 = int(min(1, (x1 + pad_x)) * w)
+            cy0 = int(max(0, (y0 - pad_y)) * h)
+            cy1 = int(min(1, (y1 + pad_y)) * h)
+            if cx1 - cx0 < 16 or cy1 - cy0 < 16:
+                return
+            crop = cam[cy0:cy1, cx0:cx1]
+            side = max(crop.shape[:2])
+            square = np.zeros((side, side, 3), np.uint8)
+            oy = (side - crop.shape[0]) // 2
+            ox = (side - crop.shape[1]) // 2
+            square[oy:oy + crop.shape[0], ox:ox + crop.shape[1]] = crop
+            small = cv2.resize(square, (self.face_size, self.face_size),
+                               interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode('.jpg', small,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            if not ok:
+                return
+            msg = CompressedImage()
+            msg.format = 'jpeg'
+            msg.data = buf.tobytes()
+            self.face_pub.publish(msg)
+        except Exception as exc:  # noqa: BLE001 - never break tracking for this
+            self.get_logger().debug(f'face crop failed: {exc}')
+
     # ------------------------------------------------------------- gaze input
     def _update_gaze_from_webcam(self):
         """Iris position -> normalized screen coordinates."""
@@ -320,35 +421,85 @@ class GazeHUDNode(Node):
             span = np.linalg.norm(b - a)
             return 0.0 if span < 1e-6 else float(np.dot(iris - a, b - a) / (span ** 2))
 
+        def perp(iris, a, b):
+            """Signed distance off the corner line, in units of eye width.
+
+            Positive = the iris is ABOVE the line joining the eye corners.
+
+            This replaces the old vertical measure, which divided the iris
+            height by the distance between the upper and lower eyelid
+            (landmarks 159 and 145). That denominator is a few pixels and it
+            changes every time the operator blinks or squints, so the vertical
+            signal was dominated by eyelid motion rather than by where the eye
+            was pointing. Measured symptom: the vertical gain in calibration
+            kept coming back clamped at its minimum, which made FORWARD and
+            BACKWARD almost impossible to reach while turning was easy.
+
+            The corner line is the eye's own stable axis, so measuring along
+            the perpendicular of the SAME line the horizontal measure uses
+            gives a vertical signal with the same noise floor as the
+            horizontal one.
+            """
+            d = b - a
+            span = np.linalg.norm(d)
+            if span < 1e-6:
+                return 0.0
+            # Two perpendiculars; take the one pointing up the image (-y).
+            n = np.array([-d[1], d[0]]) / span
+            if n[1] > 0:
+                n = -n
+            return float(np.dot(iris - a, n) / span)
+
         # Left eye runs outer->inner, right eye inner->outer, so both ratios
         # increase toward the nose. Average and map to -1..+1.
         h = 0.5 * (ratio(l_iris, l_out, l_in) + ratio(r_iris, r_in, r_out))
-        # Vertical: iris height relative to the eye opening (159 upper, 145 lower).
-        upper = np.array([lm[159].x, lm[159].y])
-        lower = np.array([lm[145].x, lm[145].y])
-        v = ratio(l_iris, upper, lower)
+        # perp() is zero when the iris sits on the corner line, so add 0.5 to
+        # put the neutral point in the same place as the horizontal measure.
+        v = 0.5 + 0.5 * (perp(l_iris, l_out, l_in) + perp(r_iris, r_in, r_out))
 
-        self.gaze_u = float(np.clip((h - 0.5) * 3.0 + 0.5, 0.0, 1.0))
-        self.gaze_v = float(np.clip((v - 0.5) * 3.0 + 0.5, 0.0, 1.0))
+        # Keep the raw value inside 0..1: the calibration maps targets into
+        # that square, and a sample outside it cannot be fitted against.
+        self.gaze_u = float(np.clip((h - 0.5) * self.iris_gain_h + 0.5, 0.0, 1.0))
+        self.gaze_v = float(np.clip((v - 0.5) * self.iris_gain_v + 0.5, 0.0, 1.0))
         self.gaze_valid = True
 
+        if self.publish_face:
+            self._publish_face_crop(cam, lm)
+
     # ------------------------------------------------------------------ logic
-    def _classify(self, dx, dy, deadzone_r):
-        dist = float(np.hypot(dx, dy))
-        if dist < deadzone_r:
+    def _classify(self, dx, dy, rx, ry):
+        """Map an offset from centre to a control zone, with an oval deadzone.
+
+        `rx` and `ry` are separate on purpose. A circular deadzone sized for
+        horizontal comfort makes the vertical zones unreachable: the eye
+        travels much further sideways than up and down, so the operator could
+        turn easily but almost never got far enough above or below centre to
+        drive. Normalising each axis by its own radius fixes that without
+        touching how far sideways the eyes must go.
+
+        Returns (zone, normalized_distance) - 1.0 is the deadzone edge.
+        """
+        nx = dx / max(1e-6, rx)
+        ny = dy / max(1e-6, ry)
+        dist = float(np.hypot(nx, ny))
+        if dist < 1.0:
             return ZONE_CENTER, dist
-        # Horizontal component dominates -> turn, otherwise drive.
-        if abs(dx) >= abs(dy):
-            return (ZONE_TURN_LEFT if dx < 0 else ZONE_TURN_RIGHT), dist
-        return (ZONE_FORWARD if dy < 0 else ZONE_BACKWARD), dist
+        # Compare the NORMALISED offsets, so "up" competes on equal terms with
+        # "sideways" rather than losing because the eye moves less that way.
+        if abs(nx) >= abs(ny):
+            return (ZONE_TURN_LEFT if nx < 0 else ZONE_TURN_RIGHT), dist
+        return (ZONE_FORWARD if ny < 0 else ZONE_BACKWARD), dist
 
     def _publish_servo(self):
         now = time.time()
         if now - self._last_servo < self._servo_period:
             return
         self._last_servo = now
+        # x = s1 = TILT, y = s2 = PAN. The arbiter reads it that way and the
+        # hardware is wired that way; sending them crossed is what pinned both
+        # axes against each other's limits.
         self.servo_pub.publish(
-            Vector3(x=float(self.pan), y=float(self.tilt), z=0.0))
+            Vector3(x=float(self.tilt), y=float(self.pan), z=0.0))
 
     def _assert_mode(self):
         # Only ever *offer* the mode, and only while this node is genuinely
@@ -390,7 +541,9 @@ class GazeHUDNode(Node):
 
         h, w = frame.shape[:2]
         cx, cy = w // 2, h // 2
-        deadzone_r = int(min(w, h) * self.deadzone_ratio)
+        # Oval deadzone, in pixels, for drawing and for the pixel offsets below.
+        dz_rx = int(w * self.deadzone_ratio * 0.5)
+        dz_ry = int(h * self.deadzone_ratio_y * 0.5)
 
         # Mouse gaze: convert the last click into normalized coordinates.
         if self.gaze_source == 'mouse' and self.mouse_click is not None:
@@ -398,6 +551,7 @@ class GazeHUDNode(Node):
             self.gaze_u = float(np.clip(mx / max(1, w), 0.0, 1.0))
             self.gaze_v = float(np.clip(my / max(1, h), 0.0, 1.0))
             self.gaze_valid = True
+            cu, cv = self.gaze_u, self.gaze_v
 
         # Everything downstream works on the CORRECTED point: that is where
         # the operator meant to look. The raw point is still drawn, hollow,
@@ -409,7 +563,7 @@ class GazeHUDNode(Node):
         ry = int(self.gaze_v * h)
         dx, dy = gx - cx, gy - cy
 
-        zone, dist = self._classify(dx, dy, deadzone_r)
+        zone, dist = self._classify(dx, dy, dz_rx, dz_ry)
         now = time.time()
 
         # ---- dwell state machine ----
@@ -422,15 +576,35 @@ class GazeHUDNode(Node):
 
         if zone == ZONE_CENTER:
             # Fine PTZ aiming only - the chassis never moves in the deadzone.
+            #
+            # POSITIONAL, not integrating. An earlier version added a small
+            # step to the servo angle on every tick, which is rate control:
+            # holding the eyes slightly off centre drove the head further and
+            # further until it hit a travel limit and stayed there. At 30 Hz a
+            # full deflection moved the servo 45 deg/s, which is the jerkiness
+            # the operator felt, and it made fine aiming impossible.
+            #
+            # Here the offset maps to an absolute angle, so a small look is a
+            # small angle that then STOPS, and looking back returns the head to
+            # centre. The range is inherently bounded by the span.
             if self.gaze_valid:
-                pan_step = -(dx / max(1, deadzone_r)) * self.gain_pan
-                tilt_step = -(dy / max(1, deadzone_r)) * self.gain_tilt
+                fx = float(np.clip(-dx / max(1.0, dz_rx), -1.0, 1.0))
+                fy = float(np.clip(-dy / max(1.0, dz_ry), -1.0, 1.0))
                 if self.invert_pan:
-                    pan_step = -pan_step
+                    fx = -fx
                 if self.invert_tilt:
-                    tilt_step = -tilt_step
-                self.pan = float(np.clip(self.pan + pan_step, self.s1_min, self.s1_max))
-                self.tilt = float(np.clip(self.tilt + tilt_step, self.s2_min, self.s2_max))
+                    fy = -fy
+                # Full deflection at the deadzone edge == half the span.
+                pan_target = self.pan_center + fx * (self.pan_span * 0.5)
+                tilt_target = self.tilt_center + fy * (self.tilt_span * 0.5)
+                pan_target = float(np.clip(pan_target, self.s2_min, self.s2_max))
+                tilt_target = float(np.clip(tilt_target, self.s1_min, self.s1_max))
+
+                # Low-pass, so tracker jitter does not vibrate the servo. This
+                # is what turns "correct but twitchy" into "smooth".
+                a = self.servo_smoothing
+                self.pan += a * (pan_target - self.pan)
+                self.tilt += a * (tilt_target - self.tilt)
                 self._publish_servo()
         else:
             dwell = now - self.zone_since
@@ -446,10 +620,12 @@ class GazeHUDNode(Node):
                     twist.angular.z = -self.turn_wz
 
         self.vel_pub.publish(twist)
+        self.zone_pub.publish(String(data=self.confirmed_zone))
 
         # ---- HUD ----
         overlay = frame.copy()
-        cv2.circle(overlay, (cx, cy), deadzone_r, (0, 200, 0), 2)
+        cv2.ellipse(overlay, (cx, cy), (dz_rx, dz_ry), 0, 0, 360,
+                    (0, 200, 0), 2)
         cv2.line(overlay, (cx - 12, cy), (cx + 12, cy), (0, 200, 0), 1)
         cv2.line(overlay, (cx, cy - 12), (cx, cy + 12), (0, 200, 0), 1)
         cv2.line(overlay, (cx, 0), (cx, h), (70, 70, 70), 1)
@@ -483,7 +659,7 @@ class GazeHUDNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
 
         if not self.gaze_valid:
-            cv2.putText(overlay, 'NO GAZE', (cx - 60, cy - deadzone_r - 14),
+            cv2.putText(overlay, 'NO GAZE', (cx - 60, cy - dz_ry - 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
         if now - self._fps_t >= 1.0:
@@ -526,8 +702,9 @@ class GazeHUDNode(Node):
             if key == ord('q'):
                 raise KeyboardInterrupt
             if key == ord('u'):
-                self.pan = float(self.get_parameter('servo_s1_center').value)
-                self.tilt = float(self.get_parameter('servo_s2_center').value)
+                # Same axis swap as everywhere else: s1 is tilt, s2 is pan.
+                self.pan = self.pan_center
+                self.tilt = self.tilt_center
                 self._publish_servo()
 
     def destroy_node(self):
