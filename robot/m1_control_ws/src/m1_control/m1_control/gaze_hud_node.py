@@ -329,6 +329,11 @@ class GazeHUDNode(Node):
         self.create_timer(1.0, self._report_calib)
 
         self._face_mesh = None
+        self._cap = None
+        self._cam_failures = 0
+        self._face_seen_at = 0.0
+        self._no_face_since = 0.0
+        self._warned_no_face = False
         if self.gaze_source == 'mediapipe':
             self._init_mediapipe()
         elif self.gaze_source == 'mouse':
@@ -345,6 +350,49 @@ class GazeHUDNode(Node):
             f'| deadzone={self.deadzone_ratio:.0%} | feed={self.camera_topic}')
 
     # ------------------------------------------------------------------ setup
+    def _find_camera(self):
+        """Open the first /dev/videoN that can actually deliver a frame.
+
+        The index is NOT stable. Unplugging the camera, or the host
+        re-enumerating USB, moves it from /dev/video0 to /dev/video1 and back.
+        A hard-coded index then silently fails to open, the node falls back to
+        mouse gaze, and the operator sees "no face" with nothing anywhere
+        saying why - which looks exactly like a broken tracker.
+
+        A V4L2 camera also exposes several nodes: the capture node and a
+        metadata node that opens fine but never produces a frame. That is why
+        this reads a frame instead of trusting isOpened().
+        """
+        tried = []
+        preferred = int(self.get_parameter('webcam_id').value)
+        # Preferred index first, then the rest.
+        for idx in [preferred] + [i for i in range(10) if i != preferred]:
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                tried.append('%d:no-open' % idx)
+                continue
+            ok, _frame = cap.read()
+            if not ok:
+                cap.release()
+                tried.append('%d:no-frame' % idx)
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self.get_logger().info(
+                'Camera %d opened (%s)'
+                % (idx, 'preferred' if idx == preferred else 'auto-detected'))
+            return cap
+
+        import glob
+        nodes = sorted(glob.glob('/dev/video*'))
+        self.get_logger().error(
+            'No usable camera. Tried indices %s. Devices present: %s. '
+            'Is the webcam connected and passed through to this machine?'
+            % (', '.join(tried) if tried else 'none',
+               ', '.join(nodes) if nodes else 'NONE - /dev/video* does not exist'))
+        return None
+
     def _init_mediapipe(self):
         try:
             import mediapipe as mp
@@ -354,15 +402,19 @@ class GazeHUDNode(Node):
                 refine_landmarks=True,          # needed for iris landmarks
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5)
-            self._cap = cv2.VideoCapture(int(self.get_parameter('webcam_id').value))
-            if not self._cap.isOpened():
-                raise RuntimeError('webcam did not open')
-            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            self._cap = self._find_camera()
+            if self._cap is None:
+                raise RuntimeError('no camera device could deliver a frame')
             self.get_logger().info('MediaPipe iris tracking ready')
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().warn(
-                f'mediapipe/webcam unavailable ({exc}) - falling back to mouse gaze')
+            # Falling back to mouse is the right behaviour - the operator can
+            # still calibrate and drive - but it must be LOUD. A silent
+            # fallback looks identical to a broken tracker, and the operator
+            # then spends an hour recalibrating a camera that is not there.
+            self.get_logger().error(
+                f'EYE TRACKING UNAVAILABLE ({exc}). '
+                f'Falling back to MOUSE gaze - this is NOT eye tracking. '
+                f'Fix the camera before calibrating.')
             self._face_mesh = None
             self.gaze_source = 'mouse'
 
@@ -545,13 +597,52 @@ class GazeHUDNode(Node):
         ok, cam = self._cap.read()
         if not ok:
             self.gaze_valid = False
+            self._cam_failures += 1
+            # A camera can be unplugged, or re-enumerated to a different
+            # /dev/videoN, in the middle of a session. Without this the node
+            # reports "face lost" forever and the only fix is a restart -
+            # which is exactly what "cannot see face AGAIN" looks like.
+            if self._cam_failures >= 30:            # ~1 s at 30 Hz
+                self._cam_failures = 0
+                self.get_logger().warn(
+                    'Camera stopped delivering frames - searching again')
+                try:
+                    self._cap.release()
+                except Exception:                   # noqa: BLE001
+                    pass
+                self._cap = self._find_camera()
+                if self._cap is None:
+                    self.get_logger().error(
+                        'Camera is gone. Eye tracking is off until it is '
+                        'reconnected.')
             return
+        self._cam_failures = 0
         cam = cv2.flip(cam, 1)
         rgb = cv2.cvtColor(cam, cv2.COLOR_BGR2RGB)
         res = self._face_mesh.process(rgb)
         if not res.multi_face_landmarks:
             self.gaze_valid = False
+            # Say WHY, once. "Cannot see face" has several causes and the log
+            # is the only place that can tell them apart: a camera aimed at a
+            # wall, a lens cap, the wrong camera, or lighting. Without this the
+            # operator sees a frozen dot and has nothing to go on - which is
+            # exactly the report "why can it not see my face again".
+            if self._face_seen_at == 0.0:
+                if self._no_face_since == 0.0:
+                    self._no_face_since = time.time()
+                elif (time.time() - self._no_face_since > 5.0
+                      and not self._warned_no_face):
+                    self._warned_no_face = True
+                    self.get_logger().warn(
+                        'Camera is delivering frames but NO FACE has been '
+                        'detected. Point the camera at your face. If it is '
+                        'already pointed correctly, check that this is the '
+                        'right camera - another app may be holding the one you '
+                        'expect.')
             return
+        self._face_seen_at = time.time()
+        self._no_face_since = 0.0
+        self._warned_no_face = False
 
         lm = res.multi_face_landmarks[0].landmark
         # MediaPipe FaceMesh iris indices: 468-472 left, 473-477 right.
@@ -1009,9 +1100,12 @@ class GazeHUDNode(Node):
                 self._publish_servo()
 
     def destroy_node(self):
-        if getattr(self, '_cap', None) is not None:
-            self._cap.release()
-        if self.show_window:
+        # getattr throughout: destroy_node runs on failure paths too, including
+        # ones where __init__ did not get far enough to set these.
+        cap = getattr(self, '_cap', None)
+        if cap is not None:
+            cap.release()
+        if getattr(self, 'show_window', False):
             cv2.destroyAllWindows()
         super().destroy_node()
 

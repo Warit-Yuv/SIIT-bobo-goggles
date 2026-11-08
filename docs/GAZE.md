@@ -446,15 +446,47 @@ wrong, because it looks right.
 | Head moves the wrong way | axis inverted | `invert_pan` / `invert_tilt` |
 | A calibration dot disappears | bar overlapping the dot area | Fixed — see `scripts/test_gaze_calib_layout.py` |
 
+### The camera index is not stable
+
+The node searches `/dev/video0`..`9` and opens the first one that can actually
+deliver a frame. A hard-coded index silently fails when the camera
+re-enumerates, which happens on every unplug or host USB reset - and the symptom
+is identical to "the tracker is broken".
+
+A V4L2 camera also exposes several nodes. The metadata node opens fine and never
+produces a frame, so the search reads a frame rather than trusting `isOpened()`.
+
+The log says which index it chose:
+
+```
+Camera 1 opened (auto-detected)
+```
+
+If it finds nothing, it says so as an **ERROR** and lists the devices that do
+exist. And if the camera is open but no face has been seen for 5 seconds, it
+warns - because "no face" has several causes and the log is the only place that
+can tell them apart.
+
 ### Checking the camera is free
 
 ```bash
-sudo fuser -v /dev/video0     # should print nothing
-ls /dev/video0                # must exist
+sudo fuser -v /dev/video1     # should print nothing
+ls /dev/video*                # must exist
 ```
 
 Only one process can open a V4L2 camera at a time. `cheese` and `guvcview` hold
 it until closed, and so does a gaze HUD left running.
+
+**`xdg-desktop-portal` is the one that catches people out.** It hands camera
+access to sandboxed apps and can keep the device open after the app is gone, so
+every index fails with "can't open camera by index" even though the device
+exists. Free it with:
+
+```bash
+systemctl --user restart xdg-desktop-portal
+```
+
+`sudo fuser -v /dev/video1` naming `pipewire` as the holder is the tell.
 
 ---
 
