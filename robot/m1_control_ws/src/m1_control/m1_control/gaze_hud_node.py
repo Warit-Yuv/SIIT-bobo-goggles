@@ -31,6 +31,7 @@ Run on the PC:
     ros2 run m1_control gaze_hud_node --ros-args -p gaze_source:=mouse
 """
 
+import json
 import math
 import os
 import time
@@ -180,6 +181,10 @@ class GazeHUDNode(Node):
         # beats trying to push weights across a topic.
         self.declare_parameter(
             'model_path', os.path.expanduser('~/gaze_calibration.json'))
+        # The four quick profiles fit an offset and a gain rather than a
+        # model, so they are saved separately.
+        self.declare_parameter(
+            'legacy_path', os.path.expanduser('~/gaze_legacy_calib.json'))
 
         gp = self.get_parameter
         self.camera_topic = gp('camera_topic').value
@@ -234,6 +239,12 @@ class GazeHUDNode(Node):
                        float(gp('gaze_offset_y').value),
                        float(gp('gaze_gain_x').value),
                        float(gp('gaze_gain_y').value)]
+        # ...and then immediately replaced by whatever was saved last session.
+        # The four quick profiles (fast/long/super/ultra) only ever lived in
+        # this list, so restarting the HUD silently threw away a calibration
+        # the operator had just spent minutes producing - and the only symptom
+        # was that the gaze went back to being wrong.
+        self._load_legacy_calib()
 
         servo_period = 1.0 / max(1.0, float(gp('servo_rate_limit_hz').value))
         self._last_servo = 0.0
@@ -440,25 +451,77 @@ class GazeHUDNode(Node):
         self.battery = float(msg.data)
 
     def _calib_cb(self, msg: Float32MultiArray):
-        """A new model arrived. Reload it from the shared file.
+        """A calibration arrived. Persist it, then reload the model file.
 
-        The console and this node run on the same machine, so the model travels
-        as a JSON file rather than as a few dozen floats on a topic: it keeps
-        the weights, the standardisation, the ignored-column list and the
-        reported error together, and it survives a restart of either side.
+        Two things travel on this topic and they need different treatment:
+
+          * the four quick profiles send an offset and a gain, which are just
+            four numbers - they are written straight to disk here
+          * the Posture profile sends NEUTRAL and relies on the model file,
+            which the console already wrote; this callback just triggers the
+            reload
+
+        Either way the console and this node run on the same machine, so a
+        file is the shared truth. It keeps the weights, the standardisation,
+        the ignored-column list and the reported error together, and it
+        survives a restart of either side.
         """
+        data = list(msg.data)
+        if len(data) >= 4 and data != [0.5, 0.5, 1.0, 1.0]:
+            # A real offset/gain, not the "use the model" neutral marker.
+            self._calib = [float(x) for x in data[:4]]
+            self._save_legacy_calib()
         self._reload_model(force=True)
 
+    # ------------------------------------------------- legacy calibration
+    def _legacy_path(self):
+        try:
+            return os.path.expanduser(self.get_parameter('legacy_path').value)
+        except Exception:  # noqa: BLE001
+            return os.path.expanduser('~/gaze_legacy_calib.json')
+
+    def _save_legacy_calib(self):
+        """Write the four quick-profile numbers so they outlive this process."""
+        path = self._legacy_path()
+        try:
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump({'offset_x': self._calib[0],
+                           'offset_y': self._calib[1],
+                           'gain_x': self._calib[2],
+                           'gain_y': self._calib[3]}, fh, indent=2)
+            # Replace in one step: a half-written calibration file is worse
+            # than none, because it loads without complaint and steers wrong.
+            os.replace(tmp, path)
+            self.get_logger().info(f'Calibration saved to {path}')
+        except OSError as exc:
+            self.get_logger().warn(f'Could not save calibration: {exc}')
+
+    def _load_legacy_calib(self):
+        """Adopt a saved offset/gain, if there is one."""
+        path = self._legacy_path()
+        try:
+            with open(path, encoding='utf-8') as fh:
+                d = json.load(fh)
+            values = [float(d[k]) for k in
+                      ('offset_x', 'offset_y', 'gain_x', 'gain_y')]
+        except (OSError, KeyError, TypeError, ValueError):
+            return          # no file, or a broken one: keep the parameters
+        self._calib = values
+        self.get_logger().info(
+            'Restored calibration  offset=(%+.3f, %+.3f)  gain=(%.2f, %.2f)'
+            % tuple(values))
+
     def _report_calib(self):
-        m = self._model
-        if m is None or not m.is_ready():
-            self.calib_state_pub.publish(
-                Float32MultiArray(data=[0.5, 0.5, 1.0, 1.0]))
-            return
-        # Keep the old four-number shape for the console's status line, but
-        # derive it from the model's own accuracy rather than inventing values.
-        self.calib_state_pub.publish(Float32MultiArray(
-            data=[0.5, 0.5, 1.0, 1.0]))
+        """Echo the calibration that is actually in force.
+
+        This used to publish a hardcoded [0.5, 0.5, 1.0, 1.0] in both branches,
+        so the console's status line read "offset +0.50 +0.50 gain 1.00, 1.00"
+        no matter what had been calibrated. A status line that cannot report a
+        change is worse than no status line: it looks like confirmation.
+        """
+        self.calib_state_pub.publish(
+            Float32MultiArray(data=[float(x) for x in self._calib]))
 
     def _reload_model(self, force=False):
         """Load the calibration file if it is new or missing."""

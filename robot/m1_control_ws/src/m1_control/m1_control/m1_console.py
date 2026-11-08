@@ -89,6 +89,21 @@ except ImportError:  # run as a plain script rather than through ros2 run
 MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
 MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 
+#: Keyboard drive keys -> (Twist group, axis, value). m/s and rad/s.
+#:
+#: These are the values the console ASKS for. The arbiter caps them at
+#: `max_linear_x` / `max_linear_y` / `max_angular_z` in m1_params.yaml, and it
+#: runs on the robot, so raising a number here without raising the cap there
+#: changes nothing at all - the command is silently clamped on arrival.
+DRIVE_KEYS = {
+    'w': ('linear', 'x', 0.32),
+    's': ('linear', 'x', -0.32),
+    'q': ('linear', 'y', 0.20),
+    'e': ('linear', 'y', -0.20),
+    'a': ('angular', 'z', 0.60),
+    'd': ('angular', 'z', -0.60),
+}
+
 # Expected DDS environment. A mismatch does not raise an error - it silently
 # never discovers the robot, which is far more confusing than a hard failure.
 EXPECTED_DOMAIN = '30'
@@ -3754,17 +3769,9 @@ def main(args=None):
                 self.showMaximized()
                 return
 
-            mapping = {
-                'w': ('linear', 'x', 0.20), 's': ('linear', 'x', -0.20),
-                'q': ('linear', 'y', 0.20), 'e': ('linear', 'y', -0.20),
-                'a': ('angular', 'z', 0.60), 'd': ('angular', 'z', -0.60),
-            }
-            if text in mapping:
-                group, axis, value = mapping[text]
-                setattr(getattr(node.teleop, group), axis, value)
+            if text in DRIVE_KEYS:
                 self.held.add(text)
-                self.pad.set_held(self.held)
-                self.lbl_drive.setText(f'driving: {text.upper()}')
+                self._apply_drive()
                 return
 
             step = node.servo_step
@@ -3778,15 +3785,44 @@ def main(args=None):
                 return
             super().keyPressEvent(event)
 
+        def _apply_drive(self):
+            """Rebuild the velocity command from the keys that are DOWN.
+
+            The twist is RECOMPUTED from the held set, not patched per key.
+
+            Zeroing the whole twist on any release was the bug. Press W, press
+            A, release A: the release wiped the forward velocity that W had
+            set - and because W was still physically down it produced no new
+            press event, so the robot stayed stopped until the operator lifted
+            and re-pressed W. That is the jerking.
+
+            Recomputing also keeps the behaviour that was already right: with
+            W and A both down the command carries forward AND turn, and
+            releasing either one leaves the other intact.
+            """
+            twist = Twist()
+            for key in self.held:
+                spec = DRIVE_KEYS.get(key)
+                if spec is None:
+                    continue
+                group, axis, value = spec
+                setattr(getattr(twist, group), axis, value)
+            node.teleop = twist
+            self.pad.set_held(self.held)
+            if self.held:
+                self.lbl_drive.setText(
+                    'driving: '
+                    + ' '.join(sorted(k.upper() for k in self.held)))
+            else:
+                self.lbl_drive.setText('idle')
+
         def keyReleaseEvent(self, event):
             if event.isAutoRepeat():
                 return
             text = event.text().lower()
-            if text in {'w', 's', 'q', 'e', 'a', 'd'}:
-                node.teleop = Twist()
+            if text in DRIVE_KEYS:
                 self.held.discard(text)
-                self.pad.set_held(self.held)
-                self.lbl_drive.setText('idle' if not self.held else 'driving')
+                self._apply_drive()
                 return
             super().keyReleaseEvent(event)
 
