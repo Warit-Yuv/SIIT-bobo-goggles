@@ -42,6 +42,7 @@ to begin — no prior ROS 2 knowledge assumed.
 | Set up the operator PC | [`operator-pc/SETUP.md`](operator-pc/SETUP.md) |
 | Understand what was built and why | [`robot/docs/report.md`](robot/docs/report.md) |
 | **Map a space, then localise** | [`docs/MAPPING.md`](docs/MAPPING.md) |
+| **Set up gaze / eye control** | [`docs/GAZE.md`](docs/GAZE.md) |
 | **Start / stop / close properly** | [`docs/START_STOP.md`](docs/START_STOP.md) |
 | **Connect a webcam or mic to the VM** | [`docs/DEVICE_PASSTHROUGH.md`](docs/DEVICE_PASSTHROUGH.md) |
 

@@ -572,7 +572,7 @@ def make_gaze_map(QtCore, QtGui, QtWidgets):
             self.corrected = None
             self.valid = False
             self.stale = True
-            self.setMinimumSize(170, 170)
+            self.setMinimumSize(140, 140)
             # Let it grow: on a maximised window there is space, and a 170px
             # gaze plot in a 400px panel looks unfinished.
             self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
@@ -703,7 +703,7 @@ def make_map_view(QtCore, QtGui, QtWidgets):
             self.map_age = 99.0
             self._img = None          # cached occupancy QImage
             self._img_src = None      # identity of the map tuple it came from
-            self.setMinimumHeight(168)
+            self.setMinimumHeight(150)
             self.setToolTip('SLAM map — occupancy grid, live laser, robot pose')
 
         def update_view(self, map_tuple, scan_tuple, pose, scan_age, map_age):
@@ -1221,6 +1221,11 @@ def main(args=None):
             self.view_timer.start(3000)
             self._poll_view()
 
+            self.gaze_timer = QtCore.QTimer(self)
+            self.gaze_timer.timeout.connect(self._poll_gaze)
+            self.gaze_timer.start(4000)
+            self._poll_gaze()
+
         # ------------------------------------------------------------- layout
         def _build_header(self):
             w = QtWidgets.QWidget()
@@ -1517,6 +1522,29 @@ def main(args=None):
             gv.addWidget(self.lbl_zone)
 
             row = QtWidgets.QHBoxLayout()
+            row.setSpacing(4)
+            self.cmb_gaze_src = QtWidgets.QComboBox()
+            self.cmb_gaze_src.addItems(['Mediapipe', 'Mouse', 'External'])
+            self.cmb_gaze_src.setToolTip(
+                'Mediapipe  iris tracking from the local webcam (real eye tracking)\n'
+                'Mouse      click the HUD window to aim (no dependencies)\n'
+                'External   wait for /gaze/point from another program')
+            self.cmb_gaze_src.setFixedWidth(96)
+            row.addWidget(self.cmb_gaze_src)
+            self.btn_gaze = QtWidgets.QPushButton('Start gaze')
+            self.btn_gaze.setObjectName('primary')
+            self.btn_gaze.setToolTip(
+                'Start the gaze HUD on this machine. Opens a window showing the\n'
+                'robot camera with your gaze point overlaid.')
+            self.btn_gaze.clicked.connect(self._toggle_gaze)
+            row.addWidget(self.btn_gaze, 1)
+            self.btn_gaze_stop = QtWidgets.QPushButton('Stop')
+            self.btn_gaze_stop.setEnabled(False)
+            self.btn_gaze_stop.clicked.connect(self._stop_gaze)
+            row.addWidget(self.btn_gaze_stop)
+            gv.addLayout(row)
+
+            row = QtWidgets.QHBoxLayout()
             self.btn_calib = QtWidgets.QPushButton('Calibrate…')
             self.btn_calib.setObjectName('primary')
             self.btn_calib.clicked.connect(self._calibrate)
@@ -1792,6 +1820,55 @@ def main(args=None):
                     pass
             self.logline('audio relay stopped')
 
+        # --------------------------------------------------------------- gaze
+        def _gaze_pids(self):
+            try:
+                r = subprocess.run(['pgrep', '-f', 'gaze_hud_node'],
+                                   capture_output=True, text=True, timeout=3)
+                return [int(p) for p in r.stdout.split()]
+            except Exception:  # noqa: BLE001
+                return []
+
+        def _toggle_gaze(self):
+            if self._gaze_pids():
+                self.logline('gaze already running')
+                return
+            wrapper = os.path.expanduser('~/m1_gaze.sh')
+            if not os.path.exists(wrapper):
+                self.logline(f'missing {wrapper} - see docs/GAZE.md')
+                return
+            try:
+                subprocess.Popen(
+                    ['bash', wrapper, self.cmb_gaze_src.currentText().lower()],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True)
+                self.logline(
+                    f'gaze started ({self.cmb_gaze_src.currentText()}) - '
+                    f'the HUD window shows the robot camera with your gaze point')
+                QtCore.QTimer.singleShot(8000, self._poll_gaze)
+            except Exception as exc:  # noqa: BLE001
+                self.logline(f'gaze failed to start: {exc}')
+
+        def _stop_gaze(self):
+            pids = self._gaze_pids()
+            if not pids:
+                self.logline('gaze not running')
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, 15)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.logline('gaze stopped')
+            QtCore.QTimer.singleShot(1500, self._poll_gaze)
+
+        def _poll_gaze(self):
+            running = bool(self._gaze_pids())
+            self.btn_gaze.setEnabled(not running)
+            self.btn_gaze_stop.setEnabled(running)
+            self.btn_gaze.setText('Gaze running' if running else 'Start gaze')
+
+        # ---------------------------------------------------------- calibration
         def _calibrate(self):
             dlg = CalibDialogCls(node, self)
             if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_calib:

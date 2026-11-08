@@ -431,8 +431,18 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception:  # noqa: BLE001
+        # ExternalShutdownException and RCLError both arrive here when the
+        # process is killed with SIGTERM (timeout, Ctrl+C in a wrapper script,
+        # systemd). Printing a traceback for that is noise: nothing is wrong,
+        # the context was simply shut down underneath us. The console has the
+        # same guard for the same reason.
+        pass
     finally:
-        node.vel_pub.publish(Twist())
+        try:
+            node.vel_pub.publish(Twist())
+        except Exception:  # noqa: BLE001 - context may already be gone
+            pass
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
