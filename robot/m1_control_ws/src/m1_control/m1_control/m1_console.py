@@ -101,11 +101,17 @@ MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 #: happens the operator is left with no way to say "go", "switch what gaze
 #: steers", or "play a sound" - so the same three actions get a key each.
 #:
-#: The letters are chosen to be mnemonic in the same way as the pad labels:
-#:   B  BLINK   -> go / stop
-#:   N  jaw     -> switch what gaze steers  (N is for "next", the nearest free
-#:                key - J and K are already tilt, L is pan, M is music)
-#:   M  MUSIC   -> play a sound
+#: The letters follow the GESTURE, not the action:
+#:   B  BLINK   (currently: switch what gaze steers)
+#:   N  jaw     (currently: go / stop)   N is the nearest free key to the
+#:                                      others - J/K are tilt, L is pan, M brow
+#:   M  MUSIC   (currently: play a sound)
+#:
+#: Bound to the gesture on purpose. The gesture-to-action mapping is a
+#: preference that has already changed once after the operator used it; when it
+#: changes again, B still means "the blink" and the pad still shows what that
+#: does today. Binding the keys to ACTIONS instead would silently re-label them
+#: every time the mapping moved.
 #:
 #: They are not the pad's own letters on purpose: BLINK/JAW/BROW would collide
 #: with nothing, but B/N/M is what the operator's hands already expect from the
@@ -1180,8 +1186,10 @@ def make_gesture_pad(QtCore, QtGui, QtWidgets):
     #: name from the enclosing function - `ROWS = ROWS` inside the class raises
     #: NameError, since the assignment makes ROWS local to the class scope.
     _GESTURE_ROWS = [
-        ('DOUBLE_BLINK', 'BLINK', 'go / stop'),
-        ('JAW_CLENCH', 'JAW', 'steer robot <-> camera'),
+        # Jaw clench first: it is the easiest to perform, so it owns the
+        # control the operator reaches for most often.
+        ('JAW_CLENCH', 'JAW', 'go / stop'),
+        ('DOUBLE_BLINK', 'BLINK', 'steer robot <-> camera'),
         ('EYEBROW_RAISE', 'BROW', 'play a sound'),
     ]
 
@@ -1190,10 +1198,21 @@ def make_gesture_pad(QtCore, QtGui, QtWidgets):
         #: can check the mapping the operator is being shown.
         ROWS = _GESTURE_ROWS
 
+        #: Emitted with the gesture name when a row is clicked.
+        clicked = QtCore.pyqtSignal(str)
+
         def __init__(self, parent=None):
             super().__init__(parent)
             self.lit = None            # gesture name, or None
             self.lit_at = 0.0
+            # Clickable. The same three actions are already on B/N/M, but a
+            # pad that looks like buttons and does nothing when clicked is
+            # worse than plain text: it invites a click and then ignores it.
+            self.setCursor(QtCore.Qt.PointingHandCursor)
+            self.setToolTip(
+                'Click a row to trigger that gesture.\n'
+                'Keyboard: B = blink, N = jaw, M = brow.')
+            self._rects = {}
             #: How long a key stays lit. Long enough to catch the eye while
             #: looking at the robot, short enough to be clearly "just now".
             self.HOLD_SEC = 1.6
@@ -1204,6 +1223,19 @@ def make_gesture_pad(QtCore, QtGui, QtWidgets):
             self.lit = (gesture or '').strip().upper() or None
             self.lit_at = at
             self.update()
+
+        def _row_at(self, pos):
+            """Which gesture the pointer is over, or None."""
+            for gesture, rect in self._rects.items():
+                if rect.contains(QtCore.QPointF(pos)):
+                    return gesture
+            return None
+
+        def mousePressEvent(self, event):
+            gesture = self._row_at(event.pos())
+            if gesture is not None:
+                self.clicked.emit(gesture)
+            super().mousePressEvent(event)
 
         def _lit_now(self):
             if not self.lit:
@@ -1230,10 +1262,15 @@ def make_gesture_pad(QtCore, QtGui, QtWidgets):
 
             lit = self._lit_now()
 
+            self._rects = {}
             for i, (gesture, key_label, action) in \
                     enumerate(_GESTURE_ROWS):
                 y = y0 + i * (row_h + gap)
                 on = (gesture == lit)
+                # Remember the whole row so the hit area is the row, not the
+                # small key box - a 46 px target is fiddly for anyone.
+                self._rects[gesture] = QtCore.QRectF(
+                    2, y, self.width() - 4, row_h)
 
                 # The key box, in the same colours as the WASD pad.
                 rect = QtCore.QRectF(4, y, key_w, row_h)
@@ -2895,6 +2932,7 @@ def main(args=None):
             # cannot: a gesture that toggles to the value it already had
             # changes no state at all.
             self.pad_gesture = GesturePad()
+            self.pad_gesture.clicked.connect(self._eeg_key)
             gm.addWidget(self.pad_gesture, 3, 0, 1, 2)
 
             # State, in one line. Always true, rarely changes - the opposite of
@@ -2902,8 +2940,8 @@ def main(args=None):
             self.lbl_eeg = QtWidgets.QLabel('EEG  no link')
             self.lbl_eeg.setObjectName('dim')
             self.lbl_eeg.setToolTip(
-                'BLINK = go / stop (most reliable)\n'
-                'JAW = steer robot <-> steer camera\n'
+                'JAW = go / stop (easiest to perform)\n'
+                'BLINK = steer robot <-> steer camera\n'
                 'BROW = play a sound\n\n'
                 'Nothing moves until run is ON and mode is robot.')
             gm.addWidget(self.lbl_eeg, 4, 0, 1, 2)
@@ -3484,6 +3522,30 @@ def main(args=None):
             # the operator what the new deadzone actually looks like.
             self._last_jpeg = None
 
+        #: Modes in which the ARBITER forwards gaze to the wheels. Anything
+        #: else ignores /cmd_vel/gaze entirely, which is the single most
+        #: confusing thing about this system: the gaze HUD happily reports a
+        #: zone and the robot does nothing, with no error anywhere.
+        GAZE_MODES = (2, 3, 4)
+
+        def _warn_if_gaze_cannot_drive(self):
+            """Say so when gaze is running but the mode throws it away.
+
+            There are two independent gates between your eyes and the wheels:
+            the MODE (the arbiter only forwards gaze in 2/3/4) and the RUN flag
+            (the gaze node only drives when run is on). Both default to off, so
+            a fresh session looks completely dead - and the gaze HUD still
+            draws a zone, which reads as "gaze works, the robot is broken".
+            """
+            mode = node.snapshot().get('mode')
+            if mode in self.GAZE_MODES:
+                return
+            self.logline(
+                f'NOTE: mode is {MODE_NAMES.get(mode, "?")} - the robot '
+                f'IGNORES gaze in that mode.')
+            self.logline(
+                '      Pick "2 Gaze" or "4 Gaze + EEG" for gaze to drive.')
+
         def _choose_mode(self, mode):
             node.set_mode(mode)
             # Gaze modes: show the overlay without being asked. The whole point
@@ -3491,6 +3553,8 @@ def main(args=None):
             # looking, and that is unreadable unless it is drawn.
             if mode in (2, 4) and not self.btn_overlay.isChecked():
                 self.btn_overlay.setChecked(True)
+            if mode not in self.GAZE_MODES:
+                self._warn_if_gaze_cannot_drive()
 
         def _toggle_audio(self):
             """Enable audio and start/stop the operator-side relay.
@@ -3653,6 +3717,7 @@ def main(args=None):
                     args,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     start_new_session=True)
+                self._warn_if_gaze_cannot_drive()
                 self.logline(
                     f'gaze started ({self.cmb_gaze_src.currentText()}) - '
                     f'the HUD window shows the robot camera with your gaze point')
@@ -4096,12 +4161,12 @@ def main(args=None):
                 self._style(self.lbl_eeg, 'bad')
                 return
             if not run:
-                self.lbl_eeg.setText('EEG  linked - double blink to START')
+                self.lbl_eeg.setText('EEG  linked - jaw clench to START')
                 self._style(self.lbl_eeg, 'warn')
                 return
             if emode == 'camera':
                 self.lbl_eeg.setText(
-                    'EEG  RUN - steering CAMERA (jaw clench for robot)')
+                    'EEG  RUN - steering CAMERA (double blink for robot)')
                 self._style(self.lbl_eeg, 'warn')
                 return
             self.lbl_eeg.setText('EEG  RUN - steering ROBOT')

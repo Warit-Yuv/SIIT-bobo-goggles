@@ -123,7 +123,59 @@ class AudioBridgeCore:
 
     # ------------------------------------------------------------- controls
     def set_enabled(self, on):
-        self.enabled = bool(on)
+        """Turn the link on or off, and RELEASE THE DEVICE when off.
+
+        The subprocesses used to be spawned once at startup and left running
+        for the life of the process, with `enabled` only gating whether packets
+        were forwarded. So a bridge with audio switched OFF still held
+        /dev/snd card 2 open through a continuously-running aplay - and nothing
+        else on the machine could play a sound at all.
+
+        That is what made the EEG eyebrow-raise sound effect silent: the sound
+        player had no device to open, and its only diagnostic was "audio open
+        failed", which points at the sound player rather than at the bridge
+        squatting on the hardware.
+
+        A disabled subsystem must not own the hardware.
+        """
+        on = bool(on)
+        if on == self.enabled:
+            return
+        self.enabled = on
+        if on:
+            self._acquire_device()
+        else:
+            self._release_device()
+
+    def _acquire_device(self):
+        """Start arecord/aplay if they are not already running."""
+        if self.device_in and self._tx_proc is None:
+            self._tx_proc = self._spawn(self._arecord_cmd(), 'capture')
+            with self.lock:
+                self.capture_ok = self._tx_proc is not None
+        if self.device_out and self._rx_proc is None:
+            self._rx_proc = self._spawn(self._aplay_cmd(), 'playback')
+            with self.lock:
+                self.playback_ok = self._rx_proc is not None
+
+    def _release_device(self):
+        """Stop arecord/aplay so another process can use the card."""
+        for name in ('_tx_proc', '_rx_proc'):
+            proc = getattr(self, name)
+            if proc is None:
+                continue
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:                                # noqa: BLE001
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+            setattr(self, name, None)
+        with self.lock:
+            self.capture_ok = False
+            self.playback_ok = False
 
     def set_mic(self, on):
         self.mic_enabled = bool(on)
@@ -173,14 +225,11 @@ class AudioBridgeCore:
                 '-c', str(CHANNELS), '-t', 'raw']
 
     def start(self):
-        if self.device_in:
-            self._tx_proc = self._spawn(self._arecord_cmd(), 'capture')
-            with self.lock:
-                self.capture_ok = self._tx_proc is not None
-        if self.device_out:
-            self._rx_proc = self._spawn(self._aplay_cmd(), 'playback')
-            with self.lock:
-                self.playback_ok = self._rx_proc is not None
+        # Only take the sound card if audio is actually enabled. Grabbing it at
+        # startup for a feature that is switched off is how the speaker ended up
+        # permanently busy.
+        if self.enabled:
+            self._acquire_device()
 
         threading.Thread(target=self._tx_loop, daemon=True).start()
         threading.Thread(target=self._rx_loop, daemon=True).start()

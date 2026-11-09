@@ -64,6 +64,14 @@ class SoundPlayerNode(Node):
         # silent with no error anywhere.
         self.declare_parameter('player', 'ffplay')
         self.declare_parameter('volume', 80)        # ffplay uses 0..100
+        # ALSA device. Empty means "let the player choose", which is usually
+        # right on a desktop and usually WRONG in the robot container: the
+        # audio bridge may hold card 2, and SDL then reports only
+        # "audio open failed", which reads as a bug in this node.
+        #
+        # "default" is tried first because it honours /etc/asound.conf, which
+        # on this image maps to the C-Media USB speaker.
+        self.declare_parameter('device', 'default')
         self.declare_parameter('topic', '/eeg/music')
         self.declare_parameter('enabled', True)
 
@@ -71,11 +79,13 @@ class SoundPlayerNode(Node):
             str(self.get_parameter('sound_dir').value))
         self.player = str(self.get_parameter('player').value)
         self.volume = int(self.get_parameter('volume').value)
+        self.device = str(self.get_parameter('device').value)
         self.enabled = bool(self.get_parameter('enabled').value)
 
         self._proc = None
         self._last_state = None
         self._played = 0
+        self._last_error = ''
 
         if shutil.which(self.player) is None:
             self.get_logger().error(
@@ -179,9 +189,22 @@ class SoundPlayerNode(Node):
         self._kill()
         cmd = [self.player, '-nodisp', '-autoexit', '-loglevel', 'error',
                '-volume', str(self.volume), path]
+
+        # ffplay gets its output device from SDL, not from a command-line flag:
+        # this build has no -audio_device option at all (it answers "Option not
+        # found" and exits 1), so the device has to be selected through the
+        # environment.
+        #
+        # Without this, SDL picks a device itself and fails with
+        # "No more combinations to try, audio open failed" - which names no
+        # device and points at nothing.
+        env = dict(os.environ)
+        if self.device and os.path.basename(self.player).startswith('ffplay'):
+            env['SDL_AUDIODRIVER'] = 'alsa'
+            env['AUDIODEV'] = self.device
         try:
             self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL,
+                cmd, stdin=subprocess.DEVNULL, env=env,
                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             self._played += 1
             self.get_logger().info(
@@ -216,10 +239,19 @@ class SoundPlayerNode(Node):
                 err = proc.stderr.read() or b''
             except Exception:                                # noqa: BLE001
                 pass
+            text = err.decode(errors='replace').strip()
+            self._last_error = text
             self.get_logger().warn(
                 f'{self.player} exited with {code}'
-                + (f': {err.decode(errors="replace").strip()[:200]}'
-                   if err else ''))
+                + (f': {text[:200]}' if text else ''))
+            if 'busy' in text.lower() or 'open' in text.lower():
+                # Name the usual cause. "audio open failed" on this robot is
+                # almost always another process holding the card, and the
+                # operator cannot fix what they cannot see.
+                self.get_logger().warn(
+                    'The sound card is in use by another process. The audio '
+                    'bridge holds it whenever "Enable audio" is ON. Turn that '
+                    'off, or expect the sound effect to be silent.')
 
     def destroy_node(self):
         self._kill()

@@ -18,8 +18,8 @@ continuous signal, and every missed or late packet is a wrong movement.
 
 Protocol v1 replaced it with three TOGGLES and a state block:
 
-    DOUBLE_BLINK   -> TOGGLE_RUN    run:  false <-> true
-    JAW_CLENCH     -> TOGGLE_MODE   mode: "robot" <-> "camera"
+    JAW_CLENCH     -> TOGGLE_RUN    run:  false <-> true
+    DOUBLE_BLINK   -> TOGGLE_MODE   mode: "robot" <-> "camera"
     EYEBROW_RAISE  -> TOGGLE_MUSIC  music: false <-> true  (sound effect)
 
 Every message - event or heartbeat - carries the FULL state after it. So this
@@ -82,23 +82,27 @@ MODE_CAMERA = 'camera'
 #: Gesture -> command, so an event carrying only a gesture still works. The
 #: sender always includes `command`, but a hand-typed test packet may not.
 #:
-#: Ordered by how reliably the classifier separates them, which was measured on
-#: this headset rather than assumed:
+#: Assigned by how easily the operator can PERFORM each gesture, which is the
+#: property that matters when they have to do it many times per session:
 #:
-#:   DOUBLE_BLINK   the most consistent of the three by a clear margin, so it
-#:                  gets the job the operator needs most often - go / stop
-#:   JAW_CLENCH     consistent, but occasionally confused with an eyebrow raise
-#:                  (the classifier reports UNCLEAR_MUSCLE), so it gets a job
-#:                  where a misfire is visible and harmless - switching what
+#:   JAW_CLENCH     the easiest to produce deliberately and the least tiring,
+#:                  so it gets the job used most often - go / stop
+#:   DOUBLE_BLINK   reliable, but takes more effort and is more tiring to
+#:                  repeat, so it gets the less frequent job - switching what
 #:                  gaze steers
-#:   EYEBROW_RAISE  the least reliable, so it gets the only job where being
-#:                  wrong costs nothing at all: a sound effect
+#:   EYEBROW_RAISE  the least reliable of the three (the classifier reports
+#:                  UNCLEAR_MUSCLE when it cannot separate it from a clench),
+#:                  so it gets the only job where being wrong costs nothing at
+#:                  all: a sound effect
 #:
-#: Putting the least reliable gesture on the run toggle is what made the robot
-#: lurch; putting the most reliable one there is the whole point of this table.
+#: This ordering came from the operator actually using it. An earlier version
+#: put the blink on the run toggle on the assumption that it was the most
+#: CONSISTENT gesture; in practice the clench is the easier one to perform, and
+#: frequency of use matters more than raw accuracy for a toggle that has to be
+#: hit several times a minute.
 GESTURE_COMMANDS = {
-    'DOUBLE_BLINK': TOGGLE_RUN,
-    'JAW_CLENCH': TOGGLE_MODE,
+    'JAW_CLENCH': TOGGLE_RUN,
+    'DOUBLE_BLINK': TOGGLE_MODE,
     'EYEBROW_RAISE': TOGGLE_MUSIC,
 }
 
@@ -135,6 +139,28 @@ class EEGCore:
         #: invisible - which is exactly the case where the operator most wants
         #: to know whether the headset saw them.
         self.gesture_seq = 0
+        #: Until when a keyboard gesture outranks the sender's state.
+        #:
+        #: Protocol v1 makes the SENDER authoritative: every packet repeats the
+        #: full state so a lost datagram heals itself. That is right for the
+        #: headset and wrong for a keyboard press, because the sender knows
+        #: nothing about it - so the very next heartbeat, 100 ms later, puts
+        #: the state straight back and the keypress appears to do nothing.
+        #:
+        #: Measured: a keyboard blink set mode=camera and the sender's next
+        #: packet reverted it to robot 0.2 s later, which looks exactly like
+        #: the key being broken.
+        #:
+        #: So a keyboard gesture wins for `kb_override_sec`, then the sender
+        #: takes over again. A temporary override rather than a permanent one:
+        #: the headset is the primary input and must not be locked out by a
+        #: stray keypress nobody remembers making.
+        self._kb_until = 0.0
+        self.kb_override_sec = 5.0
+        #: How many state packets a keyboard override suppressed, so the
+        #: bridge can say so once instead of silently ignoring input.
+        self.kb_suppressed = 0
+
         #: False until the first state block has been adopted. The very first
         #: packet always differs from the bridge's starting defaults, and
         #: counting that as a gesture would make the GUI announce a blink
@@ -221,6 +247,15 @@ class EEGCore:
                     self._apply_toggle(command, now)
 
             state = msg.get('state')
+            if isinstance(state, dict) and now < self._kb_until:
+                # A keyboard gesture is still in force. Take the link and any
+                # gesture the packet carries, but let the keyboard's state
+                # stand until the window closes - otherwise the sender's own
+                # heartbeat undoes the keypress within one period.
+                self.kb_suppressed += 1
+                self._state_seen = True
+                return note
+
             if isinstance(state, dict):
                 if 'run' in state:
                     new_run = bool(state['run'])
@@ -246,10 +281,10 @@ class EEGCore:
                 after = (self.run, self.mode, self.music)
                 if after != prev:
                     if after[0] != prev[0]:
-                        self.last_gesture = 'DOUBLE_BLINK'
+                        self.last_gesture = 'JAW_CLENCH'
                         self.last_command = TOGGLE_RUN
                     elif after[1] != prev[1]:
-                        self.last_gesture = 'JAW_CLENCH'
+                        self.last_gesture = 'DOUBLE_BLINK'
                         self.last_command = TOGGLE_MODE
                     else:
                         self.last_gesture = 'EYEBROW_RAISE'
@@ -288,6 +323,8 @@ class EEGCore:
             self.last_command = command
             self.gesture_seq += 1
             self._apply_toggle(command, now)
+            self._kb_until = now + self.kb_override_sec
+            self.kb_suppressed = 0
             return '%s -> %s (keyboard)' % (gesture, command)
 
     def _apply_toggle(self, command, now):
@@ -432,7 +469,7 @@ def run_ros(args, core):
             self.get_logger().info(
                 f'EEG bridge (protocol v{PROTOCOL_VERSION}) | UDP :{args.port} | '
                 f'link timeout {core.link_timeout}s | '
-                f'blink=TOGGLE_RUN  jaw=TOGGLE_MODE  brow=TOGGLE_MUSIC')
+                f'jaw=TOGGLE_RUN  blink=TOGGLE_MODE  brow=TOGGLE_MUSIC')
 
         def _simulate_cb(self, msg):
             note = core.inject_gesture(msg.data, time.monotonic())

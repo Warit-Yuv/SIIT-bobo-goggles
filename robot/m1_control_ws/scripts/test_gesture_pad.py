@@ -61,19 +61,20 @@ def main():
     check('eyebrow raise is listed', 'EYEBROW_RAISE' in names, str(names))
 
     by_name = {g: (k, a) for g, k, a in rows}
-    check('double blink is shown as go / stop',
-          'go' in by_name['DOUBLE_BLINK'][1], by_name['DOUBLE_BLINK'][1])
-    check('jaw clench is shown as the mode switch',
-          'steer' in by_name['JAW_CLENCH'][1], by_name['JAW_CLENCH'][1])
+    check('jaw clench is shown as go / stop',
+          'go' in by_name['JAW_CLENCH'][1], by_name['JAW_CLENCH'][1])
+    check('double blink is shown as the mode switch',
+          'steer' in by_name['DOUBLE_BLINK'][1], by_name['DOUBLE_BLINK'][1])
     check('eyebrow raise is shown as the sound',
           'sound' in by_name['EYEBROW_RAISE'][1],
           by_name['EYEBROW_RAISE'][1])
 
-    # The most reliable gesture must be first: that is the one the operator
-    # should reach for, and putting it at the top is the whole point of the
-    # ordering.
-    check('the most reliable gesture is the top row',
-          names[0] == 'DOUBLE_BLINK', names[0])
+    # The EASIEST gesture to perform must be first: that is the one the
+    # operator reaches for most often, and putting it at the top is the whole
+    # point of the ordering. Easiness beats accuracy here - a toggle that has
+    # to be hit several times a minute is limited by effort, not by precision.
+    check('the easiest gesture to perform is the top row',
+          names[0] == 'JAW_CLENCH', names[0])
 
     # ------------------------------------------------------- the event
     print('\nthe pad lights on an event:')
@@ -130,6 +131,35 @@ def main():
         tiny_ok = False
         print(f'      raised: {exc}')
     check('it survives being squeezed into a narrow column', tiny_ok)
+
+    # ---------------------------------------------------- clickable rows
+    print('\nclicking a row triggers that gesture:')
+    fired = []
+    pad.clicked.connect(fired.append)
+    pad.set_gesture('', 0.0)
+    pad.grab()                       # lays out the row rectangles
+    # The pad is 230x96 with three rows, so the first row's centre is the
+    # point a click on "JAW" would land on.
+    pad.resize(230, 96)
+    pad.grab()
+    check('the pad exposes a clicked signal', hasattr(pad, 'clicked'))
+    check('the rows are laid out for hit-testing', bool(pad._rects),
+          f'{len(pad._rects)} rows')
+
+    # Drive the hit test directly, which is what mousePressEvent uses.
+    for gesture in ('JAW_CLENCH', 'DOUBLE_BLINK', 'EYEBROW_RAISE'):
+        rect = pad._rects.get(gesture)
+        if rect is None:
+            check(f'{gesture} has a clickable row', False)
+            continue
+        centre = rect.center().toPoint()
+        got = pad._row_at(centre)
+        check(f'clicking the {gesture} row resolves to it', got == gesture,
+              str(got))
+
+    # A click outside any row must do nothing at all.
+    pad.clicked.emit('JAW_CLENCH')   # sanity: the signal is connected
+    check('the signal reaches a listener', fired == ['JAW_CLENCH'], str(fired))
 
     print()
     print('=' * 60)

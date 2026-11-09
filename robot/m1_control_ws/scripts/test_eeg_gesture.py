@@ -46,12 +46,14 @@ def main():
 
     # ------------------------------------------------------- the gesture map
     print('gesture mapping, ordered by measured reliability:')
-    check('double blink is the most reliable, so it is the run toggle',
-          GESTURE_COMMANDS.get('DOUBLE_BLINK') == 'TOGGLE_RUN',
-          str(GESTURE_COMMANDS.get('DOUBLE_BLINK')))
-    check('jaw clench switches what gaze steers',
-          GESTURE_COMMANDS.get('JAW_CLENCH') == 'TOGGLE_MODE',
+    # Assigned by how easily the operator can PERFORM each gesture, which is
+    # the property that matters for a toggle used several times a minute.
+    check('jaw clench is the easiest to perform, so it is the run toggle',
+          GESTURE_COMMANDS.get('JAW_CLENCH') == 'TOGGLE_RUN',
           str(GESTURE_COMMANDS.get('JAW_CLENCH')))
+    check('double blink switches what gaze steers',
+          GESTURE_COMMANDS.get('DOUBLE_BLINK') == 'TOGGLE_MODE',
+          str(GESTURE_COMMANDS.get('DOUBLE_BLINK')))
     check('eyebrow raise gets the only cost-free job',
           GESTURE_COMMANDS.get('EYEBROW_RAISE') == 'TOGGLE_MUSIC',
           str(GESTURE_COMMANDS.get('EYEBROW_RAISE')))
@@ -64,12 +66,12 @@ def main():
     check('the counter starts at zero', c.gesture_seq == 0)
 
     c.on_message({'v': 1, 'seq': 1,
-                  'event': {'gesture': 'DOUBLE_BLINK'}}, now=1.0)
+                  'event': {'gesture': 'JAW_CLENCH'}}, now=1.0)
     check('one gesture is counted', c.gesture_seq == 1, str(c.gesture_seq))
-    check('double blink turns run ON', c.run is True)
+    check('jaw clench turns run ON', c.run is True)
 
     c.on_message({'v': 1, 'seq': 2,
-                  'event': {'gesture': 'DOUBLE_BLINK'}}, now=2.0)
+                  'event': {'gesture': 'JAW_CLENCH'}}, now=2.0)
     check('a second gesture is counted too', c.gesture_seq == 2,
           str(c.gesture_seq))
     check('and it turns run back OFF', c.run is False)
@@ -78,7 +80,7 @@ def main():
     # recognised but changes nothing.
     before = (c.run, c.mode, c.music)
     c.on_message({'v': 1, 'seq': 3,
-                  'event': {'gesture': 'DOUBLE_BLINK'},
+                  'event': {'gesture': 'JAW_CLENCH'},
                   'state': {'run': False}}, now=3.0)
     check('a gesture that changes no state is still counted',
           c.gesture_seq == 3, f'seq={c.gesture_seq}')

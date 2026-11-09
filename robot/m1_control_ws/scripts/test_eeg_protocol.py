@@ -47,14 +47,15 @@ def main():
     print('constants:')
     check('the protocol version is 1', PROTOCOL_VERSION == 1,
           str(PROTOCOL_VERSION))
-    # Ordered by how reliably the classifier separates them: the most
-    # consistent gesture gets the go/stop, the least gets a sound effect.
-    check('double blink is the run toggle (most reliable)',
-          GESTURE_COMMANDS.get('DOUBLE_BLINK') == TOGGLE_RUN,
-          str(GESTURE_COMMANDS.get('DOUBLE_BLINK')))
-    check('jaw clench is the mode toggle',
-          GESTURE_COMMANDS.get('JAW_CLENCH') == TOGGLE_MODE,
+    # Ordered by how easily the operator can PERFORM each gesture: the easiest
+    # gets the go/stop it has to hit most often, the least reliable gets a
+    # sound effect where a misfire costs nothing.
+    check('jaw clench is the run toggle (easiest to perform)',
+          GESTURE_COMMANDS.get('JAW_CLENCH') == TOGGLE_RUN,
           str(GESTURE_COMMANDS.get('JAW_CLENCH')))
+    check('double blink is the mode toggle',
+          GESTURE_COMMANDS.get('DOUBLE_BLINK') == TOGGLE_MODE,
+          str(GESTURE_COMMANDS.get('DOUBLE_BLINK')))
 
     print('\nfollowing the sender state:')
     c = EEGCore(link_timeout=1.5)
@@ -87,20 +88,20 @@ def main():
 
     print('\ngestures toggle:')
     c2 = EEGCore(link_timeout=1.5, start_run=False)
-    c2.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'DOUBLE_BLINK'},
+    c2.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'JAW_CLENCH'},
                    'state': {'run': True}}, now=20.0)
-    check('double blink can turn run ON', c2.run is True)
-    c2.on_message({'v': 1, 'seq': 2, 'event': {'gesture': 'DOUBLE_BLINK'},
+    check('jaw clench can turn run ON', c2.run is True)
+    c2.on_message({'v': 1, 'seq': 2, 'event': {'gesture': 'JAW_CLENCH'},
                    'state': {'run': False}}, now=20.1)
-    check('double blink can turn run OFF again', c2.run is False)
+    check('jaw clench can turn run OFF again', c2.run is False)
 
     # A packet with no state block at all - a hand-typed datagram - must still
     # toggle, otherwise debugging over netcat is impossible.
     c2b = EEGCore(link_timeout=1.5, start_run=False)
-    c2b.on_message({'event': {'gesture': 'DOUBLE_BLINK'}}, now=21.0)
+    c2b.on_message({'event': {'gesture': 'JAW_CLENCH'}}, now=21.0)
     check('a state-less packet still toggles', c2b.run is True)
     check('the gesture is remembered',
-          c2.last_gesture == 'DOUBLE_BLINK', c2.last_gesture)
+          c2.last_gesture == 'JAW_CLENCH', c2.last_gesture)
 
     print('\nthe link watchdog:')
     c3 = EEGCore(link_timeout=1.5, start_run=True)
@@ -144,15 +145,15 @@ def main():
     c6.on_message({'v': 1, 'seq': 2, 'state': {'run': True,
                                                'mode': 'robot',
                                                'music': False}}, now=50.5)
-    check('a run flip is read as a double blink',
-          c6.last_gesture == 'DOUBLE_BLINK', c6.last_gesture)
+    check('a run flip is read as a jaw clench',
+          c6.last_gesture == 'JAW_CLENCH', c6.last_gesture)
     check('and it is counted', c6.gesture_seq == 1, str(c6.gesture_seq))
 
     c6.on_message({'v': 1, 'seq': 3, 'state': {'run': True,
                                                'mode': 'camera',
                                                'music': False}}, now=51.0)
-    check('a mode flip is read as a jaw clench',
-          c6.last_gesture == 'JAW_CLENCH', c6.last_gesture)
+    check('a mode flip is read as a double blink',
+          c6.last_gesture == 'DOUBLE_BLINK', c6.last_gesture)
 
     c6.on_message({'v': 1, 'seq': 4, 'state': {'run': True,
                                                'mode': 'camera',

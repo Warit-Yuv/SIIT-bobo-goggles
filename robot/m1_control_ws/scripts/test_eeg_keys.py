@@ -71,21 +71,23 @@ def main():
         return core.inject_gesture(gesture, at)
 
     c = EEGCore(link_timeout=1.5)
-    note = press(c, 'DOUBLE_BLINK', 1.0)
-    check('a blink is accepted', note is not None, str(note))
+    # N is the jaw, and the jaw owns go/stop.
+    note = press(c, 'JAW_CLENCH', 1.0)
+    check('N (jaw) is accepted', note is not None, str(note))
     check('it turns run ON', c.run is True)
     check('the note says it came from the keyboard',
           note and 'keyboard' in note, str(note))
     check('the gesture is recorded for the GUI',
-          c.status()['last'].startswith('DOUBLE_BLINK'), c.status()['last'])
+          c.status()['last'].startswith('JAW_CLENCH'), c.status()['last'])
 
-    press(c, 'DOUBLE_BLINK', 2.0)
+    press(c, 'JAW_CLENCH', 2.0)
     check('pressing it again turns run OFF', c.run is False)
 
-    press(c, 'JAW_CLENCH', 3.0)
-    check('N switches what gaze steers, from robot to camera',
+    # B is the blink, and the blink owns the mode switch.
+    press(c, 'DOUBLE_BLINK', 3.0)
+    check('B (blink) switches what gaze steers, robot to camera',
           c.mode == MODE_CAMERA, c.mode)
-    press(c, 'JAW_CLENCH', 4.0)
+    press(c, 'DOUBLE_BLINK', 4.0)
     check('and back again', c.mode == MODE_ROBOT, c.mode)
 
     press(c, 'EYEBROW_RAISE', 5.0)
@@ -102,7 +104,7 @@ def main():
     # watchdog force run back off one timeout later, so B would start the robot
     # and then stop it again for no visible reason.
     c2 = EEGCore(link_timeout=1.5)
-    press(c2, 'DOUBLE_BLINK', 10.0)
+    press(c2, 'JAW_CLENCH', 10.0)
     check('run is on after the keypress', c2.run is True)
     c2.tick(now=10.5)
     check('still on after half a timeout', c2.run is True)
@@ -112,12 +114,45 @@ def main():
     check('the link is still reported down', c2.link_ok is False,
           'a keypress must not claim the headset is alive')
 
+    # ------------------------------- the sender must not undo a keypress
+    print('\na connected sender must not undo a keypress:')
+    # Protocol v1 makes the SENDER authoritative - every packet repeats the
+    # full state so a lost datagram heals itself. That is right for the headset
+    # and wrong for a keypress, because the sender knows nothing about it: its
+    # next heartbeat, ~100 ms later, puts the state straight back and the key
+    # appears to do nothing. Measured on the hardware: mode went to camera and
+    # reverted to robot 0.2 s later.
+    c5 = EEGCore(link_timeout=1.5)
+    c5.on_message({'v': 1, 'seq': 1,
+                   'state': {'run': False, 'mode': 'robot', 'music': False}},
+                  now=100.0)
+    c5.inject_gesture('DOUBLE_BLINK', 101.0)
+    check('the keypress sets the mode', c5.mode == MODE_CAMERA, c5.mode)
+
+    for i in range(5):
+        c5.on_message({'v': 1, 'seq': 10 + i,
+                       'state': {'run': False, 'mode': 'robot',
+                                 'music': False}}, now=101.1 + i * 0.1)
+    check('and it survives the sender heartbeats that follow',
+          c5.mode == MODE_CAMERA, c5.mode)
+    check('the suppressed packets are counted, not silently eaten',
+          c5.kb_suppressed == 5, str(c5.kb_suppressed))
+
+    # The override must EXPIRE. A permanent one would let a stray keypress lock
+    # the headset out, and the operator would have no idea why their gestures
+    # stopped working.
+    c5.on_message({'v': 1, 'seq': 30,
+                   'state': {'run': False, 'mode': 'robot', 'music': False}},
+                  now=101.0 + c5.kb_override_sec + 1.0)
+    check('the sender takes over again once the window expires',
+          c5.mode == MODE_ROBOT, c5.mode)
+
     # ---------------------------------------------- a real gesture still works
     print('\nand a real headset gesture still works the same way:')
     c3 = EEGCore(link_timeout=1.5)
-    c3.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'DOUBLE_BLINK'}},
+    c3.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'JAW_CLENCH'}},
                   now=1.0)
-    check('a UDP blink also turns run on', c3.run is True)
+    check('a UDP clench also turns run on', c3.run is True)
     c3.on_message({'v': 1, 'seq': 2, 'state': {'run': True}}, now=1.2)
     check('a UDP packet marks the link up', c3.link_ok is True)
 
