@@ -154,8 +154,8 @@ class GazeControlNode(Node):
         # measurement that produced these numbers.
         self.declare_parameter('servo_s1_min', 5.0)
         self.declare_parameter('servo_s1_max', 75.0)
-        self.declare_parameter('servo_s2_min', 80.0)
-        self.declare_parameter('servo_s2_max', 100.0)
+        self.declare_parameter('servo_s2_min', 70.0)
+        self.declare_parameter('servo_s2_max', 110.0)
 
         self.declare_parameter('invert_pan', False)
         self.declare_parameter('invert_tilt', False)

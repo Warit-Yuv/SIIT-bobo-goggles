@@ -33,7 +33,12 @@ Only `control_arbiter_node` may publish those. Publish to a mode-specific topic:
 |---|---|---|---|
 | Keyboard | `/cmd_vel/keyboard` | `/servo/keyboard` | `1` |
 | Gaze | `/cmd_vel/gaze` | `/servo/gaze` | `2` |
-| EEG | `/cmd_vel/eeg` | — | `3` |
+| EEG | *(none - see below)* | — | `3` |
+
+The EEG has **no velocity topic**. Protocol v1 sends toggles, not speeds, so
+the bridge publishes state on `/eeg/run`, `/eeg/mode` and `/eeg/link`, and
+`gaze_control_node` gates the gaze command on them. Mode `3` alone does not
+make an EEG move the robot; it needs `run: true` from a jaw clench as well.
 
 ### 2. Select your mode before commanding
 

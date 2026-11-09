@@ -92,8 +92,8 @@ class WASDTeleopNode(Node):
         # measurement). Pan 80..100 is a deliberately narrow window: a camera
         # that swings ~90 degrees loses the view straight ahead, which is
         # dangerous while driving forward.
-        self.declare_parameter('servo_s2_min', 80.0)
-        self.declare_parameter('servo_s2_max', 100.0)
+        self.declare_parameter('servo_s2_min', 70.0)
+        self.declare_parameter('servo_s2_max', 110.0)
         self.declare_parameter('hold_time_sec', 0.25)
         self.declare_parameter('publish_rate_hz', 20.0)
 

@@ -38,18 +38,23 @@ Holding a key repeats. Releasing stops within one publish period (50 ms),
 because the teleop loop publishes zero when no key is down; the arbiter's
 350 ms watchdog is a second safety net behind that.
 
-Why the servo range is narrow
------------------------------
+Why the servo range is what it is
+---------------------------------
 Measured on the hardware with the camera as the sensor: pan (s2) moves freely
 and linearly from 0 to about 112 and then stops dead - the STM32 firmware
 clamps it. So a centre of 90 gives 90 units of travel one way and only 20 the
 other, which is exactly the asymmetry an operator notices as "it turns further
 right than left".
 
-The window is deliberately narrowed to 80..100 (+-10). A camera that swings
-90 degrees loses the view straight ahead, and driving forward blind is
-dangerous. The bar in the SERVO panel draws the allowed range, so the limit is
-visible rather than mysterious.
+The window is therefore symmetric about 90: 70..110 (+-20), the widest that
+fits under the firmware's 110 stop. It was 80..100 (+-10) for a while, on the
+theory that a camera swinging further would lose the view straight ahead - but
+in practice +-10 is too little to look to the side, and the operator can see
+where the camera is pointing from the video anyway. Symmetry matters more than
+the narrower cone did.
+
+The bar in the SERVO panel draws the allowed range, so the limit is visible
+rather than mysterious.
 
 Threading model
 ---------------
@@ -210,14 +215,14 @@ class ConsoleNode(Node):
         # Servo geometry. These MUST agree with the arbiter, otherwise the GUI
         # lets the operator ask for travel the robot will silently refuse.
         # Measured on the hardware: pan (s2) moves freely 0..112 then stops
-        # dead (firmware clamp). We use 80..100 (+-10) because a camera that
-        # swings ~90 degrees loses the view straight ahead.
+        # dead (firmware clamp). The window is symmetric about the centre:
+        # 70..110 (+-20), the widest that fits under that 110 stop.
         self.declare_parameter('servo_s1_center', 40.0)
         self.declare_parameter('servo_s2_center', 90.0)
         self.declare_parameter('servo_s1_min', 5.0)
         self.declare_parameter('servo_s1_max', 75.0)
-        self.declare_parameter('servo_s2_min', 80.0)
-        self.declare_parameter('servo_s2_max', 100.0)
+        self.declare_parameter('servo_s2_min', 70.0)
+        self.declare_parameter('servo_s2_max', 110.0)
         self.declare_parameter('servo_step', 4.0)
         # Gaze overlay geometry, as a FRACTION OF THE CONTROL SPACE (a radius,
         # not a diameter). These MUST match the HUD's, or the picture the

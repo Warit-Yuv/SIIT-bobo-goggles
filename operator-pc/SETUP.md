@@ -463,39 +463,61 @@ prompted, or the robot's replies will be blocked.
 
 ### 8.2 On the robot
 
+The bridge starts with the rest of the stack (`./m1.sh start`). It listens on
+**UDP port 9000 on all interfaces**, so nothing else needs configuring:
+
 ```bash
-ros2 run m1_control eeg_udp_bridge      # UDP :9000 -> /cmd_vel/eeg
+ss -ulnp | grep 9000          # UNCONN 0 0 0.0.0.0:9000  <- correct
+ros2 run m1_control eeg_udp_bridge        # only if it is not already up
 ```
 
 ### 8.3 Test without a headset — ✅ verified
 
 ```bash
-python3 scripts/test_eeg_udp.py --ip 127.0.0.1 --sequence
+python3 scripts/eeg_ping.py --host 127.0.0.1 --run on
+python3 scripts/eeg_ping.py --host 127.0.0.1 --run on --watch   # hold link
 ```
 
-Verified: `GO` drives forward at 0.15 m/s; stopping the heartbeat halts the
-robot in **0.88 s**.
+Expected reply:
 
-### 8.4 Gesture → motion
+```
+{"type": "ack", "state": {"run": true, "mode": "robot", "music": false,
+                          "link": true, "msgs": 1, "gaps": 0, "dropped": 0}}
+```
 
-| Gesture | Command | Robot action (M1 mecanum) |
+Verified on the hardware:
+
+| Action | `/eeg/run` | `/eeg/link` |
 |---|---|---|
-| Double blink | `GO` | Drive forward |
-| Jaw clench | `STOP` | Stop immediately (always wins) |
-| Look left | `LEFT` | **Rotate in place** CCW |
-| Look right | `RIGHT` | **Rotate in place** CW |
+| heartbeats arriving | `true` | `true` |
+| heartbeats stop for 1.5 s | `false` | `false` |
 
-> The upstream project assumes an Ackermann car that cannot turn on the spot.
-> The M1 is a **mecanum** base, so `LEFT`/`RIGHT` rotate in place instead of
-> driving a 1.5 s arc — no arc, no forward creep.
+The link watchdog is what makes that second row happen: a sleeping EEG laptop
+must never leave the robot driving.
+
+### 8.4 What the EEG actually controls
+
+Protocol **v1** is toggles plus a state block, not velocities. The bridge
+publishes state; `gaze_control_node` decides what to do with it.
+
+| Gesture | Toggle | Effect |
+|---|---|---|
+| **Jaw clench** | `TOGGLE_RUN` | go / stop. Off means nothing moves; gaze only aims the camera |
+| **Double blink** | `TOGGLE_MODE` | `robot` (gaze steers the CHASSIS) <-> `camera` (gaze steers the PTZ head) |
+| **Eyebrow raise** | `TOGGLE_MUSIC` | music on / off |
+
+Every packet - event or heartbeat - repeats the **full state**, so one lost
+datagram is corrected by the next within 0.5 s. The two sides cannot drift.
 
 ### 8.5 Tuning
 
 ```bash
-ros2 run m1_control eeg_udp_bridge --ros-args -p speed:=0.10
-# or on the command line for the standalone bridge:
-python3 eeg_udp_bridge.py --speed 0.10 --steer 0.5 --link-timeout 1.5
+python3 eeg_udp_bridge.py --link-timeout 1.5 --dry-run
 ```
+
+`--dry-run` needs no ROS and no robot: it prints the state it would publish.
+Do not pass `--speed` / `--steer` any more - protocol v1 has no velocities in
+it. Speed comes from the arbiter cap and the gaze/keyboard source.
 
 ---
 

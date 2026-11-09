@@ -27,13 +27,22 @@ control_arbiter_node:
     #
     #   s1 = TILT, centre 40.  Measured usable 0..90; +-35 is conservative.
     #   s2 = PAN,  centre 90.  The vendor driver hard-clamps s2 to 0..110, so
-    #                          the widest symmetric travel is 70..110 (+-20),
-    #                          but we narrow it to 80..100 (+-10) so the camera
-    #                          keeps the path ahead in view while driving.
+    #                          70..110 (+-20) is the widest SYMMETRIC travel
+    #                          that exists. It is now used in full: the narrower
+    #                          80..100 (+-10) left the operator unable to look
+    #                          far enough to the side, and 110 is a hard
+    #                          firmware stop rather than an estimate, so the
+    #                          upper end costs nothing to reach.
+    #
+    #                          The lower end is 70 rather than the firmware's 0
+    #                          on purpose: symmetric travel means the head
+    #                          returns to centre from either side in the same
+    #                          time, and an asymmetric range makes "look left"
+    #                          feel different from "look right".
     servo_s1_min: 5
     servo_s1_max: 75
-    servo_s2_min: 80
-    servo_s2_max: 100
+    servo_s2_min: 70
+    servo_s2_max: 110
 
     initial_mode: 1            # 1 = KEYBOARD
     publish_rate_hz: 20.0
@@ -63,8 +72,8 @@ wasd_teleop_node:
     # Symmetric about centre - see the note in control_arbiter_node above.
     servo_s1_min: 5.0
     servo_s1_max: 75.0
-    servo_s2_min: 80.0
-    servo_s2_max: 100.0
+    servo_s2_min: 70.0
+    servo_s2_max: 110.0
     hold_time_sec: 0.25
     publish_rate_hz: 20.0
 
@@ -108,8 +117,8 @@ gaze_control_node:
     # Symmetric about centre - see the note in control_arbiter_node above.
     servo_s1_min: 5.0
     servo_s1_max: 75.0
-    servo_s2_min: 80.0
-    servo_s2_max: 100.0
+    servo_s2_min: 70.0
+    servo_s2_max: 110.0
 
     # Never claim the mode automatically; the operator decides.
     assert_mode: false

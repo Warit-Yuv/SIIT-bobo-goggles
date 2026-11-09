@@ -124,10 +124,15 @@ to their own private topic, and the arbiter picks one.
 ```
 keyboard ──► /cmd_vel/keyboard ──┐
 gaze     ──► /cmd_vel/gaze     ──┼──► [ARBITER] ──► /cmd_vel ──► motors
-eeg      ──► /cmd_vel/eeg      ──┘        ▲
-                                          │
-                              /control_mode (which one wins?)
+                                 ──┘        ▲
+                                            │
+                                /control_mode (which one wins?)
 ```
+
+The EEG is NOT a velocity source. Protocol v1 sends toggles, so it has no
+`/cmd_vel/eeg` at all - it publishes `/eeg/run`, `/eeg/mode` and `/eeg/link`,
+and `gaze_control_node` gates the GAZE command on them. An EEG gesture
+therefore decides *whether* and *what* gaze steers, never how fast.
 
 The arbiter does four jobs:
 
@@ -968,8 +973,8 @@ refuses. A guard is better than a warning, because guards work when you forget.
 ```
   keyboard ──► /cmd_vel/keyboard ──┐
   gaze     ──► /cmd_vel/gaze     ──┼──► [ARBITER] ──► /cmd_vel ──► motors
-  eeg      ──► /cmd_vel/eeg      ──┘   0.35 s watchdog
-                                       0.25 m/s clamp
+                                 ──┘   0.35 s watchdog
+  eeg      ──► /eeg/run|mode ──► gaze_control_node  0.40 m/s clamp
 ```
 
 Everything else is detail.

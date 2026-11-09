@@ -93,8 +93,8 @@ class ControlArbiterNode(Node):
         # dangerous while driving forward. 80..100 keeps the path visible.
         self.declare_parameter('servo_s1_min', 5)
         self.declare_parameter('servo_s1_max', 75)
-        self.declare_parameter('servo_s2_min', 80)
-        self.declare_parameter('servo_s2_max', 100)
+        self.declare_parameter('servo_s2_min', 70)
+        self.declare_parameter('servo_s2_max', 110)
 
         self.declare_parameter('initial_mode', MODE_KEYBOARD)
         self.declare_parameter('publish_rate_hz', 20.0)
