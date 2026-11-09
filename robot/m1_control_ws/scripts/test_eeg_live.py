@@ -80,7 +80,17 @@ def main():
             sock.close()
         return True
 
-    base = 2_000_000
+    # Sequence numbers must INCREASE across runs, not just within one.
+    #
+    # The bridge ignores any seq lower than one it has already seen, because a
+    # lower seq normally means a late or duplicated datagram. A fixed base made
+    # the second run of this test entirely stale: every packet was dropped, the
+    # gesture on the topic stayed whatever the previous run left, and the test
+    # reported a failure in the bridge rather than in itself.
+    #
+    # Seconds since the epoch, scaled, is monotonic for the life of the
+    # machine and far above anything a real sender will reach.
+    base = int(time.time()) % 100_000_000
     print('\nthe subscription:')
     if not send('JAW_CLENCH', base):
         # SKIP, not FAIL. This test needs the robot stack running, which is an
@@ -95,8 +105,22 @@ def main():
         return 0
     check('the EEG bridge is reachable', True)
 
-    spin(1.0)
-    got = node.state.get('eeg_gesture')
+    # /eeg/gesture is LATCHED, so a late subscriber is handed the PREVIOUS
+    # gesture immediately - which may be anything the last session left
+    # behind. Reading the state once therefore tests "some gesture was
+    # received at some point", not "this one arrived".
+    #
+    # Wait for the value this test actually sent, and fail on the timeout.
+    def wait_for(prefix, timeout=4.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            spin(0.1)
+            got = node.state.get('eeg_gesture') or ''
+            if got.startswith(prefix):
+                return got
+        return node.state.get('eeg_gesture')
+
+    got = wait_for('JAW_CLENCH')
     check('the gesture reaches the node', got is not None,
           f'state[eeg_gesture] = {got!r}')
     check('it is the gesture that was sent',
@@ -110,8 +134,7 @@ def main():
 
     print('\na second, different gesture:')
     send('DOUBLE_BLINK', base + 1)
-    spin(1.0)
-    got2 = node.state.get('eeg_gesture')
+    got2 = wait_for('DOUBLE_BLINK')
     check('the state updates to the new gesture',
           got2 and got2.startswith('DOUBLE_BLINK'), str(got2))
     check('the timestamp moves forward',

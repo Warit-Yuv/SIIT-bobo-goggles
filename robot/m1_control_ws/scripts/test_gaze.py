@@ -59,7 +59,20 @@ def run_ros(hold):
     # running. An unstarted node publishes nothing, every reading is zero, and
     # the test then reports a confident failure about code it never exercised.
     import m1_control.gaze_control_node as gcn
+    # EEG gating OFF for this test.
+    #
+    # This file checks the ZONE MAPPING - does looking right produce a right
+    # turn. It says nothing about whether an EEG is attached, but the node
+    # subscribes to /eeg/run and /eeg/mode, and those topics are LATCHED. So
+    # whatever the bridge last published (possibly "run off" from another
+    # test) is adopted the instant this node starts, every command is gated to
+    # zero, and the test fails with a perfect zone table and no movement.
+    #
+    # That is a test-isolation bug, not a controller bug: the same code passes
+    # when run alone. Turning the gate off makes the test deterministic and
+    # keeps it testing what it is named after.
     control = gcn.GazeControlNode()
+    control.use_eeg_gating = False
     executor = rclpy.executors.SingleThreadedExecutor()
     executor.add_node(node)
     executor.add_node(control)
