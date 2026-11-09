@@ -154,6 +154,22 @@ class ControlArbiterNode(Node):
             self.create_publisher(ServoControl, '/Servo', actuator_qos)
             if _SERVO_MSG_OK else None
         )
+        # The position the arbiter is actually holding, on a message type every
+        # machine has. /Servo is yahboomcar_msgs, which is robot-only - so an
+        # operator PC cannot subscribe to it, and the console's servo bars only
+        # ever showed what the CONSOLE last asked for. Move the camera with
+        # gaze and the bars sat still, which reads as "gaze is not working".
+        #
+        # Latched, so a console started later still sees the current position
+        # instead of waiting for the next movement.
+        servo_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self.servo_state_pub = self.create_publisher(
+            Vector3, '/servo/actual', servo_state_qos)
         self.buzzer_pub = self.create_publisher(Bool, '/Buzzer', actuator_qos)
 
         # Mode command: latched so a late-joining arbiter still learns the mode.
@@ -303,10 +319,14 @@ class ControlArbiterNode(Node):
             self._accept(msg)
 
     def _gaze_vel_cb(self, msg: Twist):
-        if self.active_mode in (MODE_GAZE, MODE_FUSION):
+        if self.active_mode in (MODE_GAZE, MODE_FUSION, MODE_EEG):
             self._accept(msg)
 
     def _eeg_vel_cb(self, msg: Twist):
+        # Protocol v1 has no /cmd_vel/eeg at all: the EEG sends toggles, and
+        # gaze_control_node gates the GAZE command on them. This handler is
+        # kept for any older sender that still publishes velocities, but it is
+        # no longer the thing that makes EEG mode work.
         if self.active_mode == MODE_EEG:
             self._accept(msg)
         elif self.active_mode == MODE_FUSION:
@@ -328,7 +348,7 @@ class ControlArbiterNode(Node):
             self._set_servo(msg.x, msg.y)
 
     def _gaze_servo_cb(self, msg: Vector3):
-        if self.active_mode in (MODE_GAZE, MODE_FUSION):
+        if self.active_mode in (MODE_GAZE, MODE_FUSION, MODE_EEG):
             self._set_servo(msg.x, msg.y)
 
     def _eeg_stop_cb(self, msg: Bool):
@@ -355,12 +375,15 @@ class ControlArbiterNode(Node):
             self.servo_dirty = True
 
     def _publish_servo(self):
-        if self.servo_pub is None:
-            return
-        msg = ServoControl()
-        msg.s1 = int(self.s1)
-        msg.s2 = int(self.s2)
-        self.servo_pub.publish(msg)
+        msg = Vector3()
+        msg.x = float(self.s1)
+        msg.y = float(self.s2)
+        self.servo_state_pub.publish(msg)
+        if self.servo_pub is not None:
+            out = ServoControl()
+            out.s1 = int(self.s1)
+            out.s2 = int(self.s2)
+            self.servo_pub.publish(out)
         self.servo_dirty = False
 
     # --------------------------------------------------------------- loop

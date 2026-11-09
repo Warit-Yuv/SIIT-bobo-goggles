@@ -37,12 +37,16 @@ IMAGE="192.168.2.51:5000/ros-humble-m1:1.1.1-cam"
 WS_HOST="/home/pi/m1_control_ws"
 EEG_HOST="/home/pi/eeg_bridge"
 SHARE_HOST="/home/pi/share"
+# Sound files for the EEG eyebrow-raise gesture. Mounted because the
+# container has its own filesystem: /home/pi does not exist inside it,
+# so a path in the default sound_dir would silently resolve to nothing.
+SOUND_HOST="/home/pi/sound"
 
 log() { printf '\033[36m[m1_docker]\033[0m %s\n' "$*"; }
 err() { printf '\033[31m[m1_docker]\033[0m %s\n' "$*" >&2; }
 
 ensure_dirs() {
-    mkdir -p "$WS_HOST" "$EEG_HOST" "$SHARE_HOST"
+    mkdir -p "$WS_HOST" "$EEG_HOST" "$SHARE_HOST" "$SOUND_HOST"
 }
 
 create_container() {
@@ -66,6 +70,7 @@ create_container() {
         -v "${SHARE_HOST}:/root/share" \
         -v "${WS_HOST}:/root/m1_control_ws" \
         -v "${EEG_HOST}:/root/eeg_bridge" \
+        -v "${SOUND_HOST}:/root/sound" \
         "$IMAGE" \
         sleep infinity >/dev/null
     log "Container created (idle - nothing auto-starts)."

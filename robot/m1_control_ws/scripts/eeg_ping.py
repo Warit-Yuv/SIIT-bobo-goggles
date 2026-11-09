@@ -58,6 +58,9 @@ def main():
                     help='JAW_CLENCH / DOUBLE_BLINK / EYEBROW_RAISE')
     ap.add_argument('--watch', action='store_true',
                     help='keep heartbeating for 10 s so the link stays up')
+    ap.add_argument('--seq', type=int, default=1_000_000,
+                    help='starting sequence number (default high on purpose, '
+                         'so the bridge cannot mistake it for a stale packet)')
     args = ap.parse_args()
 
     print(f'[eeg] target {args.host}:{args.port}  protocol v{PROTOCOL_VERSION}')
@@ -70,7 +73,15 @@ def main():
     if args.mode:
         state['mode'] = args.mode
 
-    reply = send(args.host, args.port, 1, state=state or None,
+    # Start at a HIGH sequence number, not 1.
+    #
+    # The bridge ignores any seq lower than one it has already seen, because a
+    # lower seq normally means a late or duplicated datagram. A real sender has
+    # usually been running for a while, so seq 1 looks stale and is dropped -
+    # the bridge reports `dropped: 1` and nothing happens. Starting high means
+    # this tool can never be mistaken for a stale packet.
+    base = args.seq
+    reply = send(args.host, args.port, base, state=state or None,
                  gesture=args.gesture)
     if reply is None:
         print('[eeg] NO REPLY')
@@ -89,7 +100,7 @@ def main():
 
     if args.watch:
         print('[eeg] heartbeating for 10 s - Ctrl-C to stop')
-        seq = 2
+        seq = base + 1
         end = time.time() + 10
         try:
             while time.time() < end:

@@ -184,6 +184,9 @@ QLabel#mono { font-family: 'DejaVu Sans Mono'; font-size: 11px; }
 QLabel#warn { color: #fbbf24; }
 QLabel#bad { color: #ef4444; }
 QLabel#good { color: #34d399; }
+/* The EEG gesture readout, while a gesture is fresh. Bold and bright so it
+   catches the eye for a moment and then fades back to #dim. */
+QLabel#gesture { color: #34d399; font-weight: bold; font-size: 13px; }
 QLabel#banner {
     background: #3f2d0a; border: 1px solid #a16207; border-radius: 5px;
     color: #fbbf24; padding: 7px 10px;
@@ -256,6 +259,9 @@ class ConsoleNode(Node):
         self._latest_jpeg = None
         self._raw = None          # (u, v, valid, monotonic_time)
         self._features = None     # ([10 floats], monotonic_time)
+        # Log lines produced from ROS callbacks. A callback must not
+        # touch a widget, so it queues and the GUI timer drains it.
+        self._log_queue = []
         self._latest_face = None
         self._face_stamp = 0.0
 
@@ -291,6 +297,28 @@ class ConsoleNode(Node):
                                  sensor_qos)
         self.create_subscription(String, '/gaze/zone',
                                  lambda m: self._set('zone', m.data), 10)
+        # EEG state. Latched on the robot, so a late-joining console still gets
+        # the current values rather than waiting for the next gesture.
+        eeg_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
+        self.create_subscription(Bool, '/eeg/run',
+                                 lambda m: self._set('eeg_run', bool(m.data)),
+                                 eeg_qos)
+        self.create_subscription(String, '/eeg/mode',
+                                 lambda m: self._set('eeg_mode', m.data),
+                                 eeg_qos)
+        self.create_subscription(Bool, '/eeg/link',
+                                 lambda m: self._set('eeg_link', bool(m.data)),
+                                 eeg_qos)
+        # The gesture the headset actually saw. Published separately from the
+        # state it toggled, because the state alone cannot distinguish a double
+        # blink from a jaw clench - and a gesture that changed nothing would be
+        # invisible, which is precisely when the operator needs to know the
+        # headset saw them.
+        self.create_subscription(String, '/eeg/gesture',
+                                 self._eeg_gesture_cb, eeg_qos)
         self.create_subscription(String, '/audio/status',
                                  lambda m: self._set('audio', m.data), 10)
         self.create_subscription(Float32MultiArray, '/gaze/calib_state',
@@ -298,6 +326,17 @@ class ConsoleNode(Node):
         self.create_subscription(Float32MultiArray, '/gaze/tuning_state',
                                  self._tuning_state_cb, 10)
         self.create_subscription(Point, '/gaze/raw', self._raw_cb, 10)
+        # Where the camera ACTUALLY is, published by the arbiter. Without this
+        # the servo bars only ever showed what this console last asked for, so
+        # moving the camera from gaze left them frozen - which looks exactly
+        # like gaze control not working.
+        servo_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1)
+        self.create_subscription(Vector3, '/servo/actual',
+                                 self._servo_actual_cb, servo_qos)
         # The ten tracker features the calibration fits against. Separate
         # from /gaze/raw because raw is a POINT and this is a vector: a
         # calibration that fits a point can only learn a straight line
@@ -381,6 +420,32 @@ class ConsoleNode(Node):
         self._raw = (float(msg.x), float(msg.y), float(msg.z) > 0.5,
                      time.monotonic())
         self._set('gaze_alive', self._raw[2])
+
+    def _eeg_gesture_cb(self, msg):
+        """Remember the gesture and when it arrived, so the GUI can flash it."""
+        text = str(msg.data).strip()
+        if not text:
+            return
+        with self._lock:
+            self.state['eeg_gesture'] = text
+            self.state['eeg_gesture_at'] = time.monotonic()
+        # Also queue it for the log. A gesture that the headset saw but that
+        # changed no state used to leave NO trace anywhere - so "I clenched and
+        # nothing happened" could not be told apart from "the console never
+        # received it". One log line settles that.
+        self._log_queue.append(f'EEG gesture: {text}')
+
+    def _servo_actual_cb(self, msg):
+        """Adopt the arbiter's position as this console's view of the head.
+
+        Adopt, do not republish. The console is one of several things that can
+        move the head (keyboard nudges, gaze, the Centre button), and the
+        arbiter is the one place they are arbitrated. Echoing the value back
+        out would make the console a second, competing source of truth.
+        """
+        self.servo['s1'] = float(msg.x)
+        self.servo['s2'] = float(msg.y)
+        self._servo_dirty = False
 
     def _features_cb(self, msg):
         self._features = (list(msg.data), time.monotonic())
@@ -1059,6 +1124,115 @@ def make_drive_pad(QtCore, QtGui, QtWidgets):
                     p.drawText(rect, QtCore.Qt.AlignCenter, label)
 
     return DrivePad
+
+
+def make_gesture_pad(QtCore, QtGui, QtWidgets):
+    """The three EEG gestures as labelled keys, lit while they fire.
+
+    Why this exists at all
+    ----------------------
+    The EEG panel used to be two lines of grey text. That told the operator the
+    STATE ("run on, mode robot") but never the RULES, so the only way to learn
+    which gesture did what was to read the source - and the only feedback after
+    a clench was whether the robot happened to move, which it often does not
+    because a clench that toggles to the state it is already in changes nothing.
+
+    This is the same idea as the WASD pad, which works: draw the controls, and
+    light the one that just fired. The operator learns the mapping by using it,
+    and gets confirmation that the headset saw them even when the state did not
+    change.
+
+    The rows are ordered by how reliably this headset separates them, so the
+    one the operator should reach for first is at the top.
+    """
+
+    #: (gesture, key label, what it does). Order is deliberate: most reliable
+    #: first, so the safest control is the one nearest the eye.
+    #:
+    #: Named _GESTURE_ROWS rather than ROWS because a class body cannot see a
+    #: name from the enclosing function - `ROWS = ROWS` inside the class raises
+    #: NameError, since the assignment makes ROWS local to the class scope.
+    _GESTURE_ROWS = [
+        ('DOUBLE_BLINK', 'BLINK', 'go / stop'),
+        ('JAW_CLENCH', 'JAW', 'steer robot <-> camera'),
+        ('EYEBROW_RAISE', 'BROW', 'play a sound'),
+    ]
+
+    class GesturePad(QtWidgets.QWidget):
+        #: Exposed on the class, not just captured by the closure, so a test
+        #: can check the mapping the operator is being shown.
+        ROWS = _GESTURE_ROWS
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.lit = None            # gesture name, or None
+            self.lit_at = 0.0
+            #: How long a key stays lit. Long enough to catch the eye while
+            #: looking at the robot, short enough to be clearly "just now".
+            self.HOLD_SEC = 1.6
+            self.setMinimumHeight(84)
+            self.setMinimumWidth(150)
+
+        def set_gesture(self, gesture, at):
+            self.lit = (gesture or '').strip().upper() or None
+            self.lit_at = at
+            self.update()
+
+        def _lit_now(self):
+            if not self.lit:
+                return None
+            import time as _t
+            if _t.monotonic() - self.lit_at > self.HOLD_SEC:
+                return None
+            return self.lit
+
+        def paintEvent(self, _e):
+            p = QtGui.QPainter(self)
+            p.setRenderHint(QtGui.QPainter.Antialiasing)
+
+            # One row per gesture: a key box on the left, the action on the
+            # right. The action is text rather than a second box because it is
+            # a description, not something you press - drawing it as a key
+            # would suggest it can be clicked.
+            rows = len(_GESTURE_ROWS)
+            h = self.height() - 8
+            row_h = max(20, min(30, (h - (rows - 1) * 4) // rows))
+            gap = 4
+            key_w = max(46, min(60, self.width() // 4))
+            y0 = (self.height() - (row_h * rows + gap * (rows - 1))) / 2
+
+            lit = self._lit_now()
+
+            for i, (gesture, key_label, action) in \
+                    enumerate(_GESTURE_ROWS):
+                y = y0 + i * (row_h + gap)
+                on = (gesture == lit)
+
+                # The key box, in the same colours as the WASD pad.
+                rect = QtCore.QRectF(4, y, key_w, row_h)
+                p.setPen(QtGui.QPen(
+                    QtGui.QColor('#3b82f6' if on else '#333b45'), 1))
+                p.setBrush(QtGui.QColor('#1e3a5f' if on else '#1a1e24'))
+                p.drawRoundedRect(rect, 4, 4)
+                p.setPen(QtGui.QColor('#dbeafe' if on else '#8b939c'))
+                f = p.font()
+                f.setBold(on)
+                f.setPointSizeF(8.5)
+                p.setFont(f)
+                p.drawText(rect, QtCore.Qt.AlignCenter, key_label)
+
+                # What it does. Dim normally, bright while firing.
+                p.setPen(QtGui.QColor('#dbeafe' if on else '#8b939c'))
+                f.setBold(on)
+                f.setPointSizeF(8.5)
+                p.setFont(f)
+                text_rect = QtCore.QRectF(key_w + 12, y, self.width()
+                                          - key_w - 16, row_h)
+                p.drawText(text_rect,
+                           QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft,
+                           action)
+
+    return GesturePad
 
 
 def make_map_view(QtCore, QtGui, QtWidgets):
@@ -2497,6 +2671,7 @@ def main(args=None):
     DrawGazeOverlay = make_gaze_overlay(QtCore, QtGui)
     MapView = make_map_view(QtCore, QtGui, QtWidgets)
     DrivePad = make_drive_pad(QtCore, QtGui, QtWidgets)
+    GesturePad = make_gesture_pad(QtCore, QtGui, QtWidgets)
     # Bind to a NEW name: assigning back to CalibDialog would make it a
     # local of main() and the right-hand reference would raise
     # UnboundLocalError.
@@ -2679,6 +2854,32 @@ def main(args=None):
             self.btn_estop.setObjectName('estop')
             self.btn_estop.clicked.connect(self._estop)
             gm.addWidget(self.btn_estop, 2, 0, 1, 2)
+
+            # EEG state, in words. Protocol v1 made the EEG a GATE rather than
+            # a velocity source, so selecting mode 3 does nothing on its own:
+            # the chassis stays still until a DOUBLE BLINK sets run, and gaze
+            # only drives the wheels when the EEG says mode=robot. Without this
+            # line the operator sees a connected headset, a correct mode, and a
+            # robot that will not move - with nothing anywhere saying why.
+            # The three gestures as labelled keys, lit while they fire - the
+            # same idiom as the WASD pad, which the operator already reads
+            # without thinking. It shows the RULES (which gesture does what)
+            # and the EVENT (which one just fired), which the state line below
+            # cannot: a gesture that toggles to the value it already had
+            # changes no state at all.
+            self.pad_gesture = GesturePad()
+            gm.addWidget(self.pad_gesture, 3, 0, 1, 2)
+
+            # State, in one line. Always true, rarely changes - the opposite of
+            # the pad above, which is why they are separate widgets.
+            self.lbl_eeg = QtWidgets.QLabel('EEG  no link')
+            self.lbl_eeg.setObjectName('dim')
+            self.lbl_eeg.setToolTip(
+                'BLINK = go / stop (most reliable)\n'
+                'JAW = steer robot <-> steer camera\n'
+                'BROW = play a sound\n\n'
+                'Nothing moves until run is ON and mode is robot.')
+            gm.addWidget(self.lbl_eeg, 4, 0, 1, 2)
             v.addWidget(g)
 
             # -- servo ----------------------------------------------------
@@ -3821,6 +4022,65 @@ def main(args=None):
             else:
                 self.lbl_drive.setText('idle')
 
+        def _refresh_eeg(self, s):
+            """Say what the EEG is doing in words the operator can act on.
+
+            Protocol v1 made the EEG a GATE, not a joystick. Three things must
+            all be true before the wheels turn, and the operator can only see
+            one of them from the mode buttons:
+
+                link  the headset side is actually sending
+                run   a jaw clench has armed it
+                mode  robot, not camera
+
+            So the line names whichever one is blocking, rather than just
+            reporting the values. "EEG no link" is a cable problem; "jaw
+            clench to start" is a gesture; "steering the camera" is a double
+            blink. Those are three different actions and conflating them is
+            what made a working system look broken.
+            """
+            link = s.get('eeg_link')
+            run = s.get('eeg_run')
+            emode = s.get('eeg_mode')
+
+            if link is None:
+                self.lbl_eeg.setText('EEG  no data')
+                self._style(self.lbl_eeg, 'dim')
+                return
+            if not link:
+                self.lbl_eeg.setText('EEG  NO LINK - headset not sending')
+                self._style(self.lbl_eeg, 'bad')
+                return
+            if not run:
+                self.lbl_eeg.setText('EEG  linked - double blink to START')
+                self._style(self.lbl_eeg, 'warn')
+                return
+            if emode == 'camera':
+                self.lbl_eeg.setText(
+                    'EEG  RUN - steering CAMERA (jaw clench for robot)')
+                self._style(self.lbl_eeg, 'warn')
+                return
+            self.lbl_eeg.setText('EEG  RUN - steering ROBOT')
+            self._style(self.lbl_eeg, 'good')
+
+        def _refresh_gesture(self, s):
+            """Light the key for whatever gesture the headset just detected.
+
+            Driven by the EVENT, not the state. A gesture that toggles a value
+            back where it already was produces no state change at all, and on
+            this headset that is common - the classifier reports
+            UNCLEAR_MUSCLE when it cannot separate a jaw clench from an
+            eyebrow raise. Lighting the key means the operator can tell "the
+            headset did not see me" from "it saw me, and the robot is already
+            in that state".
+            """
+            text = s.get('eeg_gesture') or ''
+            at = s.get('eeg_gesture_at') or 0.0
+            # The bridge sends "<GESTURE>/<COMMAND>"; only the gesture part
+            # names a key on the pad.
+            gesture = text.split('/')[0].strip().upper()
+            self.pad_gesture.set_gesture(gesture, at)
+
         def keyReleaseEvent(self, event):
             if event.isAutoRepeat():
                 return
@@ -3835,6 +4095,18 @@ def main(args=None):
         def refresh(self):
             s = node.snapshot()
 
+            # Anything a ROS callback wanted to say. Draining here, on the GUI
+            # thread, is what keeps callbacks off the widgets.
+            while node._log_queue:
+                try:
+                    self.logline(node._log_queue.pop(0))
+                except IndexError:
+                    break
+
+            # What the headset last detected. Independent of the state line
+            # above, so a gesture that changed nothing still shows.
+            self._refresh_gesture(s)
+
             # mode
             mode = s['mode']
             if mode is None:
@@ -3844,6 +4116,8 @@ def main(args=None):
                 self.lbl_mode_hdr.setText(MODE_NAMES.get(mode, str(mode)))
                 self._style(self.lbl_mode_hdr,
                             'bad' if mode == 0 else 'good')
+
+            self._refresh_eeg(s)
             for m, b in self.mode_buttons.items():
                 b.setChecked(mode == m)
 

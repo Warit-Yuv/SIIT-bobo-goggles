@@ -47,12 +47,14 @@ def main():
     print('constants:')
     check('the protocol version is 1', PROTOCOL_VERSION == 1,
           str(PROTOCOL_VERSION))
-    check('jaw clench is the run toggle',
-          GESTURE_COMMANDS.get('JAW_CLENCH') == TOGGLE_RUN,
-          str(GESTURE_COMMANDS.get('JAW_CLENCH')))
-    check('double blink is the mode toggle',
-          GESTURE_COMMANDS.get('DOUBLE_BLINK') == TOGGLE_MODE,
+    # Ordered by how reliably the classifier separates them: the most
+    # consistent gesture gets the go/stop, the least gets a sound effect.
+    check('double blink is the run toggle (most reliable)',
+          GESTURE_COMMANDS.get('DOUBLE_BLINK') == TOGGLE_RUN,
           str(GESTURE_COMMANDS.get('DOUBLE_BLINK')))
+    check('jaw clench is the mode toggle',
+          GESTURE_COMMANDS.get('JAW_CLENCH') == TOGGLE_MODE,
+          str(GESTURE_COMMANDS.get('JAW_CLENCH')))
 
     print('\nfollowing the sender state:')
     c = EEGCore(link_timeout=1.5)
@@ -85,20 +87,20 @@ def main():
 
     print('\ngestures toggle:')
     c2 = EEGCore(link_timeout=1.5, start_run=False)
-    c2.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'JAW_CLENCH'},
+    c2.on_message({'v': 1, 'seq': 1, 'event': {'gesture': 'DOUBLE_BLINK'},
                    'state': {'run': True}}, now=20.0)
-    check('jaw clench can turn run ON', c2.run is True)
-    c2.on_message({'v': 1, 'seq': 2, 'event': {'gesture': 'JAW_CLENCH'},
+    check('double blink can turn run ON', c2.run is True)
+    c2.on_message({'v': 1, 'seq': 2, 'event': {'gesture': 'DOUBLE_BLINK'},
                    'state': {'run': False}}, now=20.1)
-    check('jaw clench can turn run OFF again', c2.run is False)
+    check('double blink can turn run OFF again', c2.run is False)
 
     # A packet with no state block at all - a hand-typed datagram - must still
     # toggle, otherwise debugging over netcat is impossible.
     c2b = EEGCore(link_timeout=1.5, start_run=False)
-    c2b.on_message({'event': {'gesture': 'JAW_CLENCH'}}, now=21.0)
+    c2b.on_message({'event': {'gesture': 'DOUBLE_BLINK'}}, now=21.0)
     check('a state-less packet still toggles', c2b.run is True)
     check('the gesture is remembered',
-          c2.last_gesture == 'JAW_CLENCH', c2.last_gesture)
+          c2.last_gesture == 'DOUBLE_BLINK', c2.last_gesture)
 
     print('\nthe link watchdog:')
     c3 = EEGCore(link_timeout=1.5, start_run=True)
@@ -125,6 +127,53 @@ def main():
           f'{c4.dropped} dropped')
     check('a wrong protocol version is remembered, not just dropped',
           c4.bad_version == 99, str(c4.bad_version))
+
+    print('\ngestures inferred from state (sender sends no event block):')
+    # A sender is not ours to change. If it publishes state but does not label
+    # the gesture, the GUI would show nothing at all - indistinguishable from a
+    # disconnected headset. The state DELTA identifies the gesture unambiguously
+    # because every toggle owns exactly one field.
+    c6 = EEGCore(link_timeout=1.5)
+    c6.on_message({'v': 1, 'seq': 1, 'state': {'run': False,
+                                               'mode': 'robot',
+                                               'music': False}}, now=50.0)
+    check('adopting the initial state is not a gesture',
+          c6.gesture_seq == 0,
+          'the first packet always differs from the defaults')
+
+    c6.on_message({'v': 1, 'seq': 2, 'state': {'run': True,
+                                               'mode': 'robot',
+                                               'music': False}}, now=50.5)
+    check('a run flip is read as a double blink',
+          c6.last_gesture == 'DOUBLE_BLINK', c6.last_gesture)
+    check('and it is counted', c6.gesture_seq == 1, str(c6.gesture_seq))
+
+    c6.on_message({'v': 1, 'seq': 3, 'state': {'run': True,
+                                               'mode': 'camera',
+                                               'music': False}}, now=51.0)
+    check('a mode flip is read as a jaw clench',
+          c6.last_gesture == 'JAW_CLENCH', c6.last_gesture)
+
+    c6.on_message({'v': 1, 'seq': 4, 'state': {'run': True,
+                                               'mode': 'camera',
+                                               'music': True}}, now=51.5)
+    check('a music flip is read as an eyebrow raise',
+          c6.last_gesture == 'EYEBROW_RAISE', c6.last_gesture)
+
+    before = c6.gesture_seq
+    c6.on_message({'v': 1, 'seq': 5, 'state': {'run': True,
+                                               'mode': 'camera',
+                                               'music': True}}, now=52.0)
+    check('a heartbeat with no change is NOT a gesture',
+          c6.gesture_seq == before,
+          f'{before} -> {c6.gesture_seq}')
+
+    # An explicit gesture field must win over inference, and both shapes must
+    # be accepted: nested in `event`, or at the top level.
+    c7 = EEGCore(link_timeout=1.5)
+    c7.on_message({'v': 1, 'seq': 1, 'gesture': 'JAW_CLENCH'}, now=60.0)
+    check('a top-level gesture field is accepted',
+          c7.last_gesture == 'JAW_CLENCH', c7.last_gesture)
 
     print('\nstartup state:')
     c5 = EEGCore(link_timeout=1.5, start_run=False)

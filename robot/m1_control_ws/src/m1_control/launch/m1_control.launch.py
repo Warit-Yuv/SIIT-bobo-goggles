@@ -50,6 +50,17 @@ def launch_setup(context, *args, **kwargs):
                 '--link-timeout', arg('eeg_link_timeout'),
             ],
         ))
+        # The sound player follows the EEG: an eyebrow raise is the least
+        # reliable of the three gestures, so it gets the only job where a
+        # misfire costs nothing but a noise. It is not gated on `eeg` because
+        # /eeg/music can also be published by hand while debugging.
+        actions.append(Node(
+            package='m1_control',
+            executable='sound_player_node',
+            name='sound_player_node',
+            output='screen',
+            parameters=[{'sound_dir': arg('sound_dir')}],
+        ))
     else:
         actions.append(LogInfo(msg='[control] EEG bridge OFF'))
 
@@ -126,6 +137,11 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
+        DeclareLaunchArgument('sound_dir', default_value='',
+                              description='Folder of sound files for the EEG '
+                                          'eyebrow-raise gesture. Empty means '
+                                          'auto-detect: /root/sound in the '
+                                          'container, /home/pi/sound outside'),
         DeclareLaunchArgument('eeg', default_value='true',
                               choices=['true', 'false'],
                               description='Start the EEG UDP -> /cmd_vel/eeg bridge'),

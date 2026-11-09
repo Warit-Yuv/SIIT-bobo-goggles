@@ -18,9 +18,9 @@ continuous signal, and every missed or late packet is a wrong movement.
 
 Protocol v1 replaced it with three TOGGLES and a state block:
 
-    JAW_CLENCH     -> TOGGLE_RUN    run:  false <-> true
-    DOUBLE_BLINK   -> TOGGLE_MODE   mode: "robot" <-> "camera"
-    EYEBROW_RAISE  -> TOGGLE_MUSIC  music: false <-> true
+    DOUBLE_BLINK   -> TOGGLE_RUN    run:  false <-> true
+    JAW_CLENCH     -> TOGGLE_MODE   mode: "robot" <-> "camera"
+    EYEBROW_RAISE  -> TOGGLE_MUSIC  music: false <-> true  (sound effect)
 
 Every message - event or heartbeat - carries the FULL state after it. So this
 bridge follows `state` rather than flipping its own copy on each event. A lost
@@ -81,9 +81,24 @@ MODE_CAMERA = 'camera'
 
 #: Gesture -> command, so an event carrying only a gesture still works. The
 #: sender always includes `command`, but a hand-typed test packet may not.
+#:
+#: Ordered by how reliably the classifier separates them, which was measured on
+#: this headset rather than assumed:
+#:
+#:   DOUBLE_BLINK   the most consistent of the three by a clear margin, so it
+#:                  gets the job the operator needs most often - go / stop
+#:   JAW_CLENCH     consistent, but occasionally confused with an eyebrow raise
+#:                  (the classifier reports UNCLEAR_MUSCLE), so it gets a job
+#:                  where a misfire is visible and harmless - switching what
+#:                  gaze steers
+#:   EYEBROW_RAISE  the least reliable, so it gets the only job where being
+#:                  wrong costs nothing at all: a sound effect
+#:
+#: Putting the least reliable gesture on the run toggle is what made the robot
+#: lurch; putting the most reliable one there is the whole point of this table.
 GESTURE_COMMANDS = {
-    'JAW_CLENCH': TOGGLE_RUN,
-    'DOUBLE_BLINK': TOGGLE_MODE,
+    'DOUBLE_BLINK': TOGGLE_RUN,
+    'JAW_CLENCH': TOGGLE_MODE,
     'EYEBROW_RAISE': TOGGLE_MUSIC,
 }
 
@@ -113,6 +128,18 @@ class EEGCore:
         self.bad_version = None
         self.last_gesture = ''
         self.last_command = ''
+        #: Increments on every gesture the sender reports, INCLUDING one that
+        #: toggles a value back to where it already was. Without a counter the
+        #: only way to notice a gesture is to see the state change, and a
+        #: gesture that produced no change (or was rejected) would be
+        #: invisible - which is exactly the case where the operator most wants
+        #: to know whether the headset saw them.
+        self.gesture_seq = 0
+        #: False until the first state block has been adopted. The very first
+        #: packet always differs from the bridge's starting defaults, and
+        #: counting that as a gesture would make the GUI announce a blink
+        #: nobody performed every time the bridge or the sender restarts.
+        self._state_seen = False
         self._run_since = 0.0
 
         self.lock = threading.Lock()
@@ -161,14 +188,30 @@ class EEGCore:
                 self.last_seq = seq
 
             note = None
+            gesture = ''
+            command = ''
+
+            # A gesture can arrive three ways. All three are accepted because
+            # the sender is not ours to change, and a sender that reports its
+            # gesture in a shape this bridge ignores produces a system that
+            # looks connected and does nothing - the worst failure mode here.
             ev = msg.get('event')
             if isinstance(ev, dict):
                 gesture = str(ev.get('gesture', '')).upper()
                 command = str(ev.get('command', '')).upper()
-                self.last_gesture = gesture
+            elif msg.get('gesture'):
+                # Top-level form: {"gesture": "JAW_CLENCH"}
+                gesture = str(msg.get('gesture', '')).upper()
+                command = str(msg.get('command', '')).upper()
+
+            prev = (self.run, self.mode, self.music)
+
+            if gesture:
                 if not command:
                     command = GESTURE_COMMANDS.get(gesture, '')
+                self.last_gesture = gesture
                 self.last_command = command
+                self.gesture_seq += 1
                 note = '%s -> %s' % (gesture or '?', command or '?')
 
                 # Fallback: if the sender did not include a state block, apply
@@ -190,6 +233,33 @@ class EEGCore:
                         self.mode = m
                 if 'music' in state:
                     self.music = bool(state['music'])
+
+            # No gesture field at all, but the state moved: work the gesture
+            # out from WHAT changed. Every toggle maps to exactly one field, so
+            # the delta identifies the gesture unambiguously.
+            #
+            # This is not a guess. It is the only way to support a sender that
+            # publishes state without labelling the event - and without it, the
+            # GUI shows nothing at all for a gesture that plainly happened,
+            # which is indistinguishable from the headset being disconnected.
+            if not gesture and self._state_seen:
+                after = (self.run, self.mode, self.music)
+                if after != prev:
+                    if after[0] != prev[0]:
+                        self.last_gesture = 'DOUBLE_BLINK'
+                        self.last_command = TOGGLE_RUN
+                    elif after[1] != prev[1]:
+                        self.last_gesture = 'JAW_CLENCH'
+                        self.last_command = TOGGLE_MODE
+                    else:
+                        self.last_gesture = 'EYEBROW_RAISE'
+                        self.last_command = TOGGLE_MUSIC
+                    self.gesture_seq += 1
+                    note = '%s -> %s (from state)' % (self.last_gesture,
+                                                      self.last_command)
+
+            if isinstance(state, dict):
+                self._state_seen = True
 
             return note
 
@@ -234,6 +304,7 @@ class EEGCore:
                 'gaps': self.seq_gaps,
                 'dropped': self.dropped,
                 'last': '%s/%s' % (self.last_gesture, self.last_command),
+                'gesture_seq': self.gesture_seq,
             }
 
 
@@ -309,14 +380,22 @@ def run_ros(args, core):
             self.run_pub = self.create_publisher(Bool, '/eeg/run', qos)
             self.mode_pub = self.create_publisher(String, '/eeg/mode', qos)
             self.music_pub = self.create_publisher(Bool, '/eeg/music', qos)
+            # The gesture itself, not just the state it produced. A GUI cannot
+            # reliably tell a double blink from a jaw clench by watching the
+            # resulting toggles - and a gesture that changes nothing is
+            # invisible entirely. This topic says what the headset actually
+            # saw, which is the only honest basis for "action detected".
+            self.gesture_pub = self.create_publisher(
+                String, '/eeg/gesture', qos)
             self.link_pub = self.create_publisher(Bool, '/eeg/link', qos)
 
             self._prev = None
+            self._prev_gesture = 0
             self.create_timer(1.0 / args.rate, self.tick)
             self.get_logger().info(
                 f'EEG bridge (protocol v{PROTOCOL_VERSION}) | UDP :{args.port} | '
                 f'link timeout {core.link_timeout}s | '
-                f'jaw=TOGGLE_RUN  blink=TOGGLE_MODE  brow=TOGGLE_MUSIC')
+                f'blink=TOGGLE_RUN  jaw=TOGGLE_MODE  brow=TOGGLE_MUSIC')
 
         def tick(self):
             now = time.monotonic()
@@ -325,6 +404,12 @@ def run_ros(args, core):
                     'EEG link lost - run forced OFF')
 
             st = core.status()
+            # Publish the gesture BEFORE the state, and independently of it, so
+            # a gesture that changed nothing still shows up on the console.
+            if st['gesture_seq'] != self._prev_gesture:
+                self._prev_gesture = st['gesture_seq']
+                if st['last'] and not st['last'].startswith('/'):
+                    self.gesture_pub.publish(String(data=st['last']))
             cur = (st['run'], st['mode'], st['music'], st['link'])
             if cur != self._prev:
                 self._prev = cur

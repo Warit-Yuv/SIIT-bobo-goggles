@@ -110,6 +110,14 @@ class GazeHUDNode(Node):
         # radius makes FORWARD and BACKWARD unreachable while turning stays
         # easy - which is exactly the complaint that drove this change.
         self.declare_parameter('deadzone_radius_ratio_y', 0.16)
+        # MUST match gaze_control_node's own `enable_vertical`, which is False
+        # by default. This HUD does not drive anything - it only DRAWS what it
+        # thinks will happen - so if the two disagree, the overlay confidently
+        # announces a zone the controller will never act on. That is exactly
+        # what happened: the HUD drew "FORWARD" while the control node, with
+        # vertical disabled, classified the same input as CENTER and did
+        # nothing at all.
+        self.declare_parameter('enable_vertical', False)
 
         self.declare_parameter('drive_speed_x', 0.20)
         self.declare_parameter('drive_speed_y', 0.20)
@@ -192,6 +200,7 @@ class GazeHUDNode(Node):
         self.dwell_threshold = float(gp('dwell_time_sec').value)
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
+        self.enable_vertical = bool(gp('enable_vertical').value)
         self.drive_vx = float(gp('drive_speed_x').value)
         self.drive_vy = float(gp('drive_speed_y').value)
         self.turn_wz = float(gp('turn_speed_z').value)
@@ -797,6 +806,18 @@ class GazeHUDNode(Node):
         nx = dx / max(1e-6, rx)
         ny = dy / max(1e-6, ry)
         dist = float(np.hypot(nx, ny))
+
+        if not self.enable_vertical:
+            # Same rule as gaze_control_node, deliberately duplicated rather
+            # than shared: this is a display, and a display that computes a
+            # DIFFERENT answer from the controller is worse than no display.
+            # Vertical gaze is the weak axis on this hardware, so the control
+            # node never lets it drive - and neither may the overlay pretend
+            # otherwise.
+            if abs(nx) < 1.0:
+                return ZONE_CENTER, dist
+            return (ZONE_TURN_LEFT if nx < 0 else ZONE_TURN_RIGHT), dist
+
         if dist < 1.0:
             return ZONE_CENTER, dist
         # Compare the NORMALISED offsets, so "up" competes on equal terms with
