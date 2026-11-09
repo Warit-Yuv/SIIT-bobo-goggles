@@ -33,12 +33,18 @@ robot/
 |---|---|
 | `control_arbiter_node` | **Safety core.** Mode mux, velocity clamping, 350 ms watchdog. The only publisher of `/cmd_vel` and `/Servo`. |
 | `wasd_teleop_node` | Keyboard mecanum (`WASD`+`QE`) and gimbal (`IJKL`) |
-| `eeg_udp_bridge` | UDP `:9000` → `/cmd_vel/eeg`, majority filter + link watchdog |
+| `eeg_udp_bridge` | UDP `:9000` → `/eeg/run`, `/eeg/mode`, `/eeg/gesture` + link watchdog |
+| `sound_player_node` | Eyebrow raise → a random file from `/home/pi/sound` |
 | `gaze_udp_bridge` | UDP `:9100` → `/gaze/point` |
 | `gaze_control_node` | Deadzone → PTZ, dwell → drive; the motion *policy* |
 | `image_throttle_node` | 30 Hz → 20 Hz compressed frames |
 | `sensor_sync_node` | `ApproximateTimeSynchronizer` for camera + scan *(PC)* |
-| `gaze_hud_node` | Local-webcam HUD overlay *(PC)* |
+| `gaze_hud_node` | Local-webcam tracker + HUD overlay *(PC)*. Display-only - it publishes `/gaze/point`, never motion |
+| `gaze_tracker.py` | Frame → 10 features (not a node; imported by the HUD) |
+| `gaze_model.py` | 10 features → screen point (not a node; imported by both) |
+
+The EEG is **not** a velocity source. Protocol v1 sends toggles, so the bridge
+publishes state and `gaze_control_node` gates the gaze command on it.
 
 ## Launch files
 
@@ -78,6 +84,8 @@ ros2 launch m1_control m1_control.launch.py eeg:=true
 
 ## Scripts
 
+### Operations
+
 | Script | Purpose |
 |---|---|
 | `env.sh` | Canonical environment (source this, never hand-type the chain) |
@@ -85,11 +93,41 @@ ros2 launch m1_control m1_control.launch.py eeg:=true
 | `stop_all.sh` | Stop nodes, zero velocity first |
 | `kill_all.sh` | Hard reset of the ROS graph |
 | `diagnose.sh` | Read-only health check (exit code = failures) |
-| `validate_safety.py` | 12 automated safety assertions |
-| `test_eeg_udp.py` | Simulate the EEG laptop, no headset needed |
-| `test_gaze.py` | Drive the gaze pipeline with synthetic points |
+| `validate_safety.py` | Safety assertions: ownership, watchdog, clamping, E-STOP, EEG |
+| `check_chain.py` | End-to-end: mode, run gate, gaze, arbiter, `/cmd_vel` |
+| `eeg_ping.py` | Send one protocol-v1 packet and print the reply |
 | `lidar_probe.py` | Raw YDLidar protocol probe |
 | `tune_network.sh` | Idempotent sysctl tuning (`apply` / `--check` / `--revert`) |
+
+`check_chain.py` is the one to run when "the robot does not move". It walks the
+chain in order and stops at the first thing that is wrong, instead of leaving
+you to guess which of five layers is at fault. The robot must be off the floor;
+pass `--wheels` to drive them.
+
+### Tests
+
+`scripts/test_*.py` are self-contained and need no hardware (except the two
+marked). Run them all:
+
+```bash
+for t in scripts/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
+```
+
+| Group | What they pin down |
+|---|---|
+| `test_gaze_model.py` | The ridge model beats the old offset+gain line |
+| `test_posture_calib.py` | 4-posture calibration is 8x better held-out |
+| `test_gaze_new_arch.py` | No clipping, bias absorbed, head invariance |
+| `test_gesture_pad.py` / `test_profile_list.py` | The GUI shows what it claims |
+| `test_eeg_*.py` | Protocol v1, keyboard fallback, live delivery |
+| `test_drive_and_persist.py` | Key-release order, and calibration surviving a restart |
+| `test_dialog_fit.py` | The calibration dialog's fitting path |
+| `test_gaze.py` | Zone mapping (**skips** if the robot stack is driving) |
+| `test_eeg_live.py` | Gesture delivery (**skips** if the robot is not up) |
+
+Tests skip rather than fail when a precondition they cannot arrange is missing.
+A suite that goes red because the robot is switched off is a suite people stop
+reading.
 
 ---
 

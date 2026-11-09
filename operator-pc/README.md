@@ -91,7 +91,7 @@ startup and shows a red banner naming the mismatch if it is wrong.
 | **1 · Robot** | Start / stop / diagnose the stack on the Pi over SSH |
 | **2 · Control mode** | Keyboard, Gaze, EEG, Gaze+EEG, and a large E-STOP |
 | **3 · Camera head** | Pan and tilt with the allowed range drawn on the bar |
-| **4 · Gaze** | Live gaze plot (raw vs corrected) and 5-point calibration |
+| **4 · Gaze** | Live gaze plot and calibration (Fast / Long / Super / Ultra / Posture) |
 | **5 · Voice** | Enable audio, mute either direction, packet meters |
 | **6 · Map** | Live SLAM map: occupancy grid, laser returns, robot pose |
 | **Camera** | Live feed at the throttled rate |

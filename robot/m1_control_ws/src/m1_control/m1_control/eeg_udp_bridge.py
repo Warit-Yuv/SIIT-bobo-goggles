@@ -139,7 +139,7 @@ class EEGCore:
         #: invisible - which is exactly the case where the operator most wants
         #: to know whether the headset saw them.
         self.gesture_seq = 0
-        #: Until when a keyboard gesture outranks the sender's state.
+        #: True while a keyboard gesture outranks the sender's state.
         #:
         #: Protocol v1 makes the SENDER authoritative: every packet repeats the
         #: full state so a lost datagram heals itself. That is right for the
@@ -151,12 +151,23 @@ class EEGCore:
         #: packet reverted it to robot 0.2 s later, which looks exactly like
         #: the key being broken.
         #:
-        #: So a keyboard gesture wins for `kb_override_sec`, then the sender
-        #: takes over again. A temporary override rather than a permanent one:
-        #: the headset is the primary input and must not be locked out by a
-        #: stray keypress nobody remembers making.
-        self._kb_until = 0.0
-        self.kb_override_sec = 5.0
+        #: The first fix was a five-second window, which is the wrong trigger.
+        #: A connected-but-idle headset sends the SAME state forever, so every
+        #: keypress was silently undone five seconds later - long after the
+        #: operator had stopped watching the screen and started believing the
+        #: key had worked. The question is not "how long ago did the key go
+        #: down" but "has the headset said anything NEW since".
+        #:
+        #: So the override lasts until the sender's own state CHANGES. A
+        #: repeating packet is a heartbeat and is ignored; a packet that
+        #: differs from the sender's last report is a real headset action and
+        #: takes over immediately. The headset can never be locked out, because
+        #: the gesture that would take it back is by definition a change.
+        self._kb_pending = False
+        #: The sender's last reported state, or None if it has not spoken yet.
+        #: A heartbeat is compared against this rather than against the live
+        #: state, which the keyboard may have moved.
+        self._sender_state = None
         #: How many state packets a keyboard override suppressed, so the
         #: bridge can say so once instead of silently ignoring input.
         self.kb_suppressed = 0
@@ -247,27 +258,46 @@ class EEGCore:
                     self._apply_toggle(command, now)
 
             state = msg.get('state')
-            if isinstance(state, dict) and now < self._kb_until:
-                # A keyboard gesture is still in force. Take the link and any
-                # gesture the packet carries, but let the keyboard's state
-                # stand until the window closes - otherwise the sender's own
-                # heartbeat undoes the keypress within one period.
-                self.kb_suppressed += 1
-                self._state_seen = True
-                return note
-
             if isinstance(state, dict):
+                # Reduce the packet to the three fields the bridge cares about,
+                # so a sender that adds a new key does not look like it changed
+                # something every single packet.
+                sender_now = {}
                 if 'run' in state:
-                    new_run = bool(state['run'])
+                    sender_now['run'] = bool(state['run'])
+                if 'mode' in state:
+                    sender_now['mode'] = str(state['mode']).lower()
+                if 'music' in state:
+                    sender_now['music'] = bool(state['music'])
+
+                # A packet identical to the sender's previous report is a
+                # HEARTBEAT: it exists to prove the link is alive and to heal a
+                # lost datagram, not to instruct anything. If the keyboard is
+                # still in force, it must not be allowed to undo a keypress -
+                # and because we do NOT record it as the new baseline, the next
+                # heartbeat is also ignored. The override therefore lasts
+                # exactly as long as the headset stays quiet.
+                if self._kb_pending and sender_now == self._sender_state:
+                    self.kb_suppressed += 1
+                    self._state_seen = True
+                    return note
+
+                # Either no keyboard override, or the sender genuinely moved.
+                # A first packet always counts as a change: the sender has just
+                # connected and knows its own state better than we do.
+                self._kb_pending = False
+                self._sender_state = sender_now
+
+                if 'run' in sender_now:
+                    new_run = sender_now['run']
                     if new_run and not self.run:
                         self._run_since = now
                     self.run = new_run
-                if 'mode' in state:
-                    m = str(state['mode']).lower()
-                    if m in (MODE_ROBOT, MODE_CAMERA):
-                        self.mode = m
-                if 'music' in state:
-                    self.music = bool(state['music'])
+                if 'mode' in sender_now and sender_now['mode'] in (MODE_ROBOT,
+                                                                  MODE_CAMERA):
+                    self.mode = sender_now['mode']
+                if 'music' in sender_now:
+                    self.music = sender_now['music']
 
             # No gesture field at all, but the state moved: work the gesture
             # out from WHAT changed. Every toggle maps to exactly one field, so
@@ -323,7 +353,7 @@ class EEGCore:
             self.last_command = command
             self.gesture_seq += 1
             self._apply_toggle(command, now)
-            self._kb_until = now + self.kb_override_sec
+            self._kb_pending = True
             self.kb_suppressed = 0
             return '%s -> %s (keyboard)' % (gesture, command)
 
@@ -344,6 +374,12 @@ class EEGCore:
             changed = False
             if self.link_ok and now - self.last_msg > self.link_timeout:
                 self.link_ok = False
+                # The sender is gone, so it has no state to defend. Drop the
+                # baseline too, so when it comes back its first packet is
+                # treated as a fresh statement rather than compared against a
+                # stale one - otherwise a keyboard override made while the
+                # headset was unplugged would outlive the reconnect.
+                self._sender_state = None
                 if self.run:
                     self.run = False
                     changed = True

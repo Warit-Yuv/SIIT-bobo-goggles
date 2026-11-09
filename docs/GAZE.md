@@ -189,6 +189,29 @@ exists to learn head-*position* effects; this does not attempt that.
 It comes from `gaze_udp_bridge` on the robot **and** from `gaze_hud_node` on the
 PC, so calibration works with any source.
 
+### Muting the tracker
+
+`gaze_hud_node` has a **latched mute** on `/gaze/hud_enable` (`std_msgs/Bool`).
+Set it to `false` and the node keeps tracking and keeps drawing its overlay, but
+stops publishing `/gaze/point`. It acknowledges on `/gaze/hud_enabled_state`, so
+you can confirm the mute took effect instead of assuming it did.
+
+```bash
+# mute
+ros2 topic pub --once /gaze/hud_enable std_msgs/msg/Bool "{data: false}"
+# check
+ros2 topic echo /gaze/hud_enabled_state --once
+# unmute
+ros2 topic pub --once /gaze/hud_enable std_msgs/msg/Bool "{data: true}"
+```
+
+This is not only a test hook. The moment anyone else walks in front of the
+camera the robot starts steering to *their* eyes, and there was previously no
+way to stop that short of killing the node. It is also what lets
+`scripts/check_chain.py` inject its own gaze points and get a trustworthy
+answer - two publishers on one topic means the control node sees an
+interleaving of both, so a "look left" comes back as CENTER.
+
 `/gaze/face` carries a 112×112 JPEG crop of the operator's face at 5 Hz, which
 the console shows beside the gaze plot. It exists because "the dot is not
 moving" and "the webcam is aimed at the ceiling" look identical on a bare dot.
@@ -531,9 +554,9 @@ bad frames out of five no matter how wrong they are. Measured: a one-frame
 spike to 0.99 from a steady 0.50 moves the aim by 0.000.
 
 **Axis order matters.** The arbiter reads `/servo/gaze` as `s1 = msg.x`
-(TILT, range 5–75) and `s2 = msg.y` (PAN, range 80–100). The HUD used to send
-pan in `.x`, so each axis was clamped to the *other* axis's limits — pan to
-5–75 and tilt to 80–100. Both were pinned against a wall, which looked like
+(TILT, range 5-75) and `s2 = msg.y` (PAN, range 70-110). The HUD used to send
+pan in `.x`, so each axis was clamped to the *other* axis's limits - pan to
+5-75 and tilt to 70-110. Both were pinned against a wall, which looked like
 jerking.
 
 ---

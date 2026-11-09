@@ -140,11 +140,11 @@ The arbiter does four jobs:
 The others are silently ignored. They can't fight because they're not in the
 same lane.
 
-**2. Clamp.** Even if a controller asks for 5 m/s, the robot gets 0.25 m/s.
+**2. Clamp.** Even if a controller asks for 5 m/s, the robot gets 0.40 m/s.
 
 | Axis | Limit | Why |
 |---|---|---|
-| forward `vx` | 0.25 m/s | slow enough to react |
+| forward `vx` | 0.40 m/s | the console asks for 0.35; the cap sits above it |
 | sideways `vy` | 0.20 m/s | mecanum strafing is less stable |
 | spin `ωz` | 0.80 rad/s | ~46°/s |
 
@@ -236,27 +236,53 @@ zero. A crashed tracker can't leave the robot driving.
 
 ### Mode 3: EEG (the noisy one)
 
-The Muse 2 headband measures tiny voltages on your scalp. Four gestures:
+The Muse 2 headband measures tiny voltages on your scalp. Three gestures, and
+they are **toggles, not velocities**:
 
-| Gesture | Detected by | Command |
+| Gesture | Detected by | Effect |
 |---|---|---|
-| Jaw clench | muscle noise (EMG, 30–110 Hz) | `STOP` |
-| Double blink | two blink peaks 0.2–0.5 s apart | `GO` |
-| Look left | eye-movement spike + return spike | `LEFT` |
-| Look right | same, opposite direction | `RIGHT` |
+| Jaw clench | muscle noise (EMG, 30-110 Hz) | go / stop (`run`) |
+| Double blink | two blink peaks 0.2-0.5 s apart | steer robot <-> steer camera (`mode`) |
+| Eyebrow raise | forehead EMG | play a sound. No motion at all |
 
-**Why these four and not "think forward"?** Because real motor-imagery BCI
-needs training and is unreliable. Jaw clench and blinks produce signals
-*tens to hundreds of times larger* than brainwaves. It's pragmatic, not
-magical.
+**Why these and not "think forward"?** Because real motor-imagery BCI needs
+training and is unreliable. Jaw clench and blinks produce signals *tens to
+hundreds of times larger* than brainwaves. It is pragmatic, not magical.
 
-**The noise problem:** one misclassification shouldn't move the robot. So the
-bridge keeps the last 3 classifications and requires a **majority vote**.
-`STOP` bypasses the filter entirely — stopping is never delayed.
+**Why toggles and not velocities.** A headband classifier emits discrete
+events, not a continuous signal, so every missed or late packet was a wrong
+movement. Protocol v1 replaced velocities with three toggles plus a state block
+that is repeated in *every* packet - so a lost datagram is corrected by the
+next heartbeat within 0.5 s, and the two sides cannot drift apart.
 
-**Why `LEFT`/`RIGHT` rotate in place here:** the original project was written
-for an Ackermann (car-like) robot that can't turn on the spot, so it drove a
-1.5-second arc. Your M1 is mecanum — it can just spin. Simpler and safer.
+**The keyboard cannot be undone by a heartbeat.** Protocol v1 makes the
+*sender* authoritative, which is right for the headset and wrong for a keypress
+the sender knows nothing about: the next heartbeat put the state straight back
+and the key looked broken. The first fix was a five-second window, which is the
+wrong trigger - a connected but *idle* headset repeats one state forever, so
+every keypress was silently undone five seconds later, long after the operator
+had stopped watching. The rule is now: a packet identical to the sender's last
+report is a heartbeat and is ignored; a packet that differs is a real headset
+action and takes over at once. The headset can never be locked out, because the
+gesture that would take it back *is* a change.
+
+**Why the clench owns go/stop.** The gestures are assigned by how easily they
+can be *performed*, not by raw accuracy: the clench is the least tiring, and
+`run` is the toggle used several times a minute. An earlier version put the
+blink there on the theory that it was the most consistent; in practice the
+clench is easier to produce, and frequency of use matters more for a toggle
+than precision.
+
+**The noise problem is real and is not solved by filtering.** On this headset
+the classifier confuses a jaw clench with an eyebrow raise often enough that it
+reports `UNCLEAR_MUSCLE` and refuses to guess. That is why:
+
+* the eyebrow raise gets the only job where a misfire costs nothing (a sound)
+* every gesture also has a **keyboard key** - `N` for the clench, `B` for the
+  blink, `M` for the brow - and the console's gesture pad is clickable
+* the console shows which gesture the headset actually detected, so "it did
+  not see me" and "it saw me, and the robot is already in that state" are
+  distinguishable
 
 ---
 
@@ -701,9 +727,9 @@ it just freezes the window, which users report as "it hung".
 | Mecanum + PTZ teleop | servo round-trip verified `(60,70)` |
 | LiDAR Tmini Plus | **10.03 Hz**, 404 beams, 328 real returns |
 | USB camera | 30.8 fps capture → **20.2 Hz** throttled |
-| Arbiter + watchdog | **12/12 safety checks** |
+| Arbiter + watchdog | **Safety suite passes** |
 | Gaze control | zone mapping + PTZ verified |
-| EEG bridge | `GO` → 0.15 m/s, link-loss stop 0.88 s |
+| EEG bridge | protocol v1 toggles, link-loss stop on the 1.5 s timeout |
 | Gaze + EEG fusion | **5/5 priority tests** |
 | Two-way voice | 161/161 PCM packets, per-direction mute |
 | Container | hot-plug works, 0 zombies |
@@ -717,7 +743,7 @@ it just freezes the window, which users report as "it hung".
 | All streams | 20.20 / 10.02 / 10.59 / 20.91 Hz |
 | `slam_toolbox` | **78 occupied cells**, map 73×149 @ 5 cm |
 | Operator console | 6 panels, no layout defects, live camera |
-| Gaze calibration | **8/8 checks** |
+| Gaze calibration | **10-feature model, 4 postures** |
 
 ### ⚠️ Not yet confirmed
 
@@ -771,10 +797,16 @@ shift). That flat tail is the firmware clamp. With a centre of 90 this gives 90
 units of travel right but only 20 left — exactly the asymmetry that feels like
 "it turns further one way".
 
-Configured limits are therefore **`s1` 5..75** and **`s2` 80..100**. Pan is
-narrowed well inside the mechanical stop on purpose: a camera that swings ~90°
-loses the view straight ahead, and driving forward while blind is the dangerous
-failure. Tilt stays wide because looking down in front of the robot is useful.
+Configured limits are therefore **`s1` 5..75** and **`s2` 70..110** — the
+widest range that is symmetric about the centre of 90, since the firmware stops
+the pan dead at 110.
+
+It was narrowed to 80..100 (±10) for a while, on the theory that a camera
+swinging further would lose the view straight ahead. In practice ±10 is too
+little to look to the side, and the operator can see where the camera points
+from the video anyway. Symmetry matters more than the narrower cone did.
+
+Tilt stays wide because looking down in front of the robot is useful.
 
 ```bash
 ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
@@ -798,7 +830,7 @@ drift out of sync.
 ./m1.sh teleop
 ```
 
-Press `W`. The robot should creep forward at 0.20 m/s. Press `A` — it spins
+Press `W`. The robot should move forward at 0.35 m/s. Press `A` — it spins
 left. Press `Q` — it strafes sideways (this is the mecanum party trick).
 
 Press `SPACE` for E-STOP. **It should stop instantly and stay stopped** even if
@@ -984,7 +1016,7 @@ Everything else is detail.
 | | |
 |---|---|
 | Watchdog | **0.35 s** |
-| Max speed | **0.25 m/s** |
+| Max speed | **0.40 m/s** (console asks for 0.35) |
 | Scan rate | **10 Hz** |
 | Video rate | **20 Hz** |
 | Dwell (gaze) | **0.40 s** |

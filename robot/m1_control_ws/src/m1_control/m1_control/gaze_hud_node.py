@@ -45,7 +45,7 @@ from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, HistoryPolicy, QoSProfile,
                        ReliabilityPolicy)
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Float32, Float32MultiArray, String, UInt8
+from std_msgs.msg import (Bool, Float32, Float32MultiArray, String, UInt8)
 
 try:
     from m1_control.gaze_calib import apply as apply_calib
@@ -94,6 +94,10 @@ class GazeHUDNode(Node):
         # ---- parameters ----
         self.declare_parameter('camera_topic', '/image_throttled/compressed')
         self.declare_parameter('gaze_source', 'mediapipe')
+        #: Whether this node is allowed to DRIVE. Off by default: the motion
+        #: policy lives in gaze_control_node on the robot, next to the
+        #: watchdog, and two policies publishing /cmd_vel/gaze interleave.
+        self.declare_parameter('publish_motion', False)
         self.declare_parameter('webcam_id', 0)
         self.declare_parameter('dwell_time_sec', 0.40)
         # Deadzone radii, as a FRACTION OF THE CONTROL SPACE, not of a camera
@@ -197,6 +201,7 @@ class GazeHUDNode(Node):
         gp = self.get_parameter
         self.camera_topic = gp('camera_topic').value
         self.gaze_source = str(gp('gaze_source').value).lower()
+        self.publish_motion = bool(gp('publish_motion').value)
         self.dwell_threshold = float(gp('dwell_time_sec').value)
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
@@ -296,9 +301,17 @@ class GazeHUDNode(Node):
             history=HistoryPolicy.KEEP_LAST,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             depth=1)
+        latched_qos = mode_qos
 
-        self.vel_pub = self.create_publisher(Twist, '/cmd_vel/gaze', 10)
-        self.servo_pub = self.create_publisher(Vector3, '/servo/gaze', 10)
+        # Created only when this node is allowed to drive. An unused publisher
+        # is inert, but `ros2 topic info` counts it - and two publishers on
+        # /cmd_vel/gaze is exactly the symptom that sent me looking for a
+        # phantom second controller. The graph should not advertise an
+        # authority this node does not have.
+        self.vel_pub = (self.create_publisher(Twist, '/cmd_vel/gaze', 10)
+                        if self.publish_motion else None)
+        self.servo_pub = (self.create_publisher(Vector3, '/servo/gaze', 10)
+                          if self.publish_motion else None)
         self.mode_pub = self.create_publisher(UInt8, '/control_mode', mode_qos)
 
         # Publish the uncorrected gaze point so the operator console can
@@ -325,11 +338,32 @@ class GazeHUDNode(Node):
         # could not: the HUD drove /cmd_vel/gaze itself and never emitted
         # /gaze/point.
         self.point_pub = self.create_publisher(Point, '/gaze/point', 10)
+
+        # A remote mute for this node's gaze output.
+        #
+        # The HUD normally runs on the operator PC, and it publishes
+        # /gaze/point at camera rate. Anything that wants to inject its own
+        # points - the chain check, a replay tool, a second operator - has to
+        # be able to silence it, and it cannot be silenced with a signal
+        # because it is on a different machine. So it is a LATCHED topic: set
+        # it once, from anywhere, and it stays set.
+        #
+        # This is not only a test hook. Muting the tracker is a real
+        # requirement the moment anyone else is in front of the camera: the
+        # robot starts steering to THEIR eyes, and there is no way to stop it
+        # short of killing the node.
+        self.hud_enabled = True
+        self.create_subscription(Bool, '/gaze/hud_enable',
+                                 self._hud_enable_cb, latched_qos)
+        self.enable_state_pub = self.create_publisher(
+            Bool, '/gaze/hud_enabled_state', latched_qos)
+        self.create_timer(1.0, self._report_enabled)
         self.calib_state_pub = self.create_publisher(
             Float32MultiArray, '/gaze/calib_state', 10)
         # The console needs the zone to draw its overlay, and it should not
         # have to reimplement the dwell state machine to work it out.
-        self.zone_pub = self.create_publisher(String, '/gaze/zone', 10)
+        self.zone_pub = (self.create_publisher(String, '/gaze/zone', 10)
+                         if self.publish_motion else None)
         self.face_pub = self.create_publisher(
             CompressedImage, '/gaze/face', sensor_qos)
         # The deadzone and the head weight are the two numbers the operator has
@@ -385,6 +419,16 @@ class GazeHUDNode(Node):
         self.get_logger().info(
             f'Gaze HUD up | source={self.gaze_source} | dwell={self.dwell_threshold}s '
             f'| deadzone={self.deadzone_ratio:.0%} | feed={self.camera_topic}')
+        if self.publish_motion:
+            self.get_logger().warn(
+                'publish_motion=true - this node WILL drive /cmd_vel/gaze and '
+                '/servo/gaze. Make sure gaze_control_node is NOT also running: '
+                'two policies on one topic interleave and the robot turns or '
+                'does not turn depending on which one wins.')
+        else:
+            self.get_logger().info(
+                'display-only: this node publishes /gaze/point and draws the '
+                'overlay; gaze_control_node owns the motion policy.')
 
     # ------------------------------------------------------------------ setup
     def _find_camera(self):
@@ -831,6 +875,8 @@ class GazeHUDNode(Node):
         if now - self._last_servo < self._servo_period:
             return
         self._last_servo = now
+        if not self.publish_motion:
+            return
         # x = s1 = TILT, y = s2 = PAN. The arbiter reads it that way and the
         # hardware is wired that way; sending them crossed is what pinned both
         # axes against each other's limits.
@@ -843,6 +889,21 @@ class GazeHUDNode(Node):
         # able to take the robot away from the operator.
         if self.assert_mode and self.gaze_valid:
             self.mode_pub.publish(UInt8(data=MODE_GAZE))
+
+    def _hud_enable_cb(self, msg):
+        want = bool(msg.data)
+        if want != self.hud_enabled:
+            self.get_logger().info(
+                'gaze output ENABLED' if want else
+                'gaze output MUTED - this node will not publish /gaze/point')
+        self.hud_enabled = want
+        self._report_enabled()
+
+    def _report_enabled(self):
+        # Echo the state back on a latched topic, so whoever muted this node
+        # can CONFIRM it took effect instead of assuming it did. A mute that
+        # silently failed would look exactly like one that worked.
+        self.enable_state_pub.publish(Bool(data=bool(self.hud_enabled)))
 
     def _hud_tick(self):
         # ---- 1. ACQUIRE -------------------------------------------------
@@ -891,10 +952,11 @@ class GazeHUDNode(Node):
         # either of those again would shift them for no reason.
         if self.gaze_source == 'mediapipe':
             cu, cv = self._correct(su, sv)
-            pt = Point()
-            pt.x, pt.y = float(cu), float(cv)
-            pt.z = 0.0
-            self.point_pub.publish(pt)
+            if self.hud_enabled:
+                pt = Point()
+                pt.x, pt.y = float(cu), float(cv)
+                pt.z = 0.0
+                self.point_pub.publish(pt)
         else:
             cu, cv = su, sv
 
@@ -979,10 +1041,22 @@ class GazeHUDNode(Node):
                 elif zone == ZONE_TURN_RIGHT:
                     twist.angular.z = -self.turn_wz
 
-        self.vel_pub.publish(twist)
-        self.zone_pub.publish(String(data=self.confirmed_zone))
+        # Only ONE node may drive. The HUD predates gaze_control_node and used
+        # to BE the controller; keeping that code running next to the real one
+        # gives /cmd_vel/gaze, /servo/gaze and /gaze/zone two publishers each,
+        # and the arbiter then sees an interleaving of two independent policies
+        # with two independent dwell timers. Measured: the same steady look
+        # produced TURN_RIGHT and CENTER alternately, and the robot would turn
+        # or not turn depending on which node won the race.
+        #
+        # The HUD's job is to track the face, publish /gaze/point and draw the
+        # overlay. The policy belongs to gaze_control_node, on the robot, next
+        # to the watchdog. `publish_motion:=true` restores the old behaviour for
+        # anyone running the HUD with no robot-side control node.
+        if self.publish_motion:
+            self.vel_pub.publish(twist)
+            self.zone_pub.publish(String(data=self.confirmed_zone))
 
-        # ---- HUD ----
         overlay = frame.copy()
         cv2.ellipse(overlay, (cx, cy), (int(dz_rx), int(dz_ry)), 0, 0, 360,
                     (0, 200, 0), 2)
@@ -1094,7 +1168,10 @@ def main(args=None):
         pass
     finally:
         try:
-            node.vel_pub.publish(Twist())
+            # `vel_pub` is None in display-only mode, where this node never
+            # published a velocity and so has nothing to zero.
+            if node.vel_pub is not None:
+                node.vel_pub.publish(Twist())
         except Exception:  # noqa: BLE001 - context may already be gone
             pass
         node.destroy_node()

@@ -18,12 +18,18 @@ Checks
  3. Mode isolation: /cmd_vel/gaze is ignored in KEYBOARD mode
  4. Velocity clamping: an oversized request is capped at the envelope
  5. E-STOP latches: mode 0 keeps /cmd_vel at zero even with active input
- 6. EEG path: UDP GO -> /cmd_vel/eeg -> /cmd_vel forward motion
- 7. EEG link loss: stop heartbeating -> robot stops
+ 6. EEG bridge: reachable, and follows the state it is sent
+ 7. EEG link loss: stop heartbeating -> the link is reported down
+
+Tests 6 and 7 SKIP when a real EEG sender is connected: protocol v1 makes the
+sender authoritative, so a running headset overrides whatever this script sends
+and the result would be a false accusation against the bridge.
 """
 
 import json
+import os
 import socket
+import subprocess
 import sys
 import time
 
@@ -99,6 +105,30 @@ class Probe(Node):
 
 
 def main():
+    # Refuse to run alongside another copy.
+    #
+    # This script drives /control_mode through a scripted sequence. Two copies
+    # interleave their switches, so each one sees the other's E-STOP or
+    # KEYBOARD and reports failures that are entirely its own interference.
+    # Measured: two overlapping runs produced "mode 1 clears the E-STOP latch
+    # (|v|=0.000)" plus a burst of "8 mode changes in 50s" from the arbiter's
+    # churn detector - the arbiter was right, and the accusation was mine.
+    # A lock file, not pgrep: `pgrep -f validate_safety.py` also matches the
+    # `bash -c "python3 .../validate_safety.py"` wrapper that launched it, so
+    # it reports the caller as a competing copy and refuses to start.
+    import fcntl
+    lock_path = '/tmp/m1_validate_safety.lock'
+    lock_fh = open(lock_path, 'w')                      # noqa: SIM115
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f'ERROR: another validate_safety is already running '
+              f'({lock_path} is held).')
+        print('       Two copies fight over /control_mode and both report '
+              'false failures.')
+        lock_fh.close()
+        return 2
+
     rclpy.init()
     p = Probe()
     p.spin_for(1.5)
@@ -180,6 +210,31 @@ def main():
           f'|v|={p.magnitude():.3f}')
 
     print('\n=== 6. EEG UDP end-to-end (protocol v1) ===')
+
+    # Is a REAL sender already talking to the bridge?
+    #
+    # Protocol v1 makes the sender authoritative: every packet repeats the full
+    # state, so a running headset overrides anything this test sends and the ack
+    # comes back with the SENDER's state. The test then reports "the bridge does
+    # not follow the run flag", which is a false accusation - the bridge is
+    # following the sender exactly as designed.
+    #
+    # /eeg/link is latched and is TRUE only while packets are arriving, so
+    # reading it BEFORE sending anything is a reliable answer. Counting packets
+    # was tried first and is too racy: the real sender's 10 Hz heartbeat and
+    # this test's two sends interleave unpredictably.
+    from std_msgs.msg import Bool as _BoolLink
+    _link_seen = []
+    _qos = QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        history=HistoryPolicy.KEEP_LAST,
+        durability=DurabilityPolicy.TRANSIENT_LOCAL, depth=1)
+    p.create_subscription(_BoolLink, '/eeg/link',
+                          lambda m: _link_seen.append(bool(m.data)), _qos)
+    _end = time.time() + 1.5
+    while time.time() < _end:
+        rclpy.spin_once(p, timeout_sec=0.05)
+    real_sender = bool(_link_seen) and _link_seen[-1] is True
     # Protocol v1 carries TOGGLES plus a full state block, not velocities. The
     # bridge answers with an ack containing the state it now believes, so the
     # ack itself is the assertion - there is no /cmd_vel/eeg to watch.
@@ -207,12 +262,19 @@ def main():
     else:
         check('EEG bridge reachable on UDP :9000', True)
         st = reply.get('state', reply)
-        check('the bridge follows the run flag', st.get('run') is True,
-              str(st.get('run')))
-        check('the bridge follows the mode', st.get('mode') == 'robot',
-              str(st.get('mode')))
         check('the bridge reports a live link', st.get('link') is True,
               str(st.get('link')))
+
+        if real_sender:
+            print('  [SKIP] a real EEG sender is connected (link was already '
+                  'up)')
+            print('         its state overrides ours by design - stop it to '
+                  'test the bridge alone')
+        else:
+            check('the bridge follows the run flag', st.get('run') is True,
+                  str(st.get('run')))
+            check('the bridge follows the mode', st.get('mode') == 'robot',
+                  str(st.get('mode')))
 
         print('\n=== 7. EEG link watchdog ===')
         # Watch the LATCHED /eeg/link topic, not an ack. Asking the bridge
@@ -231,9 +293,13 @@ def main():
         end = time.time() + 3.0
         while time.time() < end:
             rclpy.spin_once(p, timeout_sec=0.05)
-        check('a silent link is reported as down',
-              seen and seen[-1] is False,
-              f'last /eeg/link = {seen[-1] if seen else "nothing"}')
+        if real_sender:
+            print('  [SKIP] a real sender keeps the link up, so the watchdog '
+                  'cannot be observed')
+        else:
+            check('a silent link is reported as down',
+                  seen and seen[-1] is False,
+                  f'last /eeg/link = {seen[-1] if seen else "nothing"}')
 
 
     p.set_mode(MODE_ESTOP)
@@ -244,6 +310,13 @@ def main():
     print(f' {len(results) - failed}/{len(results)} checks passed'
           + (f', \033[31m{failed} FAILED\033[0m' if failed else ' - all good'))
     print('=' * 58)
+
+    # Say what state the robot is being left in. E-STOP is the safe default,
+    # but silently leaving it latched makes the next session look broken: the
+    # keyboard does nothing and nothing says why.
+    print('\nRobot left in E-STOP (safe). Clear it by selecting a mode:')
+    print('  ros2 topic pub --once /control_mode std_msgs/msg/UInt8 "{data: 1}"')
+    print('  ...or just press 1 in the console.')
 
     p.destroy_node()
     rclpy.shutdown()

@@ -336,12 +336,15 @@ ros2 topic pub --once /Servo yahboomcar_msgs/msg/ServoControl "{s1: 40, s2: 90}"
 > tilt. Confirmed on this robot; see `docs/report.md` §10.
 >
 > **Ranges are measured, not guessed.** `s1` is configured **5..75** and `s2`
-> **80..100**. The measurement used the camera as the sensor: the head carries
+> **70..110**. The measurement used the camera as the sensor: the head carries
 > the camera, so a moving servo means a moving image. Pan was found to stop
 > dead at 110, which with a centre of 90 gives 90 units of travel one way and
-> only 20 the other — the asymmetry an operator notices immediately. Pan is now
-> deliberately narrowed to ±10 so the camera keeps the path ahead in view while
-> driving. See `docs/report.md` §10 for the full method and numbers.
+> only 20 the other - the asymmetry an operator notices immediately.
+>
+> 70..110 (±20) is the widest range that stays symmetric under that stop. It
+> was narrowed to ±10 for a while to keep the path ahead in view; in practice
+> that is too little to look to the side, so the full symmetric range is used.
+> See `docs/report.md` §10 for the full method and numbers.
 
 ### 9.3 Camera
 

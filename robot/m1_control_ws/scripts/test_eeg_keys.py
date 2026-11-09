@@ -138,14 +138,42 @@ def main():
     check('the suppressed packets are counted, not silently eaten',
           c5.kb_suppressed == 5, str(c5.kb_suppressed))
 
-    # The override must EXPIRE. A permanent one would let a stray keypress lock
-    # the headset out, and the operator would have no idea why their gestures
-    # stopped working.
+    # The override must NOT be on a timer. A connected-but-idle headset repeats
+    # one state forever; a five-second window therefore undid every keypress
+    # five seconds later, long after the operator had stopped watching. The
+    # correct trigger is the headset doing something NEW.
     c5.on_message({'v': 1, 'seq': 30,
                    'state': {'run': False, 'mode': 'robot', 'music': False}},
-                  now=101.0 + c5.kb_override_sec + 1.0)
-    check('the sender takes over again once the window expires',
-          c5.mode == MODE_ROBOT, c5.mode)
+                  now=101.0 + 300.0)
+    check('a heartbeat five minutes later still does not undo it',
+          c5.mode == MODE_CAMERA,
+          'a repeating packet is a liveness signal, not an instruction')
+
+    # ...but a packet that DIFFERS from what the sender last said is a real
+    # headset action, and takes over at once. This is what keeps the headset
+    # from being locked out: the gesture that would take it back is by
+    # definition a change.
+    c5.on_message({'v': 1, 'seq': 31,
+                   'state': {'run': False, 'mode': 'camera', 'music': True}},
+                  now=101.0 + 301.0)
+    check('a genuine sender change takes over immediately',
+          c5.mode == MODE_CAMERA and c5.music is True,
+          f'mode={c5.mode} music={c5.music}')
+
+    # A sender that adds a field it never sent before must not look like it
+    # changed something on every packet, or it would silently reclaim control
+    # from the keyboard 10 times a second.
+    c6 = EEGCore(link_timeout=1.5)
+    c6.on_message({'v': 1, 'seq': 1,
+                   'state': {'run': False, 'mode': 'robot', 'music': False}},
+                  now=1.0)
+    c6.inject_gesture('JAW_CLENCH', 2.0)
+    c6.on_message({'v': 1, 'seq': 2,
+                   'state': {'run': False, 'mode': 'robot', 'music': False,
+                             'battery': 91}},
+                  now=2.1)
+    check('an unknown extra state field is not mistaken for a change',
+          c6.run is True, 'run must still be on')
 
     # ---------------------------------------------- a real gesture still works
     print('\nand a real headset gesture still works the same way:')

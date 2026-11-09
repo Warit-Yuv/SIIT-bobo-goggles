@@ -256,16 +256,28 @@ class ControlArbiterNode(Node):
         # nothing like the cause.
         now = self.get_clock().now()
         self._mode_switch_times.append(now)
-        while (len(self._mode_switch_times) > 8 and
-               (now - self._mode_switch_times[0]).nanoseconds / 1e9 > 5.0):
-            self._mode_switch_times.pop(0)
+
+        # Keep only the switches inside the window, then judge by COUNT.
+        #
+        # This used to prune only while the list held more than eight entries,
+        # and only entries older than five seconds - so a list that had once
+        # reached nine entries never shrank again. From then on EVERY mode
+        # change logged "8 mode changes in 315.8s", which is a completely
+        # normal rate: eight switches over five minutes is a person pressing
+        # buttons, not a timer.
+        #
+        # A warning that fires on normal operation is worse than no warning:
+        # it trains the operator to ignore the one case it exists to catch.
+        window = 5.0
+        self._mode_switch_times = [
+            t for t in self._mode_switch_times
+            if (now - t).nanoseconds / 1e9 <= window]
 
         if len(self._mode_switch_times) >= 6:
             self.get_logger().error(
-                f'{len(self._mode_switch_times)} mode changes in '
-                f'{(now - self._mode_switch_times[0]).nanoseconds / 1e9:.1f}s '
-                f'- something is asserting /control_mode on a timer. '
-                f'Check for a gaze/EEG node with assert_mode:=true.')
+                f'{len(self._mode_switch_times)} mode changes in under '
+                f'{window:.0f}s - something is asserting /control_mode on a '
+                f'timer. Check for a gaze/EEG node with assert_mode:=true.')
 
         # Stop first, then switch. Never leave a stale setpoint behind.
         self.cmd_vel_pub.publish(Twist())

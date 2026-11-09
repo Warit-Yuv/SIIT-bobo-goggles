@@ -105,8 +105,25 @@ def launch_setup(context, *args, **kwargs):
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument('gaze', default_value='true',
-                              choices=['true', 'false']),
+        # FALSE by default, because the console owns the gaze HUD.
+        #
+        # The console's "Start gaze" button launches it with the camera the
+        # operator picked and the source they chose. If this launch also starts
+        # one, there are two trackers on one machine: two processes opening
+        # webcams (which fail, because a camera opens exclusively), two
+        # publishers on /gaze/point and two on /servo/gaze, so the head gets
+        # commands from both and the point flickers between two estimates.
+        #
+        # Measured: `ps` showed two gaze_hud_node processes, one from 02:14
+        # (console) and one from 02:21 (this launch), both running.
+        #
+        # Pass gaze:=true only when running WITHOUT the console.
+        DeclareLaunchArgument('gaze', default_value='false',
+                              choices=['true', 'false'],
+                              description='Start a gaze HUD here. Leave false '
+                                          'when the console is driving it - '
+                                          'two HUDs fight over the camera and '
+                                          'the servo topics.'),
         DeclareLaunchArgument('camera_topic',
                               default_value='/image_throttled/compressed'),
         DeclareLaunchArgument('gaze_source', default_value='mediapipe',

@@ -4,7 +4,9 @@
 **Operator PC:** `Rescue-Ubuntu` VMware VM — **`10.0.0.102`**
 **ROS 2 Humble** inside Docker container `ros-humble-dev` — **`ROS_DOMAIN_ID=30`**
 **Date:** 2026-11-08
-**Status:** Robot side complete and validated. 12/12 safety checks pass.
+**Status:** Robot side complete and validated. The safety suite
+(`scripts/validate_safety.py`) passes on hardware, and the full control chain
+(`scripts/check_chain.py`) has been verified eyes-to-wheels.
 
 > **This document is an engineering report**, not a procedure: it records what
 > was built, what broke, and the measured evidence for each claim.
@@ -24,16 +26,18 @@ implemented, built and validated against real hardware:
 | Servo axis mapping | **Working** | `s1`=tilt, `s2`=pan — confirmed by hand (§10) |
 | YDLIDAR Tmini Plus | **Working** | 10.03 Hz `/scan`, 360°, 328 real returns |
 | USB camera 640×480 | **Working** | 30.8 Hz capture, throttled to 20.0 Hz |
-| Control arbiter + watchdog | **Working** | 12/12 safety checks, stop in 0.38 s |
+| Control arbiter + watchdog | **Working** | Safety suite passes; watchdog stops in 0.03 s |
 | Gaze control pipeline | **Working** | Zone mapping + PTZ axes verified |
-| EEG UDP bridge | **Working** | `GO`→vx 0.15, link-loss stop in 0.88 s |
+| EEG UDP bridge | **Working** | Protocol v1 toggles + state, verified end-to-end |
+| Gaze calibration | **Working** | 10-feature ridge model, 4 postures, 8x better held-out |
+| EEG keyboard fallback | **Working** | B / N / M keys and a clickable gesture pad |
 | SLAM (`slam_toolbox`) on VM | **Working** | 78 occupied cells, map 73×149 @ 5 cm |
 | Cross-machine DDS | **Working** | Unicast peers, 20.2 Hz video Pi→VM (§7.14) |
 | start / stop / restart | **Working** | Two consecutive cycles, 0 leftovers |
 | Two-way voice relay | **Working** | 161/161 PCM packets, per-direction mute |
 | GAZE+EEG fusion mode | **Working** | 5/5 priority tests (gaze steers, EEG stops) |
 | Operator console (PyQt5) | **Working** | 6 panels, in-window teleop, gaze calibration |
-| Gaze calibration | **Working** | 8/8 checks, 5-point offset+gain fit |
+| Gaze calibration | **Working** | 10-feature ridge model, 4 postures, 8x better held-out |
 
 **Twenty defects were found and fixed during validation**, and one more is
 recorded as a documented failure (§7.17) because the fix looked correct and made
@@ -186,9 +190,14 @@ Everything stateful lives on the host, so the container is disposable:
     │   ├── m1_control/
     │   │   ├── control_arbiter_node.py    # safety core
     │   │   ├── wasd_teleop_node.py        # WASD+QE / IJKL
+    │   │   ├── gaze_tracker.py            # frame -> 10 features
+    │   │   ├── gaze_model.py              # features -> screen point
     │   │   ├── gaze_control_node.py       # deadzone + dwell policy
     │   │   ├── gaze_udp_bridge.py         # UDP gaze -> /gaze/point
-    │   │   ├── eeg_udp_bridge.py          # UDP EEG -> /cmd_vel/eeg
+    │   │   ├── gaze_hud_node.py           # webcam tracker + HUD (PC, display-only)
+    │   │   ├── eeg_udp_bridge.py          # UDP EEG -> /eeg/run|mode|link
+    │   │   ├── sound_player_node.py       # eyebrow raise -> a sound
+    │   │   ├── m1_console.py              # operator GUI (PC)
     │   │   ├── image_throttle_node.py     # 30 Hz -> 20 Hz
     │   │   └── sensor_sync_node.py        # camera+scan pairing (PC)
     │   ├── launch/
@@ -210,7 +219,8 @@ Everything stateful lives on the host, so the container is disposable:
 |---|---|---|
 | `control_arbiter_node` | **Pi** | Mode mux, clamping, 350 ms watchdog |
 | `wasd_teleop_node` | Pi (TTY) | Keyboard mecanum + PTZ |
-| `eeg_udp_bridge` | **Pi** | UDP :9000 → `/cmd_vel/eeg`, `/eeg/stop` |
+| `eeg_udp_bridge` | **Pi** | UDP :9000 → `/eeg/run`, `/eeg/mode`, `/eeg/gesture` |
+| `sound_player_node` | **Pi** | Eyebrow raise → random file from `/home/pi/sound` |
 | `gaze_udp_bridge` | **Pi** | UDP :9100 → `/gaze/point`, with calibration |
 | `gaze_control_node` | **Pi** | Deadzone/dwell → `/cmd_vel/gaze` |
 | `image_throttle_node` | **Pi** | 30 Hz → 20 Hz compressed |
@@ -218,7 +228,7 @@ Everything stateful lives on the host, so the container is disposable:
 | `m1_console` | **PC** | Operator GUI (PyQt5) |
 | `m1_panel` | PC | Small always-on-top mode/battery panel |
 | `sensor_sync_node` | PC | `ApproximateTimeSynchronizer` camera+scan |
-| `gaze_hud_node` | PC | Local-webcam HUD + overlay |
+| `gaze_hud_node` | PC | Local-webcam tracker + HUD overlay. **Display-only**: it publishes `/gaze/point`, not motion |
 
 ---
 
@@ -248,14 +258,21 @@ default multicast over Wi-Fi it measured **2.6 Hz** — see §7.14.
 | `/control_mode` | `UInt8` | 0=E-STOP, 1=KEYBOARD, 2=GAZE, 3=EEG, 4=GAZE+EEG |
 | `/Buzzer` | `Bool` | **Latches** — see §7.7 |
 | `/audio/enable`, `/audio/mic`, `/audio/speaker` | `Bool` | Voice relay control |
-| `/gaze/calib` | `Float32MultiArray` | `[offset_x, offset_y, gain_x, gain_y]` |
+| `/gaze/calib` | `Float32MultiArray` | Legacy offset/gain. A real model travels as `~/gaze_calibration.json` |
+| `/gaze/features` | `Float32MultiArray` | The 10 tracker features, for calibration |
+| `/eeg/simulate` | `String` | Keyboard fallback: apply a gesture as if the headset sent it |
+| `/servo/actual` | `Vector3` | Where the head is, latched. Lets the PC follow gaze-driven motion |
 
 ### Internal (arbiter inputs)
 
 | Topic | Type |
 |---|---|
-| `/cmd_vel/keyboard`, `/cmd_vel/gaze`, `/cmd_vel/eeg` | `Twist` |
+| `/cmd_vel/keyboard`, `/cmd_vel/gaze` | `Twist` |
 | `/servo/keyboard`, `/servo/gaze` | `Vector3` |
+| `/eeg/run`, `/eeg/music`, `/eeg/link` | `Bool` (latched) |
+| `/eeg/mode`, `/eeg/gesture` | `String` (latched) |
+| `/gaze/hud_enable` | `Bool` (latched) - mute the HUD's gaze output |
+| `/gaze/hud_enabled_state` | `Bool` (latched) - what the HUD actually did |
 | `/gaze/point` | `Point` (u,v ∈ 0..1) |
 | `/gaze/raw` | `Point` (uncorrected, `z`=valid) |
 | `/gaze/calib_state` | `Float32MultiArray` |
@@ -1110,7 +1127,7 @@ ros2 run m1_control gaze_control_node
 
 # EEG (laptop sends to :9000)
 ros2 run m1_control eeg_udp_bridge
-python3 scripts/test_eeg_udp.py --ip 127.0.0.1 --sequence   # no headset needed
+python3 scripts/eeg_ping.py --host 127.0.0.1 --run on       # no headset needed
 ```
 
 ### GAZE+EEG fusion (mode 4)
@@ -1122,25 +1139,41 @@ is good at.
 
 | Input | Effect in FUSION |
 |---|---|
-| Gaze | steers the robot continuously |
-| EEG **STOP** (jaw clench) | halts immediately, outranks gaze |
-| EEG turn / strafe | takes over briefly as an override |
-| EEG **REST** (zero) | **ignored** — gaze stays in charge |
-| Keyboard | wins for 0.4 s in any mode |
+| Gaze | steers the robot continuously (left / right only - vertical is disabled) |
+| **Jaw clench** | toggles `run`: the gate that lets gaze drive at all |
+| **Double blink** | switches `mode`: `robot` (gaze steers the wheels) or `camera` (gaze steers the head) |
+| **Eyebrow raise** | plays a sound. No motion at all - the only gesture where a misfire is free |
+| Keyboard | wins for 0.4 s in any mode, including `B` / `N` / `M` |
 
-The distinction between EEG STOP and EEG REST is the whole safety story. Both
-produce a zero `Twist` on `/cmd_vel/eeg`, so the bridge raises `/eeg/stop` only
-for a genuine clench. Without that, the robot would stutter every time the
-classifier rested.
+The gestures are assigned by how easily they can be PERFORMED, not by raw
+accuracy: the clench is the least tiring, so it owns the toggle used several
+times a minute. An earlier version had the blink on `run` on the theory that it
+was the most consistent; in practice the clench is easier to produce, and
+frequency of use matters more for a toggle than precision.
 
-Validation — 5/5 priority tests:
+The safety story is now the RUN GATE rather than a stop signal. Protocol v1
+sends toggles plus a full state block, so there is no zero-velocity "rest"
+state to confuse with a deliberate stop: `run` is either on or off, the sender
+repeats it in every packet, and a lost packet is corrected by the next one.
+
+Three things can still stop the robot, in order of precedence:
+
+| Condition | Result |
+|---|---|
+| Mode 0 (E-STOP) | holds zero, latched until another mode is selected |
+| `run` off | gaze cannot drive, so the wheels stay still |
+| No state for 4x the link timeout while `run` is on | stops, and logs that the bridge probably died |
+
+Validation (`scripts/check_chain.py`, on the real robot):
 
 | Test | Result |
 |---|---|
-| Gaze alone steers | `vx = 0.20` |
-| EEG STOP halts | `vx = 0.00` |
-| STOP released resumes | `vx = 0.20` |
-| Keyboard overrides | `vx = -0.12` |
+| EEG link up | `link = True` |
+| `run` off blocks gaze | `|v| = 0.000` |
+| `run` on lets gaze drive | `wz = -0.60` looking right |
+| Looking left turns the other way | `wz = +0.60` |
+| Centre stops it | `|v| = 0.000` |
+| Camera mode holds the wheels | `|v| = 0.000` |
 | Keyboard released resumes | `vx = 0.20` |
 
 ### Operator console (on the PC)

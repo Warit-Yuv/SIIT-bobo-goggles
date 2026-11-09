@@ -302,6 +302,11 @@ the calibration workflow changes.
 >
 > `gaze_hud_node` (the alternative below) is a plain OpenCV window with no
 > calibration UI. Use §7.1 if you want the calibration workflow.
+>
+> It is **display-only**: it publishes `/gaze/point` and draws the overlay, and
+> the motion policy stays in `gaze_control_node` on the robot. Running both as
+> controllers puts two publishers on `/cmd_vel/gaze` and the robot turns or does
+> not turn depending on which one wins.
 
 ### 7.1 Option A — GazeModel natively on Windows (recommended)
 
@@ -661,7 +666,7 @@ Safety envelope enforced by the arbiter on the robot:
 
 | Axis | Limit |
 |---|---|
-| `vx` | ±0.25 m/s |
+| `vx` | ±0.40 m/s |
 | `vy` | ±0.20 m/s |
 | `ωz` | ±0.80 rad/s |
 | Watchdog | 0.35 s |
@@ -710,7 +715,7 @@ ros2 topic hz /scan
 - [ ] `slam_toolbox_m1.yaml` produces `/map`
 - [ ] Gaze reaches `/gaze/point` (either transport)
 - [ ] Pan/tilt direction confirmed (set `invert_*` if needed)
-- [ ] EEG `GO`/`STOP` verified with `test_eeg_udp.py`
+- [ ] EEG jaw clench toggles run, verified with `scripts/eeg_ping.py`
 
 ---
 

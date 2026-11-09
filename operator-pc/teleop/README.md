@@ -59,7 +59,7 @@ by the override check rather than being treated as input.
 
 ### 4. Respect the envelope
 
-The arbiter clamps to `vx ≤ 0.25 m/s`, `vy ≤ 0.20 m/s`, `ωz ≤ 0.80 rad/s`, so
+The arbiter clamps to `vx ≤ 0.40 m/s`, `vy ≤ 0.20 m/s`, `ωz ≤ 0.80 rad/s`, so
 larger values are silently reduced rather than rejected. Servo limits are ROS
 parameters (`servo_s1_min/max`, `servo_s2_min/max`) — read them, do not
 hard-code them. A private copy is exactly the bug in `robot/docs/report.md`
