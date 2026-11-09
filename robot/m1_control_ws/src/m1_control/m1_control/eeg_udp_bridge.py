@@ -263,6 +263,33 @@ class EEGCore:
 
             return note
 
+    def inject_gesture(self, gesture, now):
+        """Apply a gesture that did NOT come from the headset.
+
+        This is the keyboard fallback: when the EEG classifier is unusable, the
+        operator can still drive the same three toggles from the console. It
+        goes through the SAME toggle code as a real gesture, so the two paths
+        cannot drift apart - a fallback that behaves differently from the thing
+        it is standing in for is not a fallback.
+
+        Deliberately does NOT touch `link_ok`. Marking the link up would make
+        the bridge's own watchdog force `run` back off one timeout later, so a
+        single keypress would start the robot and then stop it again with no
+        explanation. The keyboard is a local input, not a remote link.
+        """
+        with self.lock:
+            gesture = str(gesture or '').strip().upper()
+            command = GESTURE_COMMANDS.get(gesture, '')
+            if not command:
+                self.dropped += 1
+                return None
+            self.last_msg = now
+            self.last_gesture = gesture
+            self.last_command = command
+            self.gesture_seq += 1
+            self._apply_toggle(command, now)
+            return '%s -> %s (keyboard)' % (gesture, command)
+
     def _apply_toggle(self, command, now):
         if command == TOGGLE_RUN:
             self.run = not self.run
@@ -389,13 +416,31 @@ def run_ros(args, core):
                 String, '/eeg/gesture', qos)
             self.link_pub = self.create_publisher(Bool, '/eeg/link', qos)
 
+            # Keyboard fallback. The console publishes a gesture name here and
+            # this bridge applies it exactly as if the headset had reported it.
+            # Routing it through the bridge rather than publishing /eeg/run
+            # directly keeps ONE owner of the EEG state: two publishers on a
+            # latched topic would both be "true" to a subscriber, and the last
+            # writer would win in a way nobody could predict.
+            self.create_subscription(String, '/eeg/simulate',
+                                     self._simulate_cb, 10)
+
             self._prev = None
             self._prev_gesture = 0
+            self._last_beat = 0.0
             self.create_timer(1.0 / args.rate, self.tick)
             self.get_logger().info(
                 f'EEG bridge (protocol v{PROTOCOL_VERSION}) | UDP :{args.port} | '
                 f'link timeout {core.link_timeout}s | '
                 f'blink=TOGGLE_RUN  jaw=TOGGLE_MODE  brow=TOGGLE_MUSIC')
+
+        def _simulate_cb(self, msg):
+            note = core.inject_gesture(msg.data, time.monotonic())
+            if note is None:
+                self.get_logger().warn(
+                    f'ignoring unknown simulated gesture "{msg.data}"')
+            else:
+                self.get_logger().info(f'[keyboard] {note}')
 
         def tick(self):
             now = time.monotonic()
@@ -411,12 +456,23 @@ def run_ros(args, core):
                 if st['last'] and not st['last'].startswith('/'):
                     self.gesture_pub.publish(String(data=st['last']))
             cur = (st['run'], st['mode'], st['music'], st['link'])
-            if cur != self._prev:
+            # Republish on every change, AND once a second regardless.
+            #
+            # The periodic repeat is not redundant. These topics are latched,
+            # so a subscriber that joins later already sees the current value -
+            # but a subscriber has no way to tell "the value has not changed"
+            # from "the publisher has died", and those need very different
+            # responses. The repeat gives them a heartbeat.
+            changed = cur != self._prev
+            beat = now - self._last_beat >= 1.0
+            if changed or beat:
+                self._last_beat = now
                 self._prev = cur
                 self.run_pub.publish(Bool(data=st['run']))
                 self.mode_pub.publish(String(data=st['mode']))
                 self.music_pub.publish(Bool(data=st['music']))
                 self.link_pub.publish(Bool(data=st['link']))
+            if changed:
                 self.get_logger().info(
                     f"EEG state  run={'ON' if st['run'] else 'off'}  "
                     f"mode={st['mode']}  music={'on' if st['music'] else 'off'}  "

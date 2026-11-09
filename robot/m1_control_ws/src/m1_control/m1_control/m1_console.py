@@ -94,6 +94,28 @@ except ImportError:  # run as a plain script rather than through ros2 run
 MODE_NAMES = {0: 'E-STOP', 1: 'KEYBOARD', 2: 'GAZE', 3: 'EEG', 4: 'GAZE+EEG'}
 MODE_KEYS = {'0': 0, '1': 1, '2': 2, '3': 3, '4': 4}
 
+#: Keyboard stand-ins for the three EEG gestures.
+#:
+#: The EEG classifier on this headset confuses jaw clench with eyebrow raise
+#: often enough that it reports UNCLEAR_MUSCLE and refuses to guess. When that
+#: happens the operator is left with no way to say "go", "switch what gaze
+#: steers", or "play a sound" - so the same three actions get a key each.
+#:
+#: The letters are chosen to be mnemonic in the same way as the pad labels:
+#:   B  BLINK   -> go / stop
+#:   N  jaw     -> switch what gaze steers  (N is for "next", the nearest free
+#:                key - J and K are already tilt, L is pan, M is music)
+#:   M  MUSIC   -> play a sound
+#:
+#: They are not the pad's own letters on purpose: BLINK/JAW/BROW would collide
+#: with nothing, but B/N/M is what the operator's hands already expect from the
+#: W/S/Q/E/A/D/I/K/J/L/U cluster.
+EEG_KEYS = {
+    'b': 'DOUBLE_BLINK',
+    'n': 'JAW_CLENCH',
+    'm': 'EYEBROW_RAISE',
+}
+
 #: Keyboard drive keys -> (Twist group, axis, value). m/s and rad/s.
 #:
 #: These are the values the console ASKS for. The arbiter caps them at
@@ -274,6 +296,11 @@ class ConsoleNode(Node):
 
         self.mode_pub = self.create_publisher(UInt8, '/control_mode', mode_qos)
         self.vel_pub = self.create_publisher(Twist, '/cmd_vel/keyboard', 10)
+        # Keyboard stand-ins for the EEG gestures. The bridge owns /eeg/run,
+        # /eeg/mode and /eeg/music, so this does NOT publish them directly -
+        # it asks the bridge to apply the gesture, and the bridge does exactly
+        # what it would have done for the headset. One owner, one behaviour.
+        self.eeg_sim_pub = self.create_publisher(String, '/eeg/simulate', 10)
         self.servo_pub = self.create_publisher(Vector3, '/servo/keyboard', 10)
         self.audio_en_pub = self.create_publisher(Bool, '/audio/enable', 10)
         # Named for the ROBOT's hardware. The old /audio/mic and
@@ -3036,6 +3063,7 @@ def main(args=None):
             hints = QtWidgets.QLabel(
                 'W/S forward · Q/E strafe · A/D rotate\n'
                 'I/K tilt · J/L pan · U centre\n'
+                'B blink · N jaw · M brow  (EEG without the headset)\n'
                 '0–4 mode · Space stop · Ctrl+Q quit')
             hints.setObjectName('dim')
             right.addWidget(hints)
@@ -3953,6 +3981,11 @@ def main(args=None):
                 # paths drifted apart before.
                 self._choose_mode(MODE_KEYS[text])
                 return
+            if text in EEG_KEYS and not (
+                    event.modifiers() & (QtCore.Qt.ControlModifier
+                                         | QtCore.Qt.AltModifier)):
+                self._eeg_key(EEG_KEYS[text])
+                return
             if key == QtCore.Qt.Key_Space:
                 self._estop()
                 return
@@ -3990,6 +4023,17 @@ def main(args=None):
                 node.centre_servo()
                 return
             super().keyPressEvent(event)
+
+        def _eeg_key(self, gesture):
+            """Ask the bridge to apply an EEG gesture, as if the headset did.
+
+            Routing through the bridge rather than publishing /eeg/run here
+            keeps the fallback honest: it exercises the SAME toggle logic and
+            the same downstream topics, so if B works then a double blink works
+            and vice versa. Two independent paths would let one rot unnoticed.
+            """
+            self.eeg_sim_pub.publish(String(data=gesture))
+            self.logline(f'EEG (keyboard): {gesture}')
 
         def _apply_drive(self):
             """Rebuild the velocity command from the keys that are DOWN.

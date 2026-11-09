@@ -211,10 +211,16 @@ class GazeControlNode(Node):
         # bridge cannot make the robot drive.
         self.eeg_run = False
         self.eeg_mode = 'camera'
+        #: True once ANY source has stated a run value - the EEG, or the
+        #: keyboard fallback. Until then the run gate is not applied at all,
+        #: because a gate nobody has ever set would block a robot that has no
+        #: headset attached (the "nothing works and nothing says why" trap).
+        self.run_ever_set = False
         self.eeg_link = False
         self.eeg_last = 0.0
         self.eeg_ever_seen = False
         self._warned_no_eeg = False
+        self._warned_dead_bridge = False
 
         # ---------------- interfaces ----------------
         actuator_qos = QoSProfile(
@@ -272,6 +278,7 @@ class GazeControlNode(Node):
 
     # ------------------------------------------------------------ EEG state
     def _eeg_run_cb(self, msg):
+        self.run_ever_set = True
         if bool(msg.data) != self.eeg_run:
             self.get_logger().info(
                 f"EEG run {'ON' if msg.data else 'off'} "
@@ -320,19 +327,32 @@ class GazeControlNode(Node):
         """
         if not self.use_eeg_gating:
             return True
-        if self.eeg_ever_seen:
-            if (not self.eeg_link
-                    or now - self.eeg_last > self.eeg_link_timeout):
+
+        # A DEAD BRIDGE must never leave the robot driving. The bridge repeats
+        # its state once a second, so silence means the process is gone - which
+        # a latched topic alone can never reveal, because "unchanged" and
+        # "publisher died" look identical to a subscriber.
+        if self.run_ever_set and self.eeg_run:
+            stale = now - self.eeg_last
+            if stale > max(4.0, 4.0 * self.eeg_link_timeout):
+                if not self._warned_dead_bridge:
+                    self._warned_dead_bridge = True
+                    self.get_logger().error(
+                        f'No EEG state for {stale:.1f}s while run is ON - '
+                        f'stopping. The bridge has probably died.')
                 return False
-            return self.eeg_run and self.eeg_mode == 'robot'
-        # No EEG has ever connected: gaze alone is in charge.
-        if not self._warned_no_eeg:
-            self._warned_no_eeg = True
-            self.get_logger().warn(
-                'No EEG link has ever been seen - gaze is driving the chassis '
-                'without the jaw-clench run gate. Start the EEG bridge, or set '
-                'use_eeg_gating:=false to silence this.')
-        return True
+
+        if not self.run_ever_set:
+            # Nobody has ever said go or stop: gaze alone is in charge.
+            if not self._warned_no_eeg:
+                self._warned_no_eeg = True
+                self.get_logger().warn(
+                    'No run command has ever been received - gaze is driving '
+                    'the chassis ungated. Press B in the console (or double '
+                    'blink) to take control of go/stop.')
+            return True
+
+        return self.eeg_run and self.eeg_mode == 'robot' 
 
     def _classify(self, dx, dy, deadzone_r):
         """Map an offset from centre to a control zone.
