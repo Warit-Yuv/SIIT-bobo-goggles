@@ -71,6 +71,31 @@ def run_ros(hold):
     # That is a test-isolation bug, not a controller bug: the same code passes
     # when run alone. Turning the gate off makes the test deterministic and
     # keeps it testing what it is named after.
+    # This test needs EXCLUSIVE use of /cmd_vel/gaze.
+    #
+    # It reads the topic to see what the controller under test produced. If the
+    # robot stack is running there is already a gaze_control_node publishing to
+    # the same topic, and the reading becomes "whichever node published last" -
+    # which is the robot's gated zero as often as it is the test's turn
+    # command. The result is a test that passes alone and fails in a batch, for
+    # a reason that has nothing to do with the code it names.
+    #
+    # Skipping is the honest answer: the precondition is "nothing else is
+    # driving", and that is not something the test can arrange for itself.
+    probe = rclpy.create_node('gaze_test_probe')
+    existing = [i for i in probe.get_publishers_info_by_topic('/cmd_vel/gaze')
+                if i.node_name != 'gaze_control_node']
+    if existing:
+        print(f'  [SKIP] {len(existing)} other publisher(s) on '
+              f'/cmd_vel/gaze - stop the robot stack first:')
+        for i in existing:
+            print(f'         {i.node_name}')
+        probe.destroy_node()
+        node.destroy_node()
+        rclpy.try_shutdown()
+        return 0
+    probe.destroy_node()
+
     control = gcn.GazeControlNode()
     control.use_eeg_gating = False
     executor = rclpy.executors.SingleThreadedExecutor()
