@@ -107,6 +107,22 @@ gaze_control_node:
     enable_strafe: true
     gaze_link_timeout_sec: 0.6
 
+    # Forward is reachable by looking UP, even though vertical STEERING stays
+    # off (enable_vertical: false).
+    #
+    # Without this the controller could only ever return CENTER, TURN_LEFT or
+    # TURN_RIGHT, so the robot turned and stopped and never advanced - and the
+    # comment claiming the jaw clench handled forward was wrong, because the
+    # clench toggles `run`, which commands no velocity.
+    #
+    # The rule is asymmetric on purpose: UP drives forward, DOWN does nothing,
+    # so a glance at a keyboard cannot reverse the robot. The scale widens the
+    # vertical threshold and forward_dwell_sec makes it slower to engage than a
+    # turn, so it takes a deliberate look.
+    enable_forward_gaze: true
+    forward_deadzone_scale: 1.6
+    forward_dwell_sec: 0.80
+
     drive_speed_x: 0.20
     drive_speed_y: 0.20
     turn_speed_z: 0.60

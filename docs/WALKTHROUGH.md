@@ -208,20 +208,25 @@ You look at the screen; the robot reacts. But raw gaze is unusable:
 
 If you mapped gaze straight to motion, the robot would jerk randomly.
 
-**The fix — a two-zone scheme:**
+**The fix — a deadzone, plus one asymmetric exception:**
 
 ```
 ┌─────────────────────────────────────────┐
-│   TURN LEFT  │   FORWARD   │ TURN RIGHT │
-│──────────────┼─────────────┼────────────│
-│              │   ╭─────╮   │            │
-│  STRAFE LEFT │   │ DEAD│   │STRAFE RIGHT│
-│              │   │ ZONE│   │            │
-│              │   ╰─────╯   │            │
-│──────────────┼─────────────┼────────────│
-│              │  BACKWARD   │            │
+│             FORWARD (look up)           │
+│                                         │
+│   TURN LEFT   ╭─────────╮   TURN RIGHT  │
+│               │ DEADZONE│               │
+│               ╰─────────╯               │
+│                                         │
+│        (looking down does nothing)      │
 └─────────────────────────────────────────┘
 ```
+
+The picture the code actually implements is simpler than the 8-sector one this
+walkthrough used to show, and the difference matters: the 8-sector version was
+only reachable with `enable_vertical` on, which it is not, so in practice the
+robot could turn and stop and **never go forward**. The diagram promised
+FORWARD and BACKWARD that no input could produce.
 
 **Inside the circle (deadzone, 25% of half-screen):** the wheels stay still.
 Gaze offsets move the **camera head** instead. So you can look around the room
@@ -230,6 +235,14 @@ without the robot moving. This is the "free look" behaviour.
 **Outside the circle:** the direction you look becomes a drive command — but
 only after you **hold it for 0.40 seconds**. That dwell timer is what rejects
 saccades. A glance doesn't move the robot; a deliberate look does.
+
+**Forward is the one vertical exception.** Look **up** and hold it for 0.80 s
+and the robot drives forward. Look **down** and nothing happens at all. That
+asymmetry is the whole safety argument: vertical gaze is too noisy to choose
+between forward, backward and strafe, but a rule that can only ever produce
+"forward" cannot produce the dangerous direction by accident, so a glance at a
+keyboard can never reverse the robot. Forward also needs a wider look than a
+turn (1.6x the threshold) and twice the dwell, so it takes a deliberate act.
 
 And a third safety: if gaze data stops arriving for 0.6 s, velocity goes to
 zero. A crashed tracker can't leave the robot driving.

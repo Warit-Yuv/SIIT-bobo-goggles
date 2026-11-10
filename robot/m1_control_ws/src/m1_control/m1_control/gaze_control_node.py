@@ -123,6 +123,28 @@ class GazeControlNode(Node):
         # dependable than looking up.
         self.declare_parameter('enable_vertical', False)
 
+        # ---- forward, without a usable vertical STEERING axis ----
+        #
+        # `enable_vertical` false used to mean the robot could not go forward
+        # at all. `_classify` could only return CENTER, TURN_LEFT or
+        # TURN_RIGHT, so the only motion gaze could ever produce was rotation -
+        # and the comment above claimed the jaw clench covered forward, which
+        # was simply wrong: the clench toggles `run`, and `run` commands no
+        # velocity, it only decides whether gaze is ALLOWED to command one.
+        #
+        # Turning vertical STEERING back on is still wrong - the axis is too
+        # noisy to choose between forward, backward and strafe. What is safe is
+        # a deliberately ASYMMETRIC rule: look UP for forward, and DOWN does
+        # nothing at all. That removes the hazard that made vertical unsafe
+        # (a glance down at a keyboard reversing the robot) while making
+        # forward reachable.
+        #
+        # The threshold is wider than the turning one and the dwell is longer,
+        # so forward takes a more deliberate look than a turn does.
+        self.declare_parameter('enable_forward_gaze', True)
+        self.declare_parameter('forward_deadzone_scale', 1.6)
+        self.declare_parameter('forward_dwell_sec', 0.80)
+
         # ---- EEG gating (protocol v1 toggles) ----
         #
         #   run=false            nothing moves
@@ -171,6 +193,9 @@ class GazeControlNode(Node):
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.enable_strafe = bool(gp('enable_strafe').value)
         self.enable_vertical = bool(gp('enable_vertical').value)
+        self.enable_forward = bool(gp('enable_forward_gaze').value)
+        self.forward_scale = float(gp('forward_deadzone_scale').value)
+        self.forward_dwell = float(gp('forward_dwell_sec').value)
         self.use_eeg_gating = bool(gp('use_eeg_gating').value)
         self.eeg_link_timeout = float(gp('eeg_link_timeout_sec').value)
         self.drive_vx = float(gp('drive_speed_x').value)
@@ -361,25 +386,39 @@ class GazeControlNode(Node):
         from "straight up the screen" so that 0 deg means FORWARD, +90 deg means
         screen-right, which keeps the table readable.
 
-        With `enable_vertical` false - the default - ONLY left and right produce
-        a zone. Vertical gaze is the weak axis on this hardware: the iris barely
-        moves up and down inside the eye, so the signal is mostly noise and head
-        pitch. Letting it drive would mean the robot lurching forward whenever
-        the operator glanced down at a keyboard, which is the single most
-        dangerous failure this controller could have.
+        With `enable_vertical` false - the default - vertical gaze does not
+        STEER. The iris barely moves up and down inside the eye, so the signal
+        is mostly noise and head pitch, and letting it choose between forward,
+        backward and strafe would mean the robot lurching whenever the operator
+        glanced at a keyboard.
 
-        So forward/backward is left to the jaw clench, which is a deliberate
-        one-bit gesture with none of that ambiguity.
+        It does NOT follow that forward is unreachable, and that was the bug:
+        with only the horizontal rule below, the reachable zones were CENTER,
+        TURN_LEFT and TURN_RIGHT, so the robot could turn and stop and never
+        advance. The old comment here claimed the jaw clench handled forward,
+        but the clench toggles `run`, which commands no velocity.
+
+        So forward gets an ASYMMETRIC rule: look UP, and up only. Down returns
+        nothing at all, so the "glance down and reverse" hazard is gone
+        entirely, and the threshold is wider than the turning one so forward
+        needs a more deliberate look than a turn does.
         """
         if not self.enable_vertical:
+            # Forward first: looking up is a distinct, deliberate act, and it
+            # has to be decided before the horizontal rule or it could never be
+            # reached. |dx| is required to stay small so that "up and hard
+            # left" still means turn left - which is what the operator expects
+            # when steering through a doorway.
+            if self.enable_forward:
+                fwd_r = deadzone_r * self.forward_scale
+                if dy <= -fwd_r and abs(dx) < fwd_r:
+                    return ZONE_FORWARD
+
             # Horizontal only, so ONLY the horizontal offset is allowed to
             # decide. Testing the distance from centre instead would mean that
             # looking straight up - dx exactly 0 - clears the deadzone and then
             # falls through to "dx < 0 is false, so turn RIGHT". A glance at
             # the ceiling would spin the robot on the spot.
-            #
-            # A vertical deadzone also makes the rule honest: up and down
-            # cannot leave the deadzone at all, so vertical gaze cannot drive.
             if abs(dx) < deadzone_r:
                 return ZONE_CENTER
             return ZONE_TURN_LEFT if dx < 0 else ZONE_TURN_RIGHT
@@ -497,7 +536,12 @@ class GazeControlNode(Node):
             # And the chassis gate: `run` must be ON, the mode must be "robot",
             # and the EEG link must be live. A dead laptop therefore leaves the
             # robot standing, which is the only acceptable failure direction.
-            if (now - self.zone_since >= self.dwell_threshold
+            # Forward asks for a longer dwell than a turn. Turning on the spot
+            # is recoverable in one glance; driving forward is not, so the
+            # gesture that starts it should be harder to make by accident.
+            need = (self.forward_dwell if zone == ZONE_FORWARD
+                    else self.dwell_threshold)
+            if (now - self.zone_since >= need
                     and self._chassis_allowed(now)):
                 self.confirmed_zone = zone
                 fx, fy, fz = ZONE_MOTION.get(zone, (0.0, 0.0, 0.0))

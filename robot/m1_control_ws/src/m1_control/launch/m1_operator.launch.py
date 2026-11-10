@@ -15,7 +15,8 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
-                            LogInfo, OpaqueFunction)
+                            LogInfo, OpaqueFunction, RegisterEventHandler)
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -94,11 +95,68 @@ def launch_setup(context, *args, **kwargs):
             cfg = os.path.join(
                 get_package_share_directory('m1_control'), 'config',
                 'm1_operator.rviz')
-        actions.append(Node(
-            package='rviz2', executable='rviz2', name='rviz2',
-            output='screen',
-            arguments=['-d', cfg] if cfg and os.path.exists(cfg) else [],
-        ))
+        cfg_path = cfg
+
+        def rviz_actions(attempt=1):
+            """One rviz2 node plus a handler that knows what to do if it dies.
+
+            RViz has been observed to abort (SIGABRT, exit -6) about a second
+            after starting, when the VM's software OpenGL stack is still coming
+            up after a reboot. slam_toolbox does not care and keeps running, so
+            the launch looks perfectly healthy - and because the launch holds
+            the view lock, a second attempt is refused. The operator's symptom
+            is "RViz is not shown again" with no error anywhere to explain it.
+
+            So: retry once on an ABNORMAL exit, and say so loudly. A clean exit
+            (code 0) is the operator closing the window, which must not make it
+            spring back. The handler registers a handler for its own retry too,
+            so a second death is reported rather than becoming silent again.
+            """
+            node = Node(
+                package='rviz2', executable='rviz2', name='rviz2',
+                output='screen',
+                arguments=['-d', cfg_path]
+                if cfg_path and os.path.exists(cfg_path) else [],
+            )
+
+            def on_exit(event, context, attempt=attempt):
+                code = event.returncode
+                # A shutdown must not be mistaken for a crash.
+                #
+                # RViz frequently segfaults (exit -11) while Ogre tears down its
+                # render window, so a plain Ctrl+C or a stop of the view looks
+                # exactly like the startup abort this handler exists for. Left
+                # unguarded, the handler would relaunch RViz into a launch that
+                # is already going away - and print "RViz died, restarting" on
+                # every normal stop, which is a warning that fires on correct
+                # operation and teaches the operator to ignore it.
+                if code == 0:
+                    return [LogInfo(msg='[operator] RViz closed')]
+                if getattr(context, 'is_shutdown', False):
+                    return [LogInfo(msg=f'[operator] RViz stopped (exit {code} '
+                                        f'during shutdown)')]
+                if attempt < 2:
+                    return [
+                        LogInfo(msg=f'[operator] RViz died (exit {code}) - '
+                                    f'restarting it once. This is usually the '
+                                    f'VMware OpenGL driver still initialising.'),
+                        *rviz_actions(attempt + 1),
+                    ]
+                return [LogInfo(
+                    msg=f'[operator] RViz died again (exit {code}) and will '
+                        f'not be restarted. SLAM is still running and holding '
+                        f'the view lock, so there is no window and no way to '
+                        f'start another view. Stop the view, then start it '
+                        f'again. If it keeps dying, the OpenGL driver is the '
+                        f'suspect - this VM renders in software.')]
+
+            return [
+                node,
+                RegisterEventHandler(
+                    OnProcessExit(target_action=node, on_exit=on_exit)),
+            ]
+
+        actions.extend(rviz_actions())
 
     return actions
 

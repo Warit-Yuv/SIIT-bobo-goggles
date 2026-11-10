@@ -2768,6 +2768,10 @@ def main(args=None):
             self._last_jpeg = None
             self._last_face = None
             self._map_sig = None
+            #: True once we have warned that the launch is up but RViz is not,
+            #: so a dead RViz produces one message rather than one every 3 s.
+            self._rviz_warned = False
+            self._view_proc = None
             self._link_busy = False
             self._cam_index = None
 
@@ -3880,16 +3884,51 @@ def main(args=None):
                 self.logline('  create it as documented in docs/START_STOP.md')
                 return
             try:
-                subprocess.Popen(
+                # The pipe MUST be drained.
+                #
+                # It was not, and that had two consequences. First, every
+                # diagnostic m1_view.sh prints - the lock conflict, the
+                # unresolvable-meshes error, RViz dying - went into a pipe that
+                # nobody read, so the log panel stayed empty while the view was
+                # broken. Second, an unread pipe fills its ~64 KB buffer and
+                # then the child BLOCKS on write, so a long mapping session
+                # would freeze mid-run with nothing to show for it.
+                self._view_proc = subprocess.Popen(
                     ['bash', wrapper],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, start_new_session=True)
+                threading.Thread(target=self._pump_view_output,
+                                 args=(self._view_proc,),
+                                 daemon=True).start()
                 self.logline('view launched (single instance enforced)')
                 # The launch takes a few seconds to come up, so do not claim it
                 # is running yet - the poll timer will confirm.
                 QtCore.QTimer.singleShot(6000, self._poll_view)
             except Exception as exc:  # noqa: BLE001
                 self.logline(f'launch failed: {exc}')
+
+        def _pump_view_output(self, proc):
+            """Forward the view's stdout/stderr into the log panel.
+
+            Runs on a worker thread. logline() emits a signal rather than
+            touching widgets, so this is safe from here.
+            """
+            try:
+                for raw in proc.stdout:
+                    s = raw.rstrip()
+                    if not s:
+                        continue
+                    # slam_toolbox emits this on every scan until the map is
+                    # initialised, and RViz emits the GLSL complaint every
+                    # start. Both are harmless and would bury the one line that
+                    # matters.
+                    if ('extrapolation into the future' in s
+                            or 'GLSL link result' in s
+                            or 'Stereo is NOT SUPPORTED' in s):
+                        continue
+                    self.logline(f'view| {s[:118]}')
+            except Exception:  # noqa: BLE001 - the process went away
+                pass
 
         def _kill_view(self):
             """Stop SLAM + RViz and report what was actually stopped.
@@ -4023,7 +4062,42 @@ def main(args=None):
         def _poll_view(self):
             # pgrep is local and returns in a few milliseconds, so unlike the
             # SSH link probe this is safe on the GUI thread.
-            self.view_signal.emit(self._view_running())
+            running = self._view_running()
+            self.view_signal.emit(running)
+
+            # "the launch is alive" is NOT the same as "there is a window".
+            #
+            # RViz has been seen to abort (SIGABRT, exit -6) a second after
+            # starting, when the VM's software OpenGL stack is still coming up
+            # after a reboot. slam_toolbox does not care and keeps running, so
+            # from the outside the view looks healthy: the map still updates,
+            # the lock is still held, and there is simply no window - which
+            # reads as "RViz is not shown again" with nothing anywhere to say
+            # why.
+            if not running:
+                self._rviz_warned = False
+                return
+            if self._rviz_running():
+                if self._rviz_warned:
+                    self.logline('view: RViz is back')
+                self._rviz_warned = False
+                return
+            if self._rviz_warned:
+                return          # once per outage, not every 3 s
+            self._rviz_warned = True
+            self.logline('WARNING: SLAM is running but RViz is NOT.')
+            self.logline('  The launch holds the view lock, so there is no')
+            self.logline('  window and nothing to look at. Stop the view, then')
+            self.logline('  start it again.')
+
+        def _rviz_running(self):
+            """True if an rviz2 process exists on this machine."""
+            try:
+                r = subprocess.run(['pgrep', '-f', 'lib/rviz2/rviz2'],
+                                   capture_output=True, text=True, timeout=3)
+                return r.returncode == 0 and bool(r.stdout.strip())
+            except Exception:  # noqa: BLE001
+                return False
 
         def _apply_view_state(self, running):
             self.lbl_view.setText('● SLAM + RViz running' if running

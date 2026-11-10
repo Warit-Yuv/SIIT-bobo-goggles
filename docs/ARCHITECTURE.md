@@ -302,7 +302,7 @@ The rules that came out of that:
 
 | Limit | Why | Consequence |
 |---|---|---|
-| Vertical gaze is disabled | The iris barely moves up and down; the signal is mostly head pitch and noise | Gaze steers left/right only. Forward/back is a deliberate gesture, not a look |
+| Vertical gaze does not STEER | The iris barely moves up and down; the signal is mostly head pitch and noise | Looking up drives **forward** (one asymmetric rule, wider threshold, longer dwell); looking down does nothing. Strafe and reverse are unavailable from gaze |
 | One camera, one operator | The tracker is a single-face model | No multi-user support |
 | Calibration is per-person and per-seating | The model is fitted to a face at a distance | Re-run Posture after moving the bed or the chair |
 | The headset classifier confuses two gestures | Measured on this hardware; it reports `UNCLEAR_MUSCLE` | Every gesture has a key, and the least reliable gesture does nothing but play a sound |

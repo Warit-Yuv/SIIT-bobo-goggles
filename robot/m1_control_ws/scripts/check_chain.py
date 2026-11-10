@@ -270,6 +270,23 @@ def main():
               and p.cmd.angular.z > 0.05,
               f'wz={p.cmd.angular.z:+.2f}  zone={p.zone}')
 
+        # Forward. This is the check that was missing, and its absence is why
+        # the robot could only ever rotate: `enable_vertical=false` made
+        # FORWARD structurally unreachable in _classify, so every gaze test
+        # passed while the robot had no way to advance. A chain check that
+        # never asks for forward cannot notice that forward does not exist.
+        #
+        # Held longer than a turn because forward deliberately requires a
+        # longer dwell (0.8 s vs 0.4 s).
+        p.hold_gaze(0.5, 0.05, 2.0)
+        check('looking up drives forward', p.cmd is not None
+              and p.cmd.linear.x > 0.05,
+              f'vx={p.cmd.linear.x:+.2f}  zone={p.zone}')
+
+        p.hold_gaze(0.5, 0.95, 2.0)
+        check('looking down does NOT reverse', p.mag() < 1e-6,
+              f'|v|={p.mag():.3f}  zone={p.zone}')
+
         p.hold_gaze(0.5, 0.5, 1.2)
         check('looking at the centre stops it', p.mag() < 1e-6,
               f'|v|={p.mag():.3f}  zone={p.zone}')

@@ -122,6 +122,13 @@ class GazeHUDNode(Node):
         # vertical disabled, classified the same input as CENTER and did
         # nothing at all.
         self.declare_parameter('enable_vertical', False)
+        # Must also match gaze_control_node: forward is reachable by looking
+        # UP even though vertical STEERING is off, because the controller uses
+        # an asymmetric rule (up = forward, down = nothing). If the overlay did
+        # not mirror it, the operator would look up, the robot would drive
+        # forward, and the label would say CENTER.
+        self.declare_parameter('enable_forward_gaze', True)
+        self.declare_parameter('forward_deadzone_scale', 1.6)
 
         self.declare_parameter('drive_speed_x', 0.20)
         self.declare_parameter('drive_speed_y', 0.20)
@@ -206,6 +213,8 @@ class GazeHUDNode(Node):
         self.deadzone_ratio = float(gp('deadzone_radius_ratio').value)
         self.deadzone_ratio_y = float(gp('deadzone_radius_ratio_y').value)
         self.enable_vertical = bool(gp('enable_vertical').value)
+        self.enable_forward = bool(gp('enable_forward_gaze').value)
+        self.forward_scale = float(gp('forward_deadzone_scale').value)
         self.drive_vx = float(gp('drive_speed_x').value)
         self.drive_vy = float(gp('drive_speed_y').value)
         self.turn_wz = float(gp('turn_speed_z').value)
@@ -855,9 +864,13 @@ class GazeHUDNode(Node):
             # Same rule as gaze_control_node, deliberately duplicated rather
             # than shared: this is a display, and a display that computes a
             # DIFFERENT answer from the controller is worse than no display.
-            # Vertical gaze is the weak axis on this hardware, so the control
-            # node never lets it drive - and neither may the overlay pretend
-            # otherwise.
+            #
+            # Forward first, asymmetric: up only. Down must return nothing,
+            # because a display that showed BACKWARD for a glance down would be
+            # describing a motion the controller will never make.
+            if self.enable_forward:
+                if ny <= -self.forward_scale and abs(nx) < self.forward_scale:
+                    return ZONE_FORWARD, dist
             if abs(nx) < 1.0:
                 return ZONE_CENTER, dist
             return (ZONE_TURN_LEFT if nx < 0 else ZONE_TURN_RIGHT), dist

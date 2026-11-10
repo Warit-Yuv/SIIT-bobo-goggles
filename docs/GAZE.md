@@ -493,12 +493,42 @@ Press **Reset** to return to neutral (offset 0.5, gain 1.0, i.e. passthrough).
 | Gaze position | Result |
 |---|---|
 | Inside the deadzone | Chassis still, gaze drives PTZ pan/tilt |
-| Outside, held for `dwell_time_sec` | Chassis drives in that direction |
+| Left / right, held for `dwell_time_sec` (0.4 s) | Turn in place |
+| **Up**, held for `forward_dwell_sec` (0.8 s) | **Drive forward** |
+| Down | **Nothing at all** |
 
 The **deadzone** exists so that looking around does not drive the robot. The
 **dwell** exists because eyes saccade constantly — requiring the gaze to stay in
 one zone for 0.4 s rejects the natural jitter that would otherwise cause
 constant false commands.
+
+### Forward is a look, backward is not
+
+Vertical gaze does not *steer*: the iris barely moves up and down inside the
+eye, so the vertical signal is mostly noise and head pitch, and letting it
+choose between forward, backward and strafe makes the robot lurch whenever the
+operator glances at a keyboard.
+
+But "vertical gaze is too noisy to steer with" does **not** mean forward has to
+be unreachable, and for a while it was. With only the horizontal rule in place
+the reachable zones were CENTER, TURN_LEFT and TURN_RIGHT, so the robot could
+turn and stop and never advance - and the comment in the code claimed the jaw
+clench covered forward, except the clench toggles `run`, which is a gate on
+whether gaze may drive and commands no velocity of its own.
+
+So forward gets one **asymmetric** rule:
+
+* look **up** -> forward
+* look **down** -> nothing
+
+Down returning nothing removes the original hazard completely (nothing can make
+the robot reverse by accident), and forward stays deliberate: its threshold is
+`forward_deadzone_scale` (1.6x) wider than the turning threshold and it needs a
+longer dwell. Looking up *and* hard left still means turn left, so steering
+through a doorway behaves as expected.
+
+`scripts/test_forward_reachable.py` asserts both halves - that forward is
+unreachable with the rule off, and reachable with it on.
 
 ### The deadzone is an oval, and it is tunable
 
